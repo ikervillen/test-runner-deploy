@@ -55,6 +55,9 @@ inventario de paquetes y resultados de imagen en los artefactos del workflow.
    No hace falta guardar un PAT en el servidor. El login Docker se realiza en un directorio
    temporal que conserva los endpoints/TLS del contexto, sin copiar credenciales del usuario;
    se elimina al terminar. No se monta el socket Docker en el worker.
+   El login fija temporalmente UTF-8 sin BOM para el stdin nativo: en Windows PowerShell
+   5.1, un perfil con BOM altera el token y provoca `denied` aunque los permisos sean
+   correctos. Se restaura la codificación del llamante tanto al finalizar como al fallar.
 8. Proteger `main` y `develop`: exigir PR y las comprobaciones de CI aplicables, impedir
    force-push y restringir quién puede modificar workflows/entornos/variables. Un push directo
    también dispara CD: la exigencia de merge se aplica mediante protección de ramas.
