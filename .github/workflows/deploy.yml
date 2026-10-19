@@ -30,6 +30,9 @@ jobs:
           docker --context $ctx container inspect --format '{{json .State}}' $active.container
           if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect deployed worker' }
           docker --context $ctx stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' $active.container
+          docker --context $ctx info --format 'ENGINE_MEMORY={{.MemTotal}} ENGINE_CPUS={{.NCPU}}'
+          $metrics = "import base64;exec(base64.b64decode('ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCmltcG9ydCBqc29uCnZhbHVlcz17fQpmb3IgbmFtZSBpbiBbJy9wcm9jLzEvc3RhdHVzJywnL3Byb2MvMS93Y2hhbicsJy9wcm9jLzEvaW8nLCcvc3lzL2ZzL2Nncm91cC9tZW1vcnkuZXZlbnRzJywnL3N5cy9mcy9jZ3JvdXAvbWVtb3J5LnN3YXAuY3VycmVudCcsJy9zeXMvZnMvY2dyb3VwL21lbW9yeS5jdXJyZW50JywnL3N5cy9mcy9jZ3JvdXAvbWVtb3J5Lm1heCddOgogICAgdHJ5OgogICAgICAgIHRleHQ9UGF0aChuYW1lKS5yZWFkX3RleHQoKQogICAgICAgIGlmIG5hbWUuZW5kc3dpdGgoJy9zdGF0dXMnKTogdGV4dD0nXG4nLmpvaW4obGluZSBmb3IgbGluZSBpbiB0ZXh0LnNwbGl0bGluZXMoKSBpZiBsaW5lLnN0YXJ0c3dpdGgoKCdTdGF0ZTonLCdWbVJTUzonLCdWbVNpemU6JywnUnNzQW5vbjonLCdWbVN3YXA6JywnVGhyZWFkczonKSkpCiAgICAgICAgdmFsdWVzW25hbWVdPXRleHQKICAgIGV4Y2VwdCBPU0Vycm9yIGFzIGU6IHZhbHVlc1tuYW1lXT10eXBlKGUpLl9fbmFtZV9fCnByaW50KGpzb24uZHVtcHMoeydwcm9jZXNzX21lbW9yeSc6dmFsdWVzfSkpCg=='))"
+          docker --context $ctx exec $active.container python -c $metrics
           docker --context $ctx volume inspect --format '{{json .}}' $active.volume
           if ($LASTEXITCODE -ne 0) { throw 'Volume absent; no helper is launched' }
           docker --context $ctx exec $active.container python -m ingesta_delta_lake.runtime health
