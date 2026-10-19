@@ -1,7 +1,7 @@
 # Entregas de la ingesta
 
 La arquitectura y decisiones acordadas permanecen en el
-[plan detallado](../../calidad_serie/fuentes-referencia/PLAN_DELTA_LAKE.md).
+[plan detallado](PLAN_DELTA_LAKE.md).
 Este índice lo descompone en unidades revisables; no sustituye los contratos ni autoriza
 cambiar los datos de la aplicación. Todas las entregas aplican aislamiento, idempotencia,
 evidencia persistente, no escritura sin cambios y recuperación descritos en el plan.

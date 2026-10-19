@@ -3,7 +3,7 @@
 Estado: contrato acordado el **19/10/2026**, código implementado con pruebas sintéticas;
 reconstrucción/migración real pendientes. Ejecución detallada en
 [11B/11C](11bc_catalogos_derivados.md). Referencia
-única: [plan, sección 17.14](../../../calidad_serie/fuentes-referencia/PLAN_DELTA_LAKE.md).
+única: [plan, sección 17.14](../PLAN_DELTA_LAKE.md).
 Esta ficha conserva la justificación del contrato; las publicaciones reales v1 no cambian.
 
 La confirmación del usuario y los catálogos originales vinculan AV31B/8/1617–1618 con ramales

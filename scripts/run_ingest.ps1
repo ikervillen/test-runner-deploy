@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)][string]$ConfigPath,
     [string]$EnvironmentPath = (Join-Path $env:LOCALAPPDATA 'Ingesta_Delta_Lake/envs/dev-0.1')
 )

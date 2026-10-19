@@ -1,7 +1,7 @@
 # Entrega 09 — LISTA_AR
 
 Estado: implementación local de ensayo completada. Contrato `lista_ar_v1`,
-[sección 4.8 del plan](../../../calidad_serie/fuentes-referencia/PLAN_DELTA_LAKE.md).
+[sección 4.8 del plan](../PLAN_DELTA_LAKE.md).
 GitHub, despliegue e integración de consumo se mantienen para después.
 
 ## Campos y significado

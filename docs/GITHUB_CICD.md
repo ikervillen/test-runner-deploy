@@ -59,6 +59,11 @@ inventario de paquetes y resultados de imagen en los artefactos del workflow.
    force-push y restringir quién puede modificar workflows/entornos/variables. Un push directo
    también dispara CD: la exigencia de merge se aplica mediante protección de ramas.
 
+**Limitación comprobada del repositorio actual:** la API de protección de ramas devuelve
+403 y exige GitHub Pro para este repositorio privado. No se ha cambiado su visibilidad.
+La protección anterior es un requisito pendiente, no una garantía aplicada. CI/CD mantiene
+sus comprobaciones, pero un colaborador con permiso de push podría evitar pasar por PR.
+
 No se precisa SSH. El runner se conecta a GitHub y GHCR con salida autorizada. El motor
 Docker y WSL2 deben persistir/arrancar sin una sesión RDP interactiva. Verificar este punto
 reiniciando el servidor en el piloto; que funcionara en una consola no lo garantiza.

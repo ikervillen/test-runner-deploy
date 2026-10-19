@@ -32,7 +32,7 @@ el frontend, las fórmulas ni las rutas activas de la aplicación.
 
 El [índice de entregas](docs/ENTREGAS.md) divide el trabajo en doce incrementos. El plan
 arquitectónico detallado se mantiene en
-[PLAN_DELTA_LAKE.md](../calidad_serie/fuentes-referencia/PLAN_DELTA_LAKE.md); no se duplica aquí.
+[PLAN_DELTA_LAKE.md](docs/PLAN_DELTA_LAKE.md); copia de publicación del plan maestro del workspace.
 Cada entrega tiene su contrato y aceptación resumidos en `docs/entregas/` para revisar cambios
 pequeños. Al preparar un repositorio independiente, publicar este proyecto; no incorporar
 los CSV reales o sus directorios vecinos.
@@ -48,7 +48,7 @@ En PowerShell, desde este directorio y con `uv` instalado:
 ```powershell
 ./scripts/setup.ps1
 $env:UV_PROJECT_ENVIRONMENT = Join-Path $env:LOCALAPPDATA 'Ingesta_Delta_Lake/envs/dev-0.1'
-uv run --locked python -m pytest --cov=ingesta_delta_lake --cov-report=term-missing --cov-fail-under=85
+uv run --locked python -m pytest --cov=ingesta_delta_lake --cov=deployment --cov-report=term-missing --cov-fail-under=85
 uv run --locked ruff check .
 uv run --locked ruff format --check .
 ```

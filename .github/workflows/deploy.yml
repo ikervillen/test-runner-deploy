@@ -42,7 +42,7 @@ jobs:
       - name: Format
         run: uv run --locked ruff format --check .
       - name: Contracts and real Delta transactions on synthetic inputs
-        run: uv run --locked python -m pytest --cov=ingesta_delta_lake --cov-report=term-missing --cov-fail-under=85
+        run: uv run --locked python -m pytest --cov=ingesta_delta_lake --cov=deployment --cov-report=term-missing --cov-fail-under=85
 
   image:
     needs: contracts-and-delta
@@ -92,6 +92,11 @@ jobs:
           docker run --rm --network none --read-only --entrypoint python "$CANDIDATE" \
             -c 'import importlib.metadata as m,json; print(json.dumps(sorted((d.metadata["Name"],d.version) for d in m.distributions())))' \
             > release/packages.json
+      - name: Exercise real Docker activation and graceful update
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m deployment.smoke --image "$CANDIDATE" | tee release/docker-lifecycle.json
       - name: Publish tested image
         id: publish
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')

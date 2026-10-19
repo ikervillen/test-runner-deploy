@@ -1,7 +1,7 @@
 # Entrega 10 — CONT_ZC
 
 Estado: implementación local de ensayo completada. Contrato `cont_zc_v1`,
-[sección 4.9 del plan](../../../calidad_serie/fuentes-referencia/PLAN_DELTA_LAKE.md).
+[sección 4.9 del plan](../PLAN_DELTA_LAKE.md).
 Completa las nueve fuentes de origen seleccionadas; no implica integración de la app ni
 despliegue, que siguen pendientes junto con las relaciones derivadas.
 

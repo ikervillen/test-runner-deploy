@@ -1,7 +1,7 @@
 # Entrega 08 — LISTA_RECH
 
 Estado: implementación local de ensayo completada. Contrato `lista_rech_v1`,
-[sección 4.7 del plan](../../../calidad_serie/fuentes-referencia/PLAN_DELTA_LAKE.md).
+[sección 4.7 del plan](../PLAN_DELTA_LAKE.md).
 La integración con la app y el despliegue se mantienen para sus entregas.
 
 ## Conservación y esquema

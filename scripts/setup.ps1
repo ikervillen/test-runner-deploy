@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Python = '3.12',
     [string]$EnvironmentPath = (Join-Path $env:LOCALAPPDATA 'Ingesta_Delta_Lake/envs/dev-0.1')
 )

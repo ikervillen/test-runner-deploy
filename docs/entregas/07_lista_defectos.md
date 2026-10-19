@@ -1,7 +1,7 @@
 # Entrega 07 — LISTA_DEFECTOS
 
 Estado: implementación local de ensayo completada. Contrato `lista_defectos_v2`,
-[sección 4.6 del plan](../../../calidad_serie/fuentes-referencia/PLAN_DELTA_LAKE.md).
+[sección 4.6 del plan](../PLAN_DELTA_LAKE.md).
 GitHub, despliegue e integración en la app continúan aplazados.
 
 ## Datos conservados

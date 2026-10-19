@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)][string]$Repository,
     [Parameter(Mandatory = $true)][ValidateSet('main', 'develop')][string]$Branch,
     [string]$SitePath,

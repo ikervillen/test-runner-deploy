@@ -1,7 +1,7 @@
 # Entrega 11 — Asociación temporal producción–ramal
 
 Estado: implementación local de ensayo. Contrato actual `asignacion_produccion_ramal_v2`,
-regla `temporal_assignment_v2`, conforme a la [sección 17 del plan](../../../calidad_serie/fuentes-referencia/PLAN_DELTA_LAKE.md).
+regla `temporal_assignment_v2`, conforme a la [sección 17 del plan](../PLAN_DELTA_LAKE.md).
 Incluye propuestas, publicación de vigencias expresamente revisadas y atribución trazable.
 No aprueba por sí sola las vigencias reales ni integra todavía la aplicación.
 
