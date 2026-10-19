@@ -248,6 +248,9 @@ def worker(interval=600):
                     except Exception as exc:
                         result = {"status": "FAILED", "error": str(exc)}
                     event = {
+                        "activation_token": token,
+                        "channel": os.environ["INGESTA_CHANNEL"],
+                        "instance": os.environ["INGESTA_INSTANCE"],
                         "time": now(),
                         "family": family,
                         "result": result,

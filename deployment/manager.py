@@ -282,6 +282,7 @@ class Deployment:
 
     def audit(self, journal, phase):
         journal["phase"] = phase
+        journal.setdefault("timeline", []).append({"phase": phase, "time": time.time()})
         save(self.journal_path, journal)
 
     def complete(self, journal, outcome):

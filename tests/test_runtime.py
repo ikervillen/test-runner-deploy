@@ -123,6 +123,8 @@ def test_sigterm_finishes_current_unit_and_never_starts_next_one(mounted, monkey
     assert runtime.worker(10)["status"] == "STOPPED"
     assert processed == ["SIP_MODELO"]
     assert len(list((mounted / "lake/logs").glob("*.jsonl"))) == 1
+    event = json.loads(next((mounted / "lake/logs").glob("*.jsonl")).read_text())
+    assert event["activation_token"] == token and event["channel"] == "develop"
     with pytest.raises(IntegrityError, match="no preparado"):
         runtime.health()
 
