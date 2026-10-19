@@ -1,31 +1,55 @@
-name: Stop unsafe backfill retries at a cooperative boundary
+name: Observe develop pilot (read-only)
 on:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  request-stop:
+  observe:
     runs-on: [self-hosted, Windows, X64, fenix-ingesta]
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
-      - name: Disable restart and request SIGTERM without forced termination
+      - name: Read active release and lake inventory without ingestion
         shell: powershell
         run: |
-          $ErrorActionPreference='Stop'
-          $root=Join-Path $env:LOCALAPPDATA 'FenixIngesta/deployments/develop'
-          $active=Get-Content -LiteralPath (Join-Path $root 'active.json') -Raw | ConvertFrom-Json
-          if ($active.commit -ne 'af3360fe33338a23f25fc196dc02c3c5872037a9' -or $active.channel -ne 'develop') { throw 'Unexpected release' }
-          $ctx=$active.docker_context
-          $state=(& docker --context $ctx container inspect $active.container | ConvertFrom-Json)[0]
-          if ($LASTEXITCODE -ne 0 -or $state.Config.Labels.'es.fenix.ingesta.channel' -ne 'develop' -or $state.Config.Labels.'es.fenix.ingesta.role' -ne 'worker') { throw 'Unexpected container' }
-          docker --context $ctx update --restart=no $active.container
-          if ($LASTEXITCODE -ne 0) { throw 'Could not disable automatic restart' }
-          if ($state.State.Running) {
-            docker --context $ctx kill --signal SIGTERM $active.container
-            if ($LASTEXITCODE -ne 0) { throw 'Could not request cooperative stop' }
+          $ErrorActionPreference = 'Stop'
+          $siteFile = Join-Path $env:LOCALAPPDATA 'FenixIngesta/site-develop.json'
+          if (-not (Test-Path -LiteralPath $siteFile)) { Write-Output 'NO_SITE_YET'; exit 0 }
+          $site = Get-Content -LiteralPath $siteFile -Raw | ConvertFrom-Json
+          $state = Join-Path $site.state_root 'develop'
+          Write-Output "DEPLOYMENT_STATE=$state"
+          $activeFile = Join-Path $state 'active.json'
+          if (-not (Test-Path -LiteralPath $activeFile)) {
+            Write-Output 'NO_ACTIVE_RELEASE_YET'
+            $journal = Join-Path $state 'transaction.json'
+            if (Test-Path -LiteralPath $journal) { Get-Content -LiteralPath $journal -Raw }
+            exit 0
           }
-          $after=(& docker --context $ctx container inspect $active.container | ConvertFrom-Json)[0]
-          $receipt=[ordered]@{time=[DateTime]::UtcNow.ToString('o');container=$active.container;commit=$active.commit;reason='Initial MIA backlog approaches 6GiB memory and swaps heavily; disable automatic retry and request graceful stop pending bounded batches';running=$after.State.Running;oom_killed=$after.State.OOMKilled;restart_policy=$after.HostConfig.RestartPolicy.Name;restart_count=$after.RestartCount;run=$env:GITHUB_RUN_ID}
-          [IO.File]::WriteAllText((Join-Path $root ('pilot-cooperative-stop-'+$env:GITHUB_RUN_ID+'.json')), ($receipt | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
-          $receipt | ConvertTo-Json
+          $active = Get-Content -LiteralPath $activeFile -Raw | ConvertFrom-Json
+          $active | Select-Object commit,image,container,volume,channel | ConvertTo-Json
+          $ctx = $site.docker_context
           docker --context $ctx container inspect --format '{{json .State}}' $active.container
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect deployed worker' }
+          $workerState=(& docker --context $ctx container inspect $active.container | ConvertFrom-Json)[0]
+          Write-Output ('RESTART_COUNT='+$workerState.RestartCount+' RESTART_POLICY='+$workerState.HostConfig.RestartPolicy.Name)
+          if ($workerState.State.Running) {
+            docker --context $ctx stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' $active.container
+          }
+          docker --context $ctx info --format 'ENGINE_MEMORY={{.MemTotal}} ENGINE_CPUS={{.NCPU}}'
+          $metrics = "import base64;exec(base64.b64decode('ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCmltcG9ydCBqc29uCnZhbHVlcz17fQpmb3IgbmFtZSBpbiBbJy9wcm9jLzEvc3RhdHVzJywnL3Byb2MvMS93Y2hhbicsJy9wcm9jLzEvaW8nLCcvc3lzL2ZzL2Nncm91cC9tZW1vcnkuZXZlbnRzJywnL3N5cy9mcy9jZ3JvdXAvbWVtb3J5LnN3YXAuY3VycmVudCcsJy9zeXMvZnMvY2dyb3VwL21lbW9yeS5jdXJyZW50JywnL3N5cy9mcy9jZ3JvdXAvbWVtb3J5Lm1heCddOgogICAgdHJ5OgogICAgICAgIHRleHQ9UGF0aChuYW1lKS5yZWFkX3RleHQoKQogICAgICAgIGlmIG5hbWUuZW5kc3dpdGgoJy9zdGF0dXMnKTogdGV4dD0nXG4nLmpvaW4obGluZSBmb3IgbGluZSBpbiB0ZXh0LnNwbGl0bGluZXMoKSBpZiBsaW5lLnN0YXJ0c3dpdGgoKCdTdGF0ZTonLCdWbVJTUzonLCdWbVNpemU6JywnUnNzQW5vbjonLCdWbVN3YXA6JywnVGhyZWFkczonKSkpCiAgICAgICAgdmFsdWVzW25hbWVdPXRleHQKICAgIGV4Y2VwdCBPU0Vycm9yIGFzIGU6IHZhbHVlc1tuYW1lXT10eXBlKGUpLl9fbmFtZV9fCnByaW50KGpzb24uZHVtcHMoeydwcm9jZXNzX21lbW9yeSc6dmFsdWVzfSkpCg=='))"
+          if ($workerState.State.Running) { docker --context $ctx exec $active.container python -c $metrics }
+          docker --context $ctx events --since '2026-10-19T12:20:00Z' --until '2026-10-19T12:25:00Z' --filter "container=$($active.container)" --filter event=oom --format '{{json .}}'
+          docker --context $ctx volume inspect --format '{{json .}}' $active.volume
+          if ($LASTEXITCODE -ne 0) { throw 'Volume absent; no helper is launched' }
+          if ($workerState.State.Running) { docker --context $ctx exec $active.container python -m ingesta_delta_lake.runtime health }
+          $code = "import base64;exec(base64.b64decode('IiIiT25lLXNob3QsIHJlYWQtb25seSBwaWxvdCBpbnZlbnRvcnkuIE5ldmVyIGludm9rZXMgaW5nZXN0aW9uIG9yIG9wZW5zIGNvbnRyb2xzIFJXLiIiIgppbXBvcnQgY29sbGVjdGlvbnMKaW1wb3J0IGRhdGV0aW1lCmltcG9ydCBqc29uCmltcG9ydCBvcwppbXBvcnQgc3FsaXRlMwppbXBvcnQgdGVtcGZpbGUKaW1wb3J0IHNodXRpbApmcm9tIGNvbnRleHRsaWIgaW1wb3J0IGNsb3NpbmcKZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCgpmcm9tIGRlbHRhbGFrZSBpbXBvcnQgRGVsdGFUYWJsZQppbXBvcnQgcHlhcnJvdyBhcyBwYQoKcm9vdCA9IFBhdGgoJy9sYWtlJykKcmVwb3J0ID0geydhdCc6IGRhdGV0aW1lLmRhdGV0aW1lLm5vdyhkYXRldGltZS50aW1lem9uZS51dGMpLmlzb2Zvcm1hdCgpfQpyZXBvcnRbJ2lkZW50aXR5J10gPSBqc29uLmxvYWRzKChyb290IC8gJ2Vudmlyb25tZW50Lmpzb24nKS5yZWFkX3RleHQoKSkKcmVwb3J0WydydW50aW1lJ10gPSBbXQpmb3IgcCBpbiAocm9vdCAvICdydW50aW1lJykuZ2xvYignKi5qc29uJyk6CiAgICB0cnk6CiAgICAgICAgdmFsdWUgPSBqc29uLmxvYWRzKHAucmVhZF90ZXh0KCkpCiAgICAgICAgcmVwb3J0WydydW50aW1lJ10uYXBwZW5kKHtrOiB2YWx1ZVtrXSBmb3IgayBpbiAoJ3BoYXNlJywgJ3RpbWUnLCAnZmFtaWx5JykgaWYgayBpbiB2YWx1ZX0pCiAgICBleGNlcHQgKE9TRXJyb3IsIFZhbHVlRXJyb3IpOgogICAgICAgIHBhc3MKcmVwb3J0Wyd0YWJsZXMnXSA9IFtdCmZvciBwIGluIHNvcnRlZCgocm9vdCAvICdzaWx2ZXInIC8gJ0FJQUxBJykuaXRlcmRpcigpKSBpZiAocm9vdCAvICdzaWx2ZXInIC8gJ0FJQUxBJykuZXhpc3RzKCkgZWxzZSBbXToKICAgIGlmIG5vdCBwLmlzX2RpcigpOgogICAgICAgIGNvbnRpbnVlCiAgICBpdGVtID0geydmYW1pbHknOiBwLm5hbWUsICdwYXRoJzogc3RyKHApfQogICAgdHJ5OgogICAgICAgIHRhYmxlID0gRGVsdGFUYWJsZShzdHIocCkpCiAgICAgICAgYWRkcyA9IHBhLnRhYmxlKHRhYmxlLmdldF9hZGRfYWN0aW9ucygpKQogICAgICAgIGNvdW50cyA9IGFkZHNbJ251bV9yZWNvcmRzJ10udG9fcHlsaXN0KCkKICAgICAgICBpdGVtLnVwZGF0ZSh2ZXJzaW9uPXRhYmxlLnZlcnNpb24oKSwgZmlsZXM9YWRkcy5udW1fcm93cywKICAgICAgICAgICAgICAgICAgICByb3dzPXN1bShjb3VudHMpIGlmIGFsbChuIGlzIG5vdCBOb25lIGZvciBuIGluIGNvdW50cykgZWxzZSBOb25lLAogICAgICAgICAgICAgICAgICAgIHNjaGVtYV9maWVsZHM9dGFibGUuc2NoZW1hKCkudG9fYXJyb3coKS5uYW1lcywKICAgICAgICAgICAgICAgICAgICBjb250cmFjdD10YWJsZS5tZXRhZGF0YSgpLmNvbmZpZ3VyYXRpb24pCiAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgaXRlbVsnZXJyb3InXSA9IHN0cihlKQogICAgcmVwb3J0Wyd0YWJsZXMnXS5hcHBlbmQoaXRlbSkKbWFjaGluZV9wYXRoID0gcm9vdCAvICdzaWx2ZXInIC8gJ0FJQUxBJyAvICdzaXBfbWFxdWluYV9tb2xkZW8nCmlmIG1hY2hpbmVfcGF0aC5leGlzdHMoKToKICAgIHJlcG9ydFsncGh5c2ljYWxfbWFjaGluZV9kaWN0aW9uYXJ5J10gPSBEZWx0YVRhYmxlKHN0cihtYWNoaW5lX3BhdGgpKS50b19weWFycm93X3RhYmxlKCkudG9fcHlsaXN0KCkKbGFzdCA9IHt9CmNvdW50cyA9IGNvbGxlY3Rpb25zLkNvdW50ZXIoKQpmb3IgcCBpbiBzb3J0ZWQoKHJvb3QgLyAnbG9ncycpLmdsb2IoJyouanNvbmwnKSlbLTI6XToKICAgIGZvciBsaW5lIGluIHAub3BlbihlbmNvZGluZz0ndXRmLTgnKToKICAgICAgICB0cnk6CiAgICAgICAgICAgIGV2ZW50ID0ganNvbi5sb2FkcyhsaW5lKQogICAgICAgIGV4Y2VwdCBWYWx1ZUVycm9yOgogICAgICAgICAgICBjb250aW51ZQogICAgICAgIHJlc3VsdCA9IGV2ZW50LmdldCgncmVzdWx0Jywge30pCiAgICAgICAgY291bnRzWyhldmVudC5nZXQoJ2ZhbWlseScpLCByZXN1bHQuZ2V0KCdzdGF0dXMnKSldICs9IDEKICAgICAgICBsYXN0W2V2ZW50LmdldCgnZmFtaWx5JyldID0ge2s6IGV2ZW50W2tdIGZvciBrIGluICgndGltZScsICdzZWNvbmRzJykgaWYgayBpbiBldmVudH0KICAgICAgICBsYXN0W2V2ZW50LmdldCgnZmFtaWx5JyldWydyZXN1bHQnXSA9IHsKICAgICAgICAgICAgazogdiBmb3IgaywgdiBpbiByZXN1bHQuaXRlbXMoKQogICAgICAgICAgICBpZiBpc2luc3RhbmNlKHYsIChzdHIsIGludCwgZmxvYXQsIGJvb2wpKSBvciB2IGlzIE5vbmUKICAgICAgICB9CnJlcG9ydFsnbGF0ZXN0X2ZhbWlseV9yZXN1bHRzJ10gPSBsYXN0CnJlcG9ydFsncmVzdWx0X2NvdW50cyddID0gW3snZmFtaWx5JzogZiwgJ3N0YXR1cyc6IHMsICdjb3VudCc6IG59IGZvciAoZiwgcyksIG4gaW4gY291bnRzLml0ZW1zKCldCmJyb256ZSA9IGNvbGxlY3Rpb25zLkNvdW50ZXIoKQpmb3IgcCBpbiAocm9vdCAvICdicm9uemUnKS5yZ2xvYignKi5jc3YnKToKICAgIHJlbGF0aXZlID0gcC5yZWxhdGl2ZV90byhyb290IC8gJ2Jyb256ZScpCiAgICBpZiBsZW4ocmVsYXRpdmUucGFydHMpID49IDM6CiAgICAgICAgYnJvbnplWyhyZWxhdGl2ZS5wYXJ0c1sxXSwgcmVsYXRpdmUucGFydHNbMl0pXSArPSAxCnJlcG9ydFsnYnJvbnplX2NhcHR1cmVzJ10gPSBbeydvcmlnaW4nOiBvLCAnZmFtaWx5JzogZiwgJ2ZpbGVzJzogbn0gZm9yIChvLCBmKSwgbiBpbiBzb3J0ZWQoYnJvbnplLml0ZW1zKCkpXQpyZXBvcnRbJ2NvbnRyb2xzJ10gPSBbXQpkZWYgYXVkaXQoZGIpOgogICAgZGIuZXhlY3V0ZSgnUFJBR01BIHF1ZXJ5X29ubHk9T04nKQogICAgdmFsdWUgPSB7CiAgICAgICAgJ2F0dGVtcHRzJzogW2RpY3QoemlwKCgnc3RhdHVzJywgJ2NvdW50JyksIHJvdykpIGZvciByb3cgaW4gZGIuZXhlY3V0ZSgnU0VMRUNUIHN0YXR1cyxjb3VudCgqKSBGUk9NIGF0dGVtcHRzIEdST1VQIEJZIHN0YXR1cycpXSwKICAgICAgICAnaXNzdWVzJzogW2RpY3QoemlwKCgncmVhc29uJywgJ3N0YXR1cycsICdjb3VudCcpLCByb3cpKSBmb3Igcm93IGluIGRiLmV4ZWN1dGUoJ1NFTEVDVCByZWFzb24sc3RhdHVzLGNvdW50KCopIEZST00gaXNzdWVzIEdST1VQIEJZIHJlYXNvbixzdGF0dXMnKV0sCiAgICAgICAgJ2JhdGNoZXMnOiBbZGljdCh6aXAoKCdzdGF0ZScsICdjb3VudCcpLCByb3cpKSBmb3Igcm93IGluIGRiLmV4ZWN1dGUoJ1NFTEVDVCBzdGF0ZSxjb3VudCgqKSBGUk9NIGJhdGNoZXMgR1JPVVAgQlkgc3RhdGUnKV0sCiAgICB9CiAgICBpZiBhbnkocm93Wydjb3VudCddIGZvciByb3cgaW4gdmFsdWVbJ2lzc3VlcyddKToKICAgICAgICBkZWYgdHJpbSh2KToKICAgICAgICAgICAgaWYgaXNpbnN0YW5jZSh2LCBkaWN0KTogcmV0dXJuIHtrOiB0cmltKHgpIGZvciBrLCB4IGluIHYuaXRlbXMoKSBpZiBrIG5vdCBpbiB7J2V2aWRlbmNlJywgJ3NuYXBzaG90cycsICdzb3VyY2VzJywgJ29ic2VydmF0aW9ucyd9fQogICAgICAgICAgICBpZiBpc2luc3RhbmNlKHYsIGxpc3QpOiByZXR1cm4gW3RyaW0oeCkgZm9yIHggaW4gdls6NF1dCiAgICAgICAgICAgIHJldHVybiB2CiAgICAgICAgdmFsdWVbJ2lzc3VlX2V4YW1wbGVzJ10gPSBbeydyZWFzb24nOiByZWFzb24sICdwYXlsb2FkJzogdHJpbShqc29uLmxvYWRzKHBheWxvYWQpKX0gZm9yIHJlYXNvbiwgcGF5bG9hZCBpbiBkYi5leGVjdXRlKCJTRUxFQ1QgcmVhc29uLHBheWxvYWRfanNvbiBGUk9NIGlzc3VlcyBXSEVSRSBzdGF0dXMhPSdSRVNPTFZFRCcgTElNSVQgNCIpXQogICAgcmV0dXJuIHZhbHVlCgpmb3IgcCBpbiBzb3J0ZWQoKHJvb3QgLyAnY29udHJvbCcpLmdsb2IoJyouc3FsaXRlJykpOgogICAgd2FsX3BhdGggPSBwLndpdGhfbmFtZShwLm5hbWUgKyAnLXdhbCcpCiAgICBpdGVtID0geydmaWxlJzogcC5uYW1lLCAnYnl0ZXMnOiBwLnN0YXQoKS5zdF9zaXplLAogICAgICAgICAgICAnd2FsX2J5dGVzJzogd2FsX3BhdGguc3RhdCgpLnN0X3NpemUgaWYgd2FsX3BhdGguZXhpc3RzKCkgZWxzZSAwfQogICAgdHJ5OgogICAgICAgIHdpdGggY2xvc2luZyhzcWxpdGUzLmNvbm5lY3QocC5hc191cmkoKSArICc/bW9kZT1ybycsIHVyaT1UcnVlLCB0aW1lb3V0PTIpKSBhcyBkYjoKICAgICAgICAgICAgaXRlbS51cGRhdGUoYXVkaXQoZGIpKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIGl0ZW1bJ3JlYWRfb25seV9hdWRpdF91bmF2YWlsYWJsZSddID0gc3RyKGUpCiAgICAgICAgIyBBIGNsb3NlZCBjaGVja3BvaW50IGluIFdBTCBtb2RlIG1heSByZXF1aXJlIGNyZWF0aW5nIFNITSB0byBvcGVuIG5vcm1hbGx5LgogICAgICAgICMgQXVkaXQgYSBzdGFibGUsIGJvdW5kZWQgY29weSBpbiB0bXBmcyBpbnN0ZWFkOyBuZXZlciBpZ25vcmUgYSBub24tZW1wdHkgV0FMLgogICAgICAgIHdhbCA9IHAud2l0aF9uYW1lKHAubmFtZSArICctd2FsJykKICAgICAgICBkZWYgbm9fd2FsKCk6IHJldHVybiBub3Qgd2FsLmV4aXN0cygpIG9yIHdhbC5zdGF0KCkuc3Rfc2l6ZSA9PSAwCiAgICAgICAgY29weSA9IE5vbmUKICAgICAgICB0cnk6CiAgICAgICAgICAgIGJlZm9yZSA9IHAuc3RhdCgpCiAgICAgICAgICAgIGlmIGJlZm9yZS5zdF9zaXplIDw9IDE2ICogMTAyNCAqIDEwMjQgYW5kIG5vX3dhbCgpOgogICAgICAgICAgICAgICAgaGFuZGxlLCBuYW1lID0gdGVtcGZpbGUubWtzdGVtcChwcmVmaXg9J2Zlbml4LWF1ZGl0LScsIHN1ZmZpeD0nLnNxbGl0ZScpCiAgICAgICAgICAgICAgICBvcy5jbG9zZShoYW5kbGUpCiAgICAgICAgICAgICAgICBjb3B5ID0gUGF0aChuYW1lKQogICAgICAgICAgICAgICAgc2h1dGlsLmNvcHlmaWxlKHAsIGNvcHkpCiAgICAgICAgICAgICAgICBhZnRlciA9IHAuc3RhdCgpCiAgICAgICAgICAgICAgICBpZiAoYmVmb3JlLnN0X3NpemUsIGJlZm9yZS5zdF9tdGltZV9ucykgIT0gKGFmdGVyLnN0X3NpemUsIGFmdGVyLnN0X210aW1lX25zKSBvciBub3Qgbm9fd2FsKCk6CiAgICAgICAgICAgICAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCdDb250cm9sIGNoYW5nZWQgZHVyaW5nIHJlYWQtb25seSBjaGVja3BvaW50IGNvcHknKQogICAgICAgICAgICAgICAgd2l0aCBjbG9zaW5nKHNxbGl0ZTMuY29ubmVjdChjb3B5LmFzX3VyaSgpICsgJz9tb2RlPXJvJmltbXV0YWJsZT0xJywgdXJpPVRydWUpKSBhcyBkYjoKICAgICAgICAgICAgICAgICAgICBpZiBkYi5leGVjdXRlKCdQUkFHTUEgcXVpY2tfY2hlY2snKS5mZXRjaG9uZSgpWzBdICE9ICdvayc6CiAgICAgICAgICAgICAgICAgICAgICAgIHJhaXNlIFJ1bnRpbWVFcnJvcignQ2hlY2twb2ludCBjb3B5IGRpZCBub3QgcGFzcyBxdWlja19jaGVjaycpCiAgICAgICAgICAgICAgICAgICAgaXRlbS51cGRhdGUoYXVkaXQoZGIpKQogICAgICAgICAgICAgICAgaXRlbS5wb3AoJ3JlYWRfb25seV9hdWRpdF91bmF2YWlsYWJsZScsIE5vbmUpCiAgICAgICAgICAgICAgICBpdGVtWydhdWRpdF9mcm9tX3N0YWJsZV9jaGVja3BvaW50X2NvcHknXSA9IFRydWUKICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGNvcHlfZXJyb3I6CiAgICAgICAgICAgIGl0ZW1bJ3JlYWRfb25seV9hdWRpdF91bmF2YWlsYWJsZSddID0gc3RyKGNvcHlfZXJyb3IpCiAgICAgICAgZmluYWxseToKICAgICAgICAgICAgaWYgY29weSBpcyBub3QgTm9uZTogY29weS51bmxpbmsobWlzc2luZ19vaz1UcnVlKQogICAgcmVwb3J0Wydjb250cm9scyddLmFwcGVuZChpdGVtKQpwcmludChqc29uLmR1bXBzKHJlcG9ydCwgZW5zdXJlX2FzY2lpPVRydWUsIHNvcnRfa2V5cz1UcnVlLCBkZWZhdWx0PXN0cikpCg=='))"
+          $out = docker --context $ctx run --rm --pull never --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 512m --cpus 1 --tmpfs '/tmp:rw,nosuid,size=64m' --mount "type=volume,src=$($active.volume),dst=/lake,readonly" --mount "type=bind,src=$($site.input_bind),dst=/input,readonly" --entrypoint python $active.image -c $code
+          if ($LASTEXITCODE -ne 0) { throw 'Read-only inventory failed' }
+          $target = Join-Path $env:RUNNER_TEMP 'develop-pilot-inventory.json'
+          [IO.File]::WriteAllText($target, ($out -join "`n"), [Text.UTF8Encoding]::new($false))
+          Write-Output $out
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: develop-pilot-inventory
+          path: ${{ runner.temp }}/develop-pilot-inventory.json
+          if-no-files-found: warn
+          retention-days: 14
