@@ -26,7 +26,9 @@ try {
         Copy-Item -LiteralPath $contextsDirectory -Destination $temporaryDockerConfig -Recurse
     }
     $env:DOCKER_CONFIG = $temporaryDockerConfig
-    $env:INGESTA_GITHUB_TOKEN | docker login ghcr.io --username $env:INGESTA_REGISTRY_USER --password-stdin
+    # Entregar bytes al stdin de Docker desde Python: la tubería de PowerShell 5.1
+    # puede añadir un BOM al token según el perfil/configuración del runner.
+    & $Python (Join-Path $projectDirectory 'deployment/registry.py')
     if ($LASTEXITCODE -ne 0) { throw 'No se ha podido autenticar el acceso al registro.' }
     Push-Location -LiteralPath $projectDirectory
     try {
