@@ -322,3 +322,23 @@ def test_pending_candidate_is_not_recovered_by_previous_release(site, motor):
     assert dep.active()["commit"] == SHA2
     assert not motor.containers[old["container"]]["running"]
     assert json.loads(dep.journal_path.read_text())["phase"] == "SWITCHED"
+
+
+def test_rollback_drain_timeout_restores_current_without_reading_inflight_control(site, motor):
+    dep = deployer(site, motor)
+    dep.deploy(IMAGE1, SHA1, "run1")
+    motor.latest = SHA2
+    current = dep.deploy(IMAGE2, SHA2, "run2")["release"]
+    original = motor.drain
+
+    def drain(record, timeout):
+        if record["token"] == current["token"]:
+            raise RuntimeError("no safe boundary")
+        original(record, timeout)
+
+    motor.drain = drain
+    motor.pending = True
+    with pytest.raises(RuntimeError, match="no safe boundary"):
+        dep.rollback("rollback-run")
+    assert dep.active() == current
+    assert motor.containers[current["container"]]["running"]

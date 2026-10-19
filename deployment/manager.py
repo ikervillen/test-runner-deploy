@@ -532,7 +532,8 @@ class Deployment:
                 self.complete(journal, "ROLLED_BACK")
             except Exception:
                 self.docker.drain(target, self.site["drain_seconds"])
-                self.docker.helper(target, ["check"])
+                if self.active() and self.active()["token"] == target["token"]:
+                    self.docker.helper(target, ["check"])
                 self.docker.resume(current)
                 save(self.active_path, current)
                 self.complete(journal, "ROLLBACK_ABORTED")
