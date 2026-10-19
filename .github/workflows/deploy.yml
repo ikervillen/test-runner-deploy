@@ -135,7 +135,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Deploy exact tested image to the branch environment
-        shell: pwsh
+        shell: powershell
         env:
           INGESTA_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INGESTA_REGISTRY_USER: ${{ github.actor }}
@@ -172,7 +172,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Restore previous compatible release without reverting data
-        shell: pwsh
+        shell: powershell
         env:
           INGESTA_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INGESTA_REGISTRY_USER: ${{ github.actor }}
@@ -196,7 +196,7 @@ jobs:
       contents: read
     steps:
       - name: Inspect Docker and input directory without running ingestion
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           docker context show
@@ -204,6 +204,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Motor Docker no disponible para la cuenta del runner.' }
           $image = 'python:3.12.14-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e'
           $check = 'from pathlib import Path; import json,sys; v={o:(Path("/input")/o).is_dir() for o in ["AV21","AV22","AV23","AV31","AV32"]}; print(json.dumps(v)); sys.exit(0 if all(v.values()) else 1)'
+          $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($check))
+          $check = "import base64;exec(base64.b64decode('$encoded'))"
           $found = $false
           foreach ($binding in @('C:/DataSharing/Fenix', '/mnt/c/DataSharing/Fenix')) {
             Write-Output "Comprobando montaje de solo lectura: $binding"

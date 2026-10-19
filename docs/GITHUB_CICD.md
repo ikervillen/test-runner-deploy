@@ -31,9 +31,10 @@ inventario de paquetes y resultados de imagen en los artefactos del workflow.
 
 1. Publicar el contenido de este directorio como raíz del repositorio. No publicar sus
    directorios vecinos ni CSV, Delta, SQLite, `.venv`, credenciales o logs reales.
-2. Mantener el runner existente como servicio con acceso a `docker` y PowerShell 7 (`pwsh`).
+2. Mantener el runner existente como servicio con acceso a `docker` y Windows PowerShell 5.1.
    Su cuenta debe tener acceso al mismo contexto/motor Linux que funcionó en la prueba.
-   Las acciones fijadas requieren una versión actual del runner; habilitar su actualización.
+   Se ha comprobado que no dispone de `pwsh`; los jobs del servidor usan `powershell` y
+   scripts compatibles con 5.1. Las acciones fijadas requieren una versión actual del runner.
 3. Crear los entornos GitHub `develop` y `main`, limitados a la rama homónima. El workflow
    los referencia por nombre. Si se añaden revisores obligatorios, el despliegue esperará
    su aprobación; para activación automática no configurar ese bloqueo manual.
