@@ -1,223 +1,47 @@
-name: Ingesta Delta Lake
+name: Observe develop pilot (read-only)
 on:
-  push:
-    branches: [main, develop]
-  pull_request:
   workflow_dispatch:
-    inputs:
-      operation:
-        type: choice
-        options: [validate, diagnose, rollback]
-        default: validate
-        description: 'validate: CI/imagen; diagnose: Docker/montaje sin ingesta; rollback: release previa'
-
 permissions:
   contents: read
-
 jobs:
-  contracts-and-delta:
-    if: github.event_name != 'workflow_dispatch' || inputs.operation == 'validate'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+  observe:
+    runs-on: [self-hosted, Windows, X64, fenix-ingesta]
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: '3.12'
-      - name: Install pinned uv
-        shell: pwsh
-        run: |
-          "UV_PROJECT_ENVIRONMENT=$env:RUNNER_TEMP/ingesta-delta-venv" >> $env:GITHUB_ENV
-          python -m pip install uv==0.11.6
-      - name: Install locked dependencies
-        run: uv sync --locked --python 3.12
-      - name: Lint
-        run: uv run --locked ruff check .
-      - name: Format
-        run: uv run --locked ruff format --check .
-      - name: Contracts and real Delta transactions on synthetic inputs
-        run: uv run --locked python -m pytest --cov=ingesta_delta_lake --cov=deployment --cov-report=term-missing --cov-fail-under=85
-
-  image:
-    needs: contracts-and-delta
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      image: ${{ steps.publish.outputs.image }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - name: Build the immutable candidate
-        id: candidate
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA}"
-          echo "CANDIDATE=$image" >> "$GITHUB_ENV"
-          echo "image=$image" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          platforms: linux/amd64
-          load: true
-          push: false
-          tags: ${{ steps.candidate.outputs.image }}
-          build-args: |
-            REVISION=${{ github.sha }}
-            SOURCE=${{ github.server_url }}/${{ github.repository }}
-            BRANCH=${{ github.ref_name }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: Exercise the final image without operational mounts
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p release
-          docker run --rm --network none --read-only --cap-drop ALL \
-            --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,size=512m \
-            "$CANDIDATE" self-test | tee release/image-tests.json
-          docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,size=64m \
-            "$CANDIDATE" describe > release/contracts.json
-          docker image inspect "$CANDIDATE" > release/image.json
-          docker run --rm --network none --read-only --entrypoint python "$CANDIDATE" \
-            -c 'import importlib.metadata as m,json; print(json.dumps(sorted((d.metadata["Name"],d.version) for d in m.distributions())))' \
-            > release/packages.json
-      - name: Exercise real Docker activation and graceful update
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m deployment.smoke --image "$CANDIDATE" | tee release/docker-lifecycle.json
-      - name: Publish tested image
-        id: publish
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          docker push "$CANDIDATE"
-          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$CANDIDATE")
-          echo "image=$digest" >> "$GITHUB_OUTPUT"
-          echo "$digest" > release/image-reference.txt
-          docker logout ghcr.io
-      - name: Preserve validation evidence
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: image-${{ github.sha }}
-          path: release/
-          if-no-files-found: error
-          retention-days: 30
-
-  deploy:
-    needs: image
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
-    runs-on: ${{ fromJSON(vars.INGESTA_RUNNER_LABELS || '["self-hosted","Windows","X64"]') }}
-    environment: ${{ github.ref_name }}
-    concurrency:
-      group: ingesta-deploy-${{ github.repository }}-${{ github.ref_name }}
-      cancel-in-progress: false
-    timeout-minutes: 75
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: '3.12'
-      - name: Deploy exact tested image to the branch environment
-        shell: powershell
-        env:
-          INGESTA_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          INGESTA_REGISTRY_USER: ${{ github.actor }}
-          DEPLOY_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
-          INPUT_BIND: ${{ vars.INGESTA_INPUT_BIND }}
-          DOCKER_CONTEXT_NAME: ${{ vars.INGESTA_DOCKER_CONTEXT }}
-          RELEASE_IMAGE: ${{ needs.image.outputs.image }}
-          RELEASE_SHA: ${{ github.sha }}
-          RELEASE_BRANCH: ${{ github.ref_name }}
-          RELEASE_RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          $site = ./scripts/prepare_site.ps1 -Repository $env:GITHUB_REPOSITORY `
-            -Branch $env:RELEASE_BRANCH -SitePath $env:DEPLOY_SITE `
-            -InputBind $env:INPUT_BIND -DockerContext $env:DOCKER_CONTEXT_NAME
-          ./scripts/deploy.ps1 -Site $site -Branch $env:RELEASE_BRANCH `
-            -Image $env:RELEASE_IMAGE -Commit $env:RELEASE_SHA -RunUrl $env:RELEASE_RUN
-
-  rollback:
-    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'rollback' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
-    runs-on: ${{ fromJSON(vars.INGESTA_RUNNER_LABELS || '["self-hosted","Windows","X64"]') }}
-    environment: ${{ github.ref_name }}
-    concurrency:
-      group: ingesta-deploy-${{ github.repository }}-${{ github.ref_name }}
-      cancel-in-progress: false
-    timeout-minutes: 75
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: '3.12'
-      - name: Restore previous compatible release without reverting data
-        shell: powershell
-        env:
-          INGESTA_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          INGESTA_REGISTRY_USER: ${{ github.actor }}
-          DEPLOY_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
-          INPUT_BIND: ${{ vars.INGESTA_INPUT_BIND }}
-          DOCKER_CONTEXT_NAME: ${{ vars.INGESTA_DOCKER_CONTEXT }}
-          RELEASE_BRANCH: ${{ github.ref_name }}
-          RELEASE_RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          $site = ./scripts/prepare_site.ps1 -Repository $env:GITHUB_REPOSITORY `
-            -Branch $env:RELEASE_BRANCH -SitePath $env:DEPLOY_SITE `
-            -InputBind $env:INPUT_BIND -DockerContext $env:DOCKER_CONTEXT_NAME
-          ./scripts/deploy.ps1 -Site $site -Branch $env:RELEASE_BRANCH `
-            -RunUrl $env:RELEASE_RUN -Mode Rollback
-
-  diagnose:
-    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'diagnose'
-    runs-on: ${{ fromJSON(vars.INGESTA_RUNNER_LABELS || '["self-hosted","Windows","X64"]') }}
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - name: Inspect Docker and input directory without running ingestion
+      - name: Read active release and lake inventory without ingestion
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          docker context show
-          docker info --format '{{.ID}} {{.OSType}} {{.Architecture}}'
-          if ($LASTEXITCODE -ne 0) { throw 'Motor Docker no disponible para la cuenta del runner.' }
-          $image = 'python:3.12.14-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e'
-          $check = 'from pathlib import Path; import json,sys; v={o:(Path("/input")/o).is_dir() for o in ["AV21","AV22","AV23","AV31","AV32"]}; print(json.dumps(v)); sys.exit(0 if all(v.values()) else 1)'
-          $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($check))
-          $check = "import base64;exec(base64.b64decode('$encoded'))"
-          $found = $false
-          foreach ($binding in @('C:/DataSharing/Fenix', '/mnt/c/DataSharing/Fenix')) {
-            Write-Output "Comprobando montaje de solo lectura: $binding"
-            docker run --rm --network none --read-only --cap-drop ALL `
-              --mount "type=bind,src=$binding,dst=/input,readonly" `
-              --entrypoint python $image -c $check
-            if ($LASTEXITCODE -eq 0) { Write-Output "INPUT_BIND_OK=$binding"; $found = $true; break }
+          $siteFile = Join-Path $env:LOCALAPPDATA 'FenixIngesta/site-develop.json'
+          if (-not (Test-Path -LiteralPath $siteFile)) { Write-Output 'NO_SITE_YET'; exit 0 }
+          $site = Get-Content -LiteralPath $siteFile -Raw | ConvertFrom-Json
+          $state = Join-Path $site.state_root 'develop'
+          Write-Output "DEPLOYMENT_STATE=$state"
+          $activeFile = Join-Path $state 'active.json'
+          if (-not (Test-Path -LiteralPath $activeFile)) {
+            Write-Output 'NO_ACTIVE_RELEASE_YET'
+            $journal = Join-Path $state 'transaction.json'
+            if (Test-Path -LiteralPath $journal) { Get-Content -LiteralPath $journal -Raw }
+            exit 0
           }
-          if (-not $found) { throw 'No se han encontrado los cinco orígenes en el montaje.' }
+          $active = Get-Content -LiteralPath $activeFile -Raw | ConvertFrom-Json
+          $active | Select-Object commit,image,container,volume,channel | ConvertTo-Json
+          $ctx = $site.docker_context
+          docker --context $ctx container inspect --format '{{json .State}}' $active.container
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect deployed worker' }
+          docker --context $ctx stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' $active.container
+          docker --context $ctx volume inspect --format '{{json .}}' $active.volume
+          if ($LASTEXITCODE -ne 0) { throw 'Volume absent; no helper is launched' }
+          docker --context $ctx exec $active.container python -m ingesta_delta_lake.runtime health
+          $code = "import base64;exec(base64.b64decode('IiIiT25lLXNob3QsIHJlYWQtb25seSBwaWxvdCBpbnZlbnRvcnkuIE5ldmVyIGludm9rZXMgaW5nZXN0aW9uIG9yIG9wZW5zIGNvbnRyb2xzIFJXLiIiIgppbXBvcnQgY29sbGVjdGlvbnMKaW1wb3J0IGRhdGV0aW1lCmltcG9ydCBqc29uCmltcG9ydCBvcwpmcm9tIHBhdGhsaWIgaW1wb3J0IFBhdGgKCmZyb20gZGVsdGFsYWtlIGltcG9ydCBEZWx0YVRhYmxlCmltcG9ydCBweWFycm93IGFzIHBhCgpyb290ID0gUGF0aCgnL2xha2UnKQpyZXBvcnQgPSB7J2F0JzogZGF0ZXRpbWUuZGF0ZXRpbWUubm93KGRhdGV0aW1lLnRpbWV6b25lLnV0YykuaXNvZm9ybWF0KCl9CnJlcG9ydFsnaWRlbnRpdHknXSA9IGpzb24ubG9hZHMoKHJvb3QgLyAnZW52aXJvbm1lbnQuanNvbicpLnJlYWRfdGV4dCgpKQpyZXBvcnRbJ3J1bnRpbWUnXSA9IFtdCmZvciBwIGluIChyb290IC8gJ3J1bnRpbWUnKS5nbG9iKCcqLmpzb24nKToKICAgIHRyeToKICAgICAgICB2YWx1ZSA9IGpzb24ubG9hZHMocC5yZWFkX3RleHQoKSkKICAgICAgICByZXBvcnRbJ3J1bnRpbWUnXS5hcHBlbmQoe2s6IHZhbHVlW2tdIGZvciBrIGluICgncGhhc2UnLCAndGltZScsICdmYW1pbHknKSBpZiBrIGluIHZhbHVlfSkKICAgIGV4Y2VwdCAoT1NFcnJvciwgVmFsdWVFcnJvcik6CiAgICAgICAgcGFzcwpyZXBvcnRbJ3RhYmxlcyddID0gW10KZm9yIHAgaW4gc29ydGVkKChyb290IC8gJ3NpbHZlcicgLyAnQUlBTEEnKS5pdGVyZGlyKCkpIGlmIChyb290IC8gJ3NpbHZlcicgLyAnQUlBTEEnKS5leGlzdHMoKSBlbHNlIFtdOgogICAgaWYgbm90IHAuaXNfZGlyKCk6CiAgICAgICAgY29udGludWUKICAgIGl0ZW0gPSB7J2ZhbWlseSc6IHAubmFtZSwgJ3BhdGgnOiBzdHIocCl9CiAgICB0cnk6CiAgICAgICAgdGFibGUgPSBEZWx0YVRhYmxlKHN0cihwKSkKICAgICAgICBhZGRzID0gcGEudGFibGUodGFibGUuZ2V0X2FkZF9hY3Rpb25zKCkpCiAgICAgICAgY291bnRzID0gYWRkc1snbnVtX3JlY29yZHMnXS50b19weWxpc3QoKQogICAgICAgIGl0ZW0udXBkYXRlKHZlcnNpb249dGFibGUudmVyc2lvbigpLCBmaWxlcz1hZGRzLm51bV9yb3dzLAogICAgICAgICAgICAgICAgICAgIHJvd3M9c3VtKGNvdW50cykgaWYgYWxsKG4gaXMgbm90IE5vbmUgZm9yIG4gaW4gY291bnRzKSBlbHNlIE5vbmUsCiAgICAgICAgICAgICAgICAgICAgc2NoZW1hX2ZpZWxkcz10YWJsZS5zY2hlbWEoKS50b19hcnJvdygpLm5hbWVzLAogICAgICAgICAgICAgICAgICAgIGNvbnRyYWN0PXRhYmxlLm1ldGFkYXRhKCkuY29uZmlndXJhdGlvbikKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICBpdGVtWydlcnJvciddID0gc3RyKGUpCiAgICByZXBvcnRbJ3RhYmxlcyddLmFwcGVuZChpdGVtKQpsYXN0ID0ge30KY291bnRzID0gY29sbGVjdGlvbnMuQ291bnRlcigpCmZvciBwIGluIHNvcnRlZCgocm9vdCAvICdsb2dzJykuZ2xvYignKi5qc29ubCcpKVstMjpdOgogICAgZm9yIGxpbmUgaW4gcC5vcGVuKGVuY29kaW5nPSd1dGYtOCcpOgogICAgICAgIHRyeToKICAgICAgICAgICAgZXZlbnQgPSBqc29uLmxvYWRzKGxpbmUpCiAgICAgICAgZXhjZXB0IFZhbHVlRXJyb3I6CiAgICAgICAgICAgIGNvbnRpbnVlCiAgICAgICAgcmVzdWx0ID0gZXZlbnQuZ2V0KCdyZXN1bHQnLCB7fSkKICAgICAgICBjb3VudHNbKGV2ZW50LmdldCgnZmFtaWx5JyksIHJlc3VsdC5nZXQoJ3N0YXR1cycpKV0gKz0gMQogICAgICAgIGxhc3RbZXZlbnQuZ2V0KCdmYW1pbHknKV0gPSB7azogZXZlbnRba10gZm9yIGsgaW4gKCd0aW1lJywgJ3NlY29uZHMnKSBpZiBrIGluIGV2ZW50fQogICAgICAgIGxhc3RbZXZlbnQuZ2V0KCdmYW1pbHknKV1bJ3Jlc3VsdCddID0gewogICAgICAgICAgICBrOiB2IGZvciBrLCB2IGluIHJlc3VsdC5pdGVtcygpCiAgICAgICAgICAgIGlmIGlzaW5zdGFuY2UodiwgKHN0ciwgaW50LCBmbG9hdCwgYm9vbCkpIG9yIHYgaXMgTm9uZQogICAgICAgIH0KcmVwb3J0WydsYXRlc3RfZmFtaWx5X3Jlc3VsdHMnXSA9IGxhc3QKcmVwb3J0WydyZXN1bHRfY291bnRzJ10gPSBbeydmYW1pbHknOiBmLCAnc3RhdHVzJzogcywgJ2NvdW50Jzogbn0gZm9yIChmLCBzKSwgbiBpbiBjb3VudHMuaXRlbXMoKV0KYnJvbnplID0gY29sbGVjdGlvbnMuQ291bnRlcigpCmZvciBwIGluIChyb290IC8gJ2Jyb256ZScpLnJnbG9iKCcqLmNzdicpOgogICAgcmVsYXRpdmUgPSBwLnJlbGF0aXZlX3RvKHJvb3QgLyAnYnJvbnplJykKICAgIGlmIGxlbihyZWxhdGl2ZS5wYXJ0cykgPj0gMzoKICAgICAgICBicm9uemVbKHJlbGF0aXZlLnBhcnRzWzFdLCByZWxhdGl2ZS5wYXJ0c1syXSldICs9IDEKcmVwb3J0Wydicm9uemVfY2FwdHVyZXMnXSA9IFt7J29yaWdpbic6IG8sICdmYW1pbHknOiBmLCAnZmlsZXMnOiBufSBmb3IgKG8sIGYpLCBuIGluIHNvcnRlZChicm9uemUuaXRlbXMoKSldCnJlcG9ydFsnY29udHJvbHMnXSA9IFt7J2ZpbGUnOiBwLm5hbWUsICdieXRlcyc6IHAuc3RhdCgpLnN0X3NpemV9IGZvciBwIGluIHNvcnRlZCgocm9vdCAvICdjb250cm9sJykuZ2xvYignKi5zcWxpdGUnKSldCnJlcG9ydFsnaW5wdXQnXSA9IFtdCmZvciBvcmlnaW4gaW4gWydBVjIxJywgJ0FWMjInLCAnQVYyMycsICdBVjMxJywgJ0FWMzInXToKICAgIGZvbGRlciA9IFBhdGgoJy9pbnB1dCcpIC8gb3JpZ2luCiAgICBwYXRocyA9IGxpc3QoZm9sZGVyLmdsb2IoJyouY3N2JykpCiAgICByZXBvcnRbJ2lucHV0J10uYXBwZW5kKHsnb3JpZ2luJzogb3JpZ2luLCAnY3N2X2ZpbGVzJzogbGVuKHBhdGhzKSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICdjaGlsZF9kaXJlY3Rvcmllcyc6IHNvcnRlZChwLm5hbWUgZm9yIHAgaW4gZm9sZGVyLml0ZXJkaXIoKSBpZiBwLmlzX2RpcigpKSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICdsYXRlc3RfbW9kaWZpZWRfdXRjJzogZGF0ZXRpbWUuZGF0ZXRpbWUuZnJvbXRpbWVzdGFtcChtYXgocC5zdGF0KCkuc3RfbXRpbWUgZm9yIHAgaW4gcGF0aHMpLCBkYXRldGltZS50aW1lem9uZS51dGMpLmlzb2Zvcm1hdCgpIGlmIHBhdGhzIGVsc2UgTm9uZX0pCnByaW50KGpzb24uZHVtcHMocmVwb3J0LCBlbnN1cmVfYXNjaWk9VHJ1ZSwgc29ydF9rZXlzPVRydWUpKQo='))"
+          $out = docker --context $ctx run --rm --pull never --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 512m --cpus 1 --tmpfs '/tmp:rw,nosuid,size=64m' --mount "type=volume,src=$($active.volume),dst=/lake,readonly" --mount "type=bind,src=$($site.input_bind),dst=/input,readonly" --entrypoint python $active.image -c $code
+          if ($LASTEXITCODE -ne 0) { throw 'Read-only inventory failed' }
+          $target = Join-Path $env:RUNNER_TEMP 'develop-pilot-inventory.json'
+          [IO.File]::WriteAllText($target, ($out -join "`n"), [Text.UTF8Encoding]::new($false))
+          Write-Output $out
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: develop-pilot-inventory
+          path: ${{ runner.temp }}/develop-pilot-inventory.json
+          if-no-files-found: warn
+          retention-days: 14
