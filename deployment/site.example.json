@@ -1,0 +1,20 @@
+{
+  "repository": "ikervillen/test-runner-deploy",
+  "namespace": "fenix-aiala",
+  "docker_context": "default",
+  "state_root": "C:/ProgramData/FenixIngesta/deployments",
+  "input_bind": "C:/DataSharing/Fenix",
+  "drain_seconds": 1800,
+  "interval_seconds": 600,
+  "environments": {
+    "develop": {"volume": "fenix-aiala-develop", "instance": "11111111111111111111111111111111"},
+    "main": {"volume": "fenix-aiala-main", "instance": "22222222222222222222222222222222"}
+  },
+  "settings": {
+    "plant": "AIALA",
+    "sources": {"AV21": "AV21", "AV22": "AV22", "AV23": "AV23", "AV31": "AV31", "AV32": "AV32"},
+    "encoding": "cp1252",
+    "line_by_origin": {"AV21": "AV21", "AV22": "AV22", "AV23": "AV23", "AV31": "AV31", "AV32": "AV32"},
+    "line_code_by_origin": {"AV21": 21, "AV22": 22, "AV23": 23, "AV31": 31, "AV32": 32}
+  }
+}

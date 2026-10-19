@@ -1,0 +1,22 @@
+# Ejecutar antes los tres diccionarios AR sobre la misma planta/raíces.
+environment = "test"
+plant = "AIALA"
+family = "LISTA_AR"
+input_root = "C:/Ingesta_Delta_Lake_ensayo/incoming"
+bronze_root = "C:/Ingesta_Delta_Lake_ensayo/bronze"
+silver_root = "C:/Ingesta_Delta_Lake_ensayo/silver"
+control_root = "C:/Ingesta_Delta_Lake_ensayo/control"
+encoding = "cp1252"
+timestamp_policy = "local_naive_test_v1"
+# Umbral de ensayo, no regla productiva ni permiso para descartar pendientes.
+pending_review_after_hours = 24.0
+stable_wait_seconds = 0.2
+capture_attempts = 3
+max_file_bytes = 67108864
+
+[sources]
+AV21 = "AV21"
+AV22 = "AV22"
+AV23 = "AV23"
+AV31 = "AV31"
+AV32 = "AV32"
