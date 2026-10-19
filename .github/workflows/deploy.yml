@@ -8,6 +8,13 @@ jobs:
     runs-on: [self-hosted, Windows, X64, fenix-ingesta]
     timeout-minutes: 10
     steps:
+      - name: Inventory input filenames and sizes without reading rows
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $code = "import base64;exec(base64.b64decode('ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCmltcG9ydCBjb2xsZWN0aW9ucyxqc29uCmZhbWlsaWVzPVsnU0lQX01PREVMTycsJ1NJUF9ERUZFQ1RPJywnU0lQX0RFRkVDVE9fU1RBVFVTJywnU0lQX0RFRkVDVE9fQVInLCdTSVBfTUFRVUlOQV9NT0xERU8nLCdTSVBfTElORUFfWkYnLCdNUDlfQ0FNQklPX01PREVMTycsJ0xJU1RBX0FSJywnTElTVEFfUkVDSCcsJ0xJU1RBX0RFRkVDVE9TJywnQ09OVF9aQyddCm91dHB1dD1bXQpmb3Igb3JpZ2luIGluIFsnQVYyMScsJ0FWMjInLCdBVjIzJywnQVYzMScsJ0FWMzInXToKICAgIGZvbGRlcj1QYXRoKCcvaW5wdXQnKS9vcmlnaW4KICAgIHBhdGhzPWxpc3QoZm9sZGVyLmdsb2IoJyouY3N2JykpCiAgICBjb3VudHM9Y29sbGVjdGlvbnMuQ291bnRlcigpCiAgICBmb3IgcCBpbiBwYXRoczoKICAgICAgICBmb3IgZiBpbiBmYW1pbGllczoKICAgICAgICAgICAgaWYgcC5zdGVtLnVwcGVyKCkuZW5kc3dpdGgoZik6Y291bnRzW2ZdKz0xO2JyZWFrCiAgICBvdXRwdXQuYXBwZW5kKHsnb3JpZ2luJzpvcmlnaW4sJ2RpcmVjdF9jc3YnOmxlbihwYXRocyksJ3JlY29nbml6ZWQnOmRpY3QoY291bnRzKSwnc3ViZGlyZWN0b3JpZXMnOnNvcnRlZChwLm5hbWUgZm9yIHAgaW4gZm9sZGVyLml0ZXJkaXIoKSBpZiBwLmlzX2RpcigpKSwnbGFyZ2VzdF9ieXRlcyc6bWF4KChwLnN0YXQoKS5zdF9zaXplIGZvciBwIGluIHBhdGhzKSxkZWZhdWx0PTApLCdmaWxlbmFtZV9leGFtcGxlcyc6W3AubmFtZSBmb3IgcCBpbiBzb3J0ZWQocGF0aHMpWzozXV19KQpwcmludChqc29uLmR1bXBzKHsnaW5wdXRfaW52ZW50b3J5JzpvdXRwdXR9KSkK'))"
+          docker --context desktop-linux run --rm --pull never --network none --read-only --cap-drop ALL --memory 256m --cpus 1 --mount 'type=bind,src=C:/DataSharing/Fenix,dst=/input,readonly' --entrypoint python 'python:3.12.14-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e' -c $code
+          if ($LASTEXITCODE -ne 0) { throw 'Input inventory failed' }
       - name: Read active release and lake inventory without ingestion
         shell: powershell
         run: |
