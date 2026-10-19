@@ -26,15 +26,10 @@ try {
         Copy-Item -LiteralPath $contextsDirectory -Destination $temporaryDockerConfig -Recurse
     }
     $env:DOCKER_CONFIG = $temporaryDockerConfig
-    # Windows PowerShell 5.1 puede heredar UTF-8 con BOM del perfil del runner.
-    # El BOM también se envía al stdin nativo y pasa a formar parte de la contraseña.
-    $originalOutputEncoding = $OutputEncoding
-    try {
-        $OutputEncoding = [Text.UTF8Encoding]::new($false)
-        $env:INGESTA_GITHUB_TOKEN | docker login ghcr.io --username $env:INGESTA_REGISTRY_USER --password-stdin
-        if ($LASTEXITCODE -ne 0) { throw 'No se ha podido autenticar el acceso al registro.' }
-    }
-    finally { $OutputEncoding = $originalOutputEncoding }
+    # Entregar bytes al stdin de Docker desde Python: la tubería de PowerShell 5.1
+    # puede añadir un BOM al token según el perfil/configuración del runner.
+    & $Python (Join-Path $projectDirectory 'deployment/registry.py')
+    if ($LASTEXITCODE -ne 0) { throw 'No se ha podido autenticar el acceso al registro.' }
     Push-Location -LiteralPath $projectDirectory
     try {
         $deploymentArguments = @('-m', 'deployment.manager', '--site', $Site,

@@ -19,13 +19,15 @@ def test_registry_stdin_is_bom_free_and_encoding_is_restored(tmp_path, login_exi
     script = Path("scripts/deploy.ps1").resolve()
     capture = tmp_path / "capture.py"
     capture.write_text(
-        "import json,os,sys\n"
+        "import json,os,sys,subprocess\n"
         "from pathlib import Path\n"
         "root=Path(os.environ['REGISTRY_PROBE_ROOT'])\n"
         "if sys.argv[1]=='docker':\n"
         "    (root/'stdin.bin').write_bytes(sys.stdin.buffer.read())\n"
         "    (root/'docker-args.json').write_text(json.dumps(sys.argv[2:]))\n"
         "    sys.exit(int(os.environ['REGISTRY_PROBE_EXIT']))\n"
+        "if Path(sys.argv[2]).name=='registry.py':\n"
+        "    sys.exit(subprocess.call([sys.executable,*sys.argv[2:]]))\n"
         "(root/'manager-called.json').write_text(json.dumps(sys.argv[2:]))\n",
         encoding="utf-8",
     )
