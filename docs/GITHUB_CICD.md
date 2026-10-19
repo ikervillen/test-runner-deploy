@@ -105,9 +105,11 @@ Después de la prueba aislada, desactiva reinicio automático del contenedor ant
 SIGTERM. El worker termina la unidad en curso y sale; no se fuerza con SIGKILL. Si se agota
 el plazo, se aborta/restaura la programación de la versión anterior. Antes de cambiar imagen,
 se comprueban contratos, esquemas, propiedad y operaciones PREPARED/WRITING/UNKNOWN en lectura.
-Para SQLite en modo WAL se usa una copia temporal de control y WAL: así la lectura no
-necesita crear archivos SHM/WAL en el montaje original de solo lectura. La comprobación
-de activación se hace con el escritor detenido y el arranque vuelve a comprobar bajo lock.
+Con escritor detenido y sin WAL, SQLite se consulta en modo readonly/immutable, sin crear
+SHM ni copiar controles grandes a memoria. Un WAL pendiente bloquea el cambio de imagen:
+no se ignora. El worker propietario lo lee/recupera bajo lock desde su montaje operativo,
+donde puede reconstruir los archivos de coordinación necesarios. La comprobación previa
+no equivale a un escaneo completo de integridad del histórico.
 Un lote incierto se reconcilia con su release; no se entrega a otra por el mero despliegue.
 
 La nueva instancia empieza en READY sin escribir datos. Se confirma el descriptor activo

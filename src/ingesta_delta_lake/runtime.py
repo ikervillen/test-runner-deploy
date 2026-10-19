@@ -3,11 +3,9 @@
 import argparse
 import json
 import os
-import shutil
 import signal
 import sqlite3
 import sys
-import tempfile
 import threading
 import time
 from contextlib import closing, contextmanager
@@ -115,19 +113,20 @@ def bootstrap():
 
 
 @contextmanager
-def control_copy(path):
-    """Leer sin crear -shm/-wal en un volumen RO; el escritor debe estar detenido."""
-    with tempfile.TemporaryDirectory(prefix="fenix-control-check-") as folder:
-        target = Path(folder) / "control.sqlite"
-        shutil.copyfile(path, target)
-        wal = path.with_name(path.name + "-wal")
-        if wal.exists():
-            shutil.copyfile(wal, target.with_name(target.name + "-wal"))
-        with closing(sqlite3.connect(target.as_uri() + "?mode=ro", uri=True)) as db:
-            db.execute("PRAGMA query_only=ON")
-            if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                raise IntegrityError("Control SQLite inconsistente")
-            yield db
+def control_read(path, allow_pending=False):
+    """Preflight detenido: no crear SHM ni copiar controles grandes a RAM.
+
+    immutable solo se usa SIN WAL. Con WAL nunca se ignoran sus commits: el worker
+    propietario lo lee en modo RO sobre su montaje RW para poder reconstruir SHM.
+    """
+    wal = path.with_name(path.name + "-wal")
+    has_wal = wal.exists() and wal.stat().st_size > 0
+    if has_wal and not allow_pending:
+        raise IntegrityError("Recuperar WAL con la release propietaria antes de actualizar")
+    uri = path.as_uri() + "?mode=ro" + ("" if has_wal else "&immutable=1")
+    with closing(sqlite3.connect(uri, uri=True)) as db:
+        db.execute("PRAGMA query_only=ON")
+        yield db
 
 
 def check(allow_pending=False):
@@ -145,7 +144,7 @@ def check(allow_pending=False):
                 raise IntegrityError(f"Tabla sin control: {family}")
             versions[family] = None
             continue
-        with control_copy(cfg.control_path) as db:
+        with control_read(cfg.control_path, allow_pending) as db:
             values = dict(db.execute("SELECT key,value FROM settings"))
             expected = canonical(
                 {

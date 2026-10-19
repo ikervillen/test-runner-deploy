@@ -70,6 +70,7 @@ def test_check_validates_accepted_table_without_writes_and_rejects_pending(mount
     assert before == {str(p): p.read_bytes() for p in config.silver_root.rglob("*") if p.is_file()}
     with sqlite3.connect(config.control_path) as db:
         db.execute("UPDATE batches SET state='UNKNOWN'")
+    db.close()
     with pytest.raises(IntegrityError, match="Recuperar"):
         runtime.check()
     assert runtime.check(allow_pending=True)["pending"][0]["state"] == "UNKNOWN"
@@ -82,6 +83,7 @@ def test_check_rejects_incompatible_existing_binding(mounted):
     run(config)
     with sqlite3.connect(config.control_path) as db:
         db.execute("UPDATE settings SET value='{}' WHERE key='binding'")
+    db.close()
     with pytest.raises(IntegrityError, match="incompatibles"):
         runtime.check()
 
@@ -148,17 +150,22 @@ def test_runtime_cli_describe_and_report_failure(mounted, capsys):
     assert json.loads(capsys.readouterr().err)["status"] == "FAILED"
 
 
-def test_readonly_control_copy_includes_uncheckpointed_wal_without_changing_source(tmp_path):
+def test_preflight_never_ignores_wal_and_owner_reads_it_before_recovery(tmp_path):
     path = tmp_path / "source.sqlite"
     with sqlite3.connect(path) as writer:
         writer.execute("PRAGMA journal_mode=WAL")
         writer.execute("CREATE TABLE sample(value TEXT)")
         writer.execute("INSERT INTO sample VALUES('confirmed')")
         writer.commit()
-        files = {str(p): p.read_bytes() for p in tmp_path.iterdir()}
-        with runtime.control_copy(path) as reader:
+        files = {str(p): p.read_bytes() for p in tmp_path.iterdir() if not p.name.endswith("-shm")}
+        with pytest.raises(IntegrityError, match="Recuperar WAL"):
+            with runtime.control_read(path):
+                pytest.fail("No debe leer una versión que omita WAL")
+        with runtime.control_read(path, allow_pending=True) as reader:
             assert reader.execute("SELECT value FROM sample").fetchone()[0] == "confirmed"
-        assert files == {str(p): p.read_bytes() for p in tmp_path.iterdir()}
+        assert files == {
+            str(p): p.read_bytes() for p in tmp_path.iterdir() if not p.name.endswith("-shm")
+        }
 
 
 @pytest.mark.parametrize(

@@ -226,7 +226,9 @@ class Docker:
     def resume(self, record):
         if not self.container(record["container"]):
             raise RuntimeError("Falta el contenedor previo; requiere recuperación operativa")
-        self.helper(record, ["check", "--allow-pending"])
+        # El propio worker comprueba bajo lock y recupera con su imagen/montaje RW.
+        # No abrir WAL que necesite reconstruir SHM sobre un volumen readonly.
+        self.helper(record, ["identity"])
         self.call("update", "--restart=unless-stopped", record["container"])
         if not self.running(record["container"]):
             self.call("start", record["container"])
