@@ -365,7 +365,15 @@ class Deployment:
                 raise RuntimeError("La identidad/procedencia de imagen no coincide con la release")
             manifest = json.loads(
                 self.docker.call(
-                    "run", "--rm", "--network", "none", "--read-only", image, "describe"
+                    "run",
+                    "--rm",
+                    "--network",
+                    "none",
+                    "--read-only",
+                    "--tmpfs",
+                    "/tmp:rw,nosuid,size=64m",
+                    image,
+                    "describe",
                 )
             )
             token = uuid.uuid4().hex
