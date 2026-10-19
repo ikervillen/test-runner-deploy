@@ -3,12 +3,14 @@
 import argparse
 import json
 import os
+import shutil
 import signal
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -112,6 +114,22 @@ def bootstrap():
     return {"status": "PREPARED"}
 
 
+@contextmanager
+def control_copy(path):
+    """Leer sin crear -shm/-wal en un volumen RO; el escritor debe estar detenido."""
+    with tempfile.TemporaryDirectory(prefix="fenix-control-check-") as folder:
+        target = Path(folder) / "control.sqlite"
+        shutil.copyfile(path, target)
+        wal = path.with_name(path.name + "-wal")
+        if wal.exists():
+            shutil.copyfile(wal, target.with_name(target.name + "-wal"))
+        with closing(sqlite3.connect(target.as_uri() + "?mode=ro", uri=True)) as db:
+            db.execute("PRAGMA query_only=ON")
+            if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise IntegrityError("Control SQLite inconsistente")
+            yield db
+
+
 def check(allow_pending=False):
     """Solo lectura: binding, propiedad, esquema y confirmación técnica, sin leer CSV."""
     from .association_storage import STORES, AssociationStore
@@ -127,8 +145,7 @@ def check(allow_pending=False):
                 raise IntegrityError(f"Tabla sin control: {family}")
             versions[family] = None
             continue
-        with closing(sqlite3.connect(cfg.control_path.as_uri() + "?mode=ro", uri=True)) as db:
-            db.execute("PRAGMA query_only=ON")
+        with control_copy(cfg.control_path) as db:
             values = dict(db.execute("SELECT key,value FROM settings"))
             expected = canonical(
                 {

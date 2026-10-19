@@ -148,6 +148,19 @@ def test_runtime_cli_describe_and_report_failure(mounted, capsys):
     assert json.loads(capsys.readouterr().err)["status"] == "FAILED"
 
 
+def test_readonly_control_copy_includes_uncheckpointed_wal_without_changing_source(tmp_path):
+    path = tmp_path / "source.sqlite"
+    with sqlite3.connect(path) as writer:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("CREATE TABLE sample(value TEXT)")
+        writer.execute("INSERT INTO sample VALUES('confirmed')")
+        writer.commit()
+        files = {str(p): p.read_bytes() for p in tmp_path.iterdir()}
+        with runtime.control_copy(path) as reader:
+            assert reader.execute("SELECT value FROM sample").fetchone()[0] == "confirmed"
+        assert files == {str(p): p.read_bytes() for p in tmp_path.iterdir()}
+
+
 @pytest.mark.parametrize(
     "key,value",
     [

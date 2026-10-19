@@ -31,7 +31,7 @@ ZF_OK conserva su revisión independiente. Reconstrucción real en servidor desp
 | [11](entregas/11_asociacion_temporal.md) | Asociación temporal producción–ramal | Implementación local; 237.872 observaciones conciliadas y 16 candidatas; vigencias reales pendientes de revisión, publicación/corrección/recuperación probadas con datos sintéticos |
 | [11A](entregas/11a_identidad_tandem.md) | Prerrequisito MP9 v2 y contrato tándem | Máquina recuperada/validada en código; migración real pendiente |
 | [11B/11C](entregas/11bc_catalogos_derivados.md) | Catálogos físicos y derivados v2 | Implementados y probados con datos sintéticos; reconstrucción/conciliación real en servidor tras GitHub/CI |
-| [12](entregas/12_consumo_operacion.md) | Consulta, operación y despliegue | Pendiente |
+| [12](entregas/12_consumo_operacion.md) | Consulta, operación y despliegue | CI/CD Docker implementado; piloto/consumo de la app y aceptación operativa pendientes |
 
 Cada cambio mantiene las pruebas de las entregas anteriores. Una entrega aceptada en local
 no acredita operación productiva en el servidor. AV31 dispone de una relación física

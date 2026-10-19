@@ -54,9 +54,10 @@ uv run --locked ruff format --check .
 ```
 
 En Linux, usar una ruta de entorno externa al checkout y `uv sync --locked --python 3.12`.
-Las pruebas solo usan entradas sintéticas y directorios temporales. El workflow preparado
-prueba Windows/Linux cuando este directorio sea la raíz del repositorio GitHub; todavía
-no constituye una ejecución de CI ni un despliegue remoto.
+Las pruebas usan entradas sintéticas y directorios temporales. Actions ya ejecuta la CI
+Windows/Linux y la validación de imagen en el repositorio; el diagnóstico del motor y
+montaje real está verificado. El despliegue de ingesta queda pendiente del merge a develop.
+El estado de cada comprobación se consulta en la PR, sin confundir CI con aceptación real.
 
 ## Ejecución controlada
 
