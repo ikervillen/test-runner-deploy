@@ -154,3 +154,97 @@ La CI local no sustituye el ensayo real: primero diagnosticar acceso; después d
 `develop`, conciliar fuente/atribuidas/pendientes, revisar las tándem y ZF_OK, comprobar replay,
 recuperación y reinicio del host; finalmente promover a `main`. Medir rendimiento/consumo
 con las llegadas reales. Integración de la app y cálculo de score continúan separados.
+
+## Primera carga MIA con muchas versiones acumuladas
+
+El piloto del 19/10/2026 confirmó que analizar todas las versiones MIA simultáneamente
+superaba el límite de memoria del worker. `LISTA_RECH` y `LISTA_DEFECTOS` se procesan
+por grupos de hasta ocho versiones únicas y 4 MiB de CSV; un archivo individual mayor
+se procesa solo, con un máximo MIA de 8 MiB. Un archivo superior produce un error
+explícito y permanece pendiente de resolver: nunca se consume ni se omite silenciosamente. Los descriptores
+de captura son pequeños y las evidencias CSV permanecen en Bronze.
+
+Cada grupo conserva su intención, transacción Delta, confirmación y auditoría propias.
+Solo después de confirmar un lote `COMPLETED` o `PARTIAL` se registra `(origen, SHA-256)`
+en `consumed_inputs`, con referencia al lote. Una interrupción antes de registrar esa
+marca reevalúa la versión frente al destino ya confirmado, sin duplicar filas. Una
+interrupción posterior continúa con las versiones restantes. Un resultado `PARTIAL`
+significa que las filas aceptadas y las contradicciones están conservadas; no resuelve
+los casos de negocio pendientes ni habilita sus grupos para sumar inspeccionadas.
+
+Los archivos se siguen capturando/verificando y cada intento conserva sus recepciones,
+incluidos renombrados. Una versión ya consumida no se vuelve a analizar ni replica su
+evidencia de incidencia. Un contenido nuevo bajo el mismo nombre tiene otro hash y se
+procesa normalmente. Las columnas y claves de Silver se mantienen. Los contadores de
+transformación se suman por grupos procesados (`stats_scope`); las bases de inspección
+se calculan globalmente sobre registros aceptados y casos abiertos, sin sumar repetidos.
+
+SIGTERM permite terminar el grupo en curso y salir antes del siguiente. El resultado
+`STOPPED_AFTER_BATCH` indica cobertura incompleta y registra cuántas versiones restan.
+El siguiente arranque retoma esos grupos. El presupuesto del worker continúa siendo
+4 GiB, con `--memory-swap=4g` para impedir que la paginación oculte presión de memoria.
+El 20/10 el motor WSL2 exponía 8.328.400.896 bytes (unos 7,8 GiB), aunque Windows
+disponga de 16 GB. El archivo MIA mayor medido ocupaba 1.454.719 bytes. Estos límites
+son de entrada y contenedor: no prometen un factor fijo de expansión en Python ni
+un tiempo máximo universal. El historial aceptado también consume memoria y debe
+seguirse midiendo. El ajuste diagnóstico temporal a 6 GiB de la primera imagen
+no sustituye esta corrección.
+
+
+La cola `input_versions` se identifica por `(origen, SHA-256)`. Su creación migra los
+recibos anteriores una sola vez, de forma transaccional; no relee toda la auditoría
+histórica en cada ciclo. La captura y su alta en cola se confirman juntas. Los CSV
+capturados pendientes se recuperan desde Bronze aunque ya no estén en la entrada.
+Las versiones sin hora se ordenan primero, después por marca de exportación,
+mtime, origen, ruta y hash. Este orden no modifica fechas de negocio.
+
+Para versiones ya capturadas se verifica siempre el hash del archivo de entrada y
+de su evidencia Bronze. Si coinciden con una captura estable anterior, se reutiliza
+esta sin esperar otra ventana de estabilización ni generar una nueva copia diaria.
+Un cambio que conserve nombre, tamaño y mtime también se detecta por contenido.
+Las versiones nuevas mantienen la doble lectura de estabilidad y los reintentos.
+Los grupos emiten `INPUT_BATCH_CONFIRMED` con duración, bytes, versión Delta y
+versiones pendientes. Las llegadas posteriores al descubrimiento se incorporan en
+el siguiente ciclo; el intervalo comienza tras terminar el ciclo en curso.
+
+### Recuperación explícita de la carga inicial interrumpida
+
+`python -m deployment.maintenance --site <site-develop.json> --family LISTA_RECH
+--run-url <URL-del-job>` es una operación **manual y offline**, separada del despliegue
+automático. Requiere el volumen existente y la imagen propietaria exacta, retenida
+localmente. Funciona aunque se haya eliminado su contenedor. Nunca crea un volumen,
+arranca un worker ni procesa CSV como parte de la reparación.
+
+El controlador bloquea despliegues simultáneos, verifica motor, identidad, volumen,
+configuración e imagen; exige que no exista ningún contenedor activo con ese volumen.
+Ejecuta el script montado de solo lectura dentro de la imagen propietaria, sin red,
+con las raíces originales y el volumen persistente en escritura. El script adquiere
+los bloqueos de runtime y escritor y abre una transacción SQLite inmediata.
+
+Solo se permite retirar una intención inicial en `PREPARED`, sin versión Delta,
+sin contenido alguno en el destino y sin intenciones de filas que puedan haberse
+escrito. `WRITING`, `UNKNOWN`, un Parquet huérfano, un hash alterado o cualquier duda
+bloquean la operación y requieren reconciliación. La inexistencia del contenedor
+no se utiliza como prueba de que no hubo commit.
+
+Se verifican los recibos Bronze y se copia el JSON preparado íntegro mediante bloques
+de 1 MiB, sin cargarlo completo en Python. El archivo se sincroniza y se verifica
+con SHA-256; se comprueba espacio libre antes de copiar. La evidencia queda bajo
+`/lake/control/recovery/<batch_id>.prepared.json`. Después se confirma atómicamente:
+
+- El lote y sus intenciones pasan a `ABORTED_UNWRITTEN`; no se marca ningún CSV como consumido.
+- El campo JSON grande se sustituye por la referencia al archivo íntegro archivado.
+- Se conserva el resto de intenciones, incidencias y recibos sin borrar ni sumar datos.
+- Se registra un evento de mantenimiento y una generación nueva para el reprocesamiento.
+
+Una interrupción antes del commit deja el lote original pendiente; el archivo ya
+archivado se verifica y reutiliza en el reintento. Una interrupción posterior deja
+la resolución persistida y el reintento no la duplica. El checkpoint WAL se exige
+antes de permitir el preflight de actualización. El controlador conserva también
+un recibo externo al checkout con imagen propietaria, hash del script y resultado.
+
+Tras validar esta reparación se despliega la imagen con lotes acotados. No se debe
+reanudar la imagen antigua para reconstruir la carga acumulada: volvería a agruparla
+entera. No ejecutar VACUUM, borrar SQLite, recrear el volumen ni eliminar Bronze
+para resolver este caso. Los commits inciertos ordinarios siguen reconciliándose
+por su `operation_id` y la historia Delta antes de escribir otra vez.

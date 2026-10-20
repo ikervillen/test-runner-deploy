@@ -255,6 +255,8 @@ def common_args(record):
         "256",
         "--memory",
         "4g",
+        "--memory-swap",
+        "4g",
         "--cpus",
         "2",
         "--tmpfs",
