@@ -244,7 +244,11 @@ def worker(interval=600):
                     try:
                         from .service import run
 
-                        result = run(replace(base, family=family), runtime_owner=True)
+                        result = run(
+                            replace(base, family=family),
+                            runtime_owner=True,
+                            stop_requested=stop.is_set,
+                        )
                     except Exception as exc:
                         result = {"status": "FAILED", "error": str(exc)}
                     event = {

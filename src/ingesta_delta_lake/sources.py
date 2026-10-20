@@ -6,7 +6,7 @@ import re
 import tempfile
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .common import CaptureError, IntegrityError, now
@@ -28,6 +28,38 @@ class Snapshot:
 
     def descriptor(self) -> dict:
         return asdict(self)
+
+
+def orphan_captures(config, known):
+    """Recover a crash between durable Bronze capture and its SQLite receipt.
+
+    Only the writer's exact origin/family/hash layout is eligible. The original
+    export path/time is unknown; expose the actual Bronze path, never invent it.
+    """
+    for origin, _ in config.sources:
+        root = config.bronze_root / config.plant / origin / config.family
+        for path in sorted(root.glob("*/*.csv")):
+            if not re.fullmatch(r"[0-9a-f]{64}", path.stem):
+                raise IntegrityError("Unexpected file in immutable capture namespace")
+            if (origin, path.stem) in known:
+                continue
+            resolved = path.resolve()
+            if not resolved.is_relative_to(root.resolve()):
+                raise IntegrityError("Orphan capture outside its origin/family")
+            with resolved.open("rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != path.stem:
+                    raise IntegrityError("Orphan Bronze capture hash differs from its name")
+            stat = resolved.stat()
+            yield Snapshot(
+                origin,
+                str(resolved),
+                path.stem,
+                str(resolved),
+                stat.st_size,
+                0,
+                datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
+                None,
+            )
 
 
 def parse_name(name: str, family: str = FAMILY) -> str | None:
@@ -83,11 +115,37 @@ def _read_limited(path: Path, maximum: int) -> bytes:
     return data
 
 
-def capture(config: Config, origin: str, path: Path, producer_time: str | None) -> Snapshot:
+def capture(
+    config: Config, origin: str, path: Path, producer_time: str | None, *, known=None
+) -> Snapshot:
     for attempt in range(config.capture_attempts):
         try:
             before = path.stat()
             data = _read_limited(path, config.max_file_bytes)
+            sha = hashlib.sha256(data).hexdigest()
+            prior = (known or {}).get((origin, sha))
+            if prior is not None:
+                after = path.stat()
+                if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                    raise CaptureError(f"La entrada sigue cambiando: {path}")
+                bronze = Path(prior.bronze_path).resolve()
+                if not bronze.is_relative_to(config.bronze_root):
+                    raise IntegrityError("Evidencia conocida fuera de Bronze")
+                with bronze.open("rb") as stream:
+                    if hashlib.file_digest(stream, "sha256").hexdigest() != sha:
+                        raise IntegrityError("Copia Bronze alterada")
+                # The bytes match a previously stable immutable capture. Always hash
+                # input, including overwrites that preserve filename/size/mtime.
+                return Snapshot(
+                    origin,
+                    str(path),
+                    sha,
+                    str(bronze),
+                    len(data),
+                    after.st_mtime_ns,
+                    now(),
+                    producer_time,
+                )
             time.sleep(config.stable_wait_seconds)
             again = _read_limited(path, config.max_file_bytes)
             after = path.stat()
@@ -97,7 +155,6 @@ def capture(config: Config, origin: str, path: Path, producer_time: str | None) 
                 again,
             ):
                 raise CaptureError(f"La entrada sigue cambiando: {path}")
-            sha = hashlib.sha256(data).hexdigest()
             received_at = now()
             target = (
                 config.bronze_root
@@ -120,6 +177,17 @@ def capture(config: Config, origin: str, path: Path, producer_time: str | None) 
                         os.fsync(file.fileno())
                     # Crear sin reemplazar una evidencia existente. Solo filesystem local.
                     os.link(temporary, target)
+                    if os.name != "nt":
+                        directory = target.parent
+                        while directory.is_relative_to(config.bronze_root):
+                            handle = os.open(directory, os.O_RDONLY)
+                            try:
+                                os.fsync(handle)
+                            finally:
+                                os.close(handle)
+                            if directory == config.bronze_root:
+                                break
+                            directory = directory.parent
                 finally:
                     Path(temporary).unlink(missing_ok=True)
             return Snapshot(

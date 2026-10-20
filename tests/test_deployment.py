@@ -139,6 +139,22 @@ def test_two_branches_have_independent_worker_volumes_and_descriptors(site, moto
         assert helper_calls[-1][3] == {}  # check usa montaje readonly por defecto.
 
 
+def test_unicode_contract_metadata_remains_compatible_across_updates(site, motor):
+    original = motor.call
+
+    def call(*args, **kwargs):
+        if args[0] == "run" and args[-1] == "describe":
+            return json.dumps({"schema": "ID_Agrupación"}, ensure_ascii=False)
+        return original(*args, **kwargs)
+
+    motor.call = call
+    dep = deployer(site, motor)
+    dep.deploy(IMAGE1, SHA1, "first")
+    motor.latest = SHA2
+    assert dep.deploy(IMAGE2, SHA2, "update")["status"] == "DEPLOYED"
+    assert dep.active()["manifest"] == {"schema": "ID_Agrupación"}
+
+
 def test_same_digest_configuration_replay_does_not_restart(site, motor):
     dep = deployer(site, motor)
     dep.deploy(IMAGE1, SHA1, "run1")

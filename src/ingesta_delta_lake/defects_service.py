@@ -2,14 +2,53 @@
 
 import json
 import sqlite3
+import sys
+import time
 from contextlib import closing
+from dataclasses import replace
 
 from . import __version__
 from . import lista_defectos as defects
 from .common import ConfigurationError, IntegrityError, canonical, digest
 from .defects_storage import DefectsStore
 from .service import _apply
-from .sources import capture, discover
+from .sources import capture, discover, orphan_captures
+
+BATCH_FILES = 8
+BATCH_BYTES = 4 * 1024 * 1024
+MAX_FILE_BYTES = 8 * 1024 * 1024
+POLICY = "bounded-input-v1"
+
+
+def chunks(snapshots):
+    """Bound parsed input; a single file remains subject to the capture size limit."""
+    batch, size = [], 0
+    for snapshot in snapshots:
+        if batch and (len(batch) >= BATCH_FILES or size + snapshot.size > BATCH_BYTES):
+            yield batch
+            batch, size = [], 0
+        batch.append(snapshot)
+        size += snapshot.size
+    if batch:
+        yield batch
+
+
+def reconcile_pending(config, control, store_class):
+    store = store_class(config, control.control_id)
+    recovered, count = [], 0
+    for pending in control.pending():
+        version, wrote = _apply(config, control, store, pending)
+        entries = len(control.prepared(pending)["inserts"])
+        count += entries if wrote else 0
+        recovered.append(
+            {
+                "operation_id": pending["operation_id"],
+                "delta_version": version,
+                "confirmed_rows": entries,
+                "wrote_this_attempt": wrote,
+            }
+        )
+    return recovered, count
 
 
 def process(
@@ -20,26 +59,123 @@ def process(
     model=defects,
     store_class=DefectsStore,
     operation_kind="lista_defectos_insert_v2",
+    stop_requested=None,
+):
+    # Technical recovery has priority over intake; an unavailable new CSV must
+    # never prevent reconciliation of an already prepared/committed operation.
+    recovered, recovery_count = reconcile_pending(config, control, store_class)
+    captured = control.captured_inputs()
+    snapshots = []
+    for origin, path, stamp in discover(config):
+        snapshot = capture(
+            replace(config, max_file_bytes=min(config.max_file_bytes, MAX_FILE_BYTES)),
+            origin,
+            path,
+            stamp,
+            known=captured,
+        )
+        # Durable as soon as captured: a later capture error cannot lose this input.
+        control.receipts(attempt, [snapshot])
+        snapshots.append(snapshot)
+        captured.setdefault((snapshot.origin, snapshot.sha256), snapshot)
+    for snapshot in orphan_captures(config, captured):
+        control.receipts(attempt, [snapshot])
+        captured[(snapshot.origin, snapshot.sha256)] = snapshot
+    consumed = control.consumed_inputs()
+    pending = [s for key, s in captured.items() if key not in consumed]
+    if any(s.size > MAX_FILE_BYTES for s in pending):
+        raise IntegrityError("Captured MIA file exceeds 8 MiB; split-file support is required")
+    # Export timestamps order versions, never determine production or sample time.
+    pending.sort(
+        key=lambda s: (s.producer_time or "", s.mtime_ns, s.origin, s.source_path, s.sha256)
+    )
+    result, totals, completed, batch_count = None, {"inserted_this_attempt": recovery_count}, 0, 0
+    cumulative = (
+        "rows_read",
+        "normalized_rows",
+        "invalid_rows",
+        "consolidated_repetitions",
+        "new_entries",
+        "matched_entries",
+        "conflicts",
+        "counter_revisions",
+        "inspection_conflicts",
+        "inserted_this_attempt",
+    )
+    wrote = recovery_count > 0
+    stopped = False
+    # An empty batch still reconciles old uncertain commits and reports current coverage.
+    for batch in chunks(pending) if pending else [[]]:
+        if result is not None and stop_requested is not None and stop_requested():
+            stopped = True
+            break
+        started = time.monotonic()
+        result = process_batch(
+            config,
+            control,
+            attempt,
+            snapshots=batch,
+            model=model,
+            store_class=store_class,
+            operation_kind=operation_kind,
+        )
+        control.acknowledge_inputs(result["batch_id"], batch)
+        recovered.extend(result["recovered_operations"])
+        batch_count += bool(batch)
+        wrote = wrote or result["status"] == "APPLIED"
+        completed += len(batch)
+        print(
+            canonical(
+                {
+                    "event": "INPUT_BATCH_CONFIRMED",
+                    "family": config.family,
+                    "batch_id": result["batch_id"],
+                    "processed_versions": completed,
+                    "remaining_versions": len(pending) - completed,
+                    "input_bytes": sum(s.size for s in batch),
+                    "delta_version": result["delta_version"],
+                    "seconds": round(time.monotonic() - started, 3),
+                }
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        for key in cumulative:
+            totals[key] = totals.get(key, 0) + result[key]
+    status = result["status"]
+    if result["complete"]:
+        status = "APPLIED" if wrote else "NO_CHANGE" if snapshots else "NO_INPUTS"
+    if stopped:
+        status = "STOPPED_AFTER_BATCH"
+    return {
+        **result,
+        **totals,
+        "status": status,
+        "complete": result["complete"] and not stopped,
+        "source_files": len(snapshots),
+        "processed_versions": completed,
+        "remaining_versions": len(pending) - completed,
+        "completed_batches": batch_count,
+        "recovered_operations": recovered,
+        "stats_scope": "sum_of_processed_batches",
+    }
+
+
+def process_batch(
+    config,
+    control,
+    attempt,
+    *,
+    snapshots,
+    model=defects,
+    store_class=DefectsStore,
+    operation_kind="lista_defectos_insert_v2",
 ):
     store = store_class(config, control.control_id)
-    recovered, recovery_count = [], 0
-    for pending in control.pending():
-        version, wrote = _apply(config, control, store, pending)
-        count = len(control.prepared(pending)["inserts"])
-        recovery_count += count if wrote else 0
-        recovered.append(
-            {
-                "operation_id": pending["operation_id"],
-                "delta_version": version,
-                "confirmed_rows": count,
-                "wrote_this_attempt": wrote,
-            }
-        )
+    recovered, recovery_count = reconcile_pending(config, control, store_class)
     version, existing = store.read()
     if control.setting("last_version") not in (None, str(version)):
         raise IntegrityError(f"El snapshot {config.family} no coincide con su control")
-    snapshots = [capture(config, origin, path, stamp) for origin, path, stamp in discover(config)]
-    control.receipts(attempt, snapshots)
     parsed = model.parse(snapshots, config.encoding)
     inserts, issues, matches = model.decide(parsed, existing, *control.held())
     merged = {
@@ -49,6 +185,7 @@ def process(
     batch_id = digest(
         [
             model.CONTRACT,
+            POLICY,
             __version__,
             config.plant,
             config.encoding,

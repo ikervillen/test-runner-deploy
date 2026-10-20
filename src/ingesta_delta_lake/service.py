@@ -102,7 +102,7 @@ def _apply(
         raise IngestaError(f"Operación pendiente de reconciliación: {operation}: {exc}") from exc
 
 
-def _process(config: Config, control: Control, attempt: str) -> dict:
+def _process(config: Config, control: Control, attempt: str, stop_requested=None) -> dict:
     if config.family in {"SIP_MAQUINA_MOLDEO", "SIP_LINEA_ZF"}:
         from .topology_service import process
 
@@ -122,11 +122,11 @@ def _process(config: Config, control: Control, attempt: str) -> dict:
     if config.family == "LISTA_RECH":
         from .rejections_service import process
 
-        return process(config, control, attempt)
+        return process(config, control, attempt, stop_requested=stop_requested)
     if config.family == "LISTA_DEFECTOS":
         from .defects_service import process
 
-        return process(config, control, attempt)
+        return process(config, control, attempt, stop_requested=stop_requested)
     if config.family == "CATALOGO_PRODUCCIONES":
         from .catalog_service import process
 
@@ -244,7 +244,7 @@ def _process(config: Config, control: Control, attempt: str) -> dict:
     }
 
 
-def run(config: Config, *, runtime_owner: bool = False) -> dict:
+def run(config: Config, *, runtime_owner: bool = False, stop_requested=None) -> dict:
     config.validate()
     for path in (config.bronze_root, config.silver_root, config.control_root):
         path.mkdir(parents=True, exist_ok=True)
@@ -295,7 +295,7 @@ def run(config: Config, *, runtime_owner: bool = False) -> dict:
             with closing(control_class(config)) as control:
                 attempt = control.start_attempt()
                 try:
-                    result = _process(config, control, attempt)
+                    result = _process(config, control, attempt, stop_requested=stop_requested)
                 except Exception as exc:
                     control.finish_attempt(attempt, {"status": "FAILED", "error": str(exc)})
                     raise

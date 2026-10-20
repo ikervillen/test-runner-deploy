@@ -154,3 +154,97 @@ La CI local no sustituye el ensayo real: primero diagnosticar acceso; después d
 `develop`, conciliar fuente/atribuidas/pendientes, revisar las tándem y ZF_OK, comprobar replay,
 recuperación y reinicio del host; finalmente promover a `main`. Medir rendimiento/consumo
 con las llegadas reales. Integración de la app y cálculo de score continúan separados.
+
+## Primera carga MIA con muchas versiones acumuladas
+
+El piloto del 19/10/2026 confirmó que analizar todas las versiones MIA simultáneamente
+superaba el límite de memoria del worker. `LISTA_RECH` y `LISTA_DEFECTOS` se procesan
+por grupos de hasta ocho versiones únicas y 4 MiB de CSV; un archivo individual mayor
+se procesa solo, con un máximo MIA de 8 MiB. Un archivo superior produce un error
+explícito y permanece pendiente de resolver: nunca se consume ni se omite silenciosamente. Los descriptores
+de captura son pequeños y las evidencias CSV permanecen en Bronze.
+
+Cada grupo conserva su intención, transacción Delta, confirmación y auditoría propias.
+Solo después de confirmar un lote `COMPLETED` o `PARTIAL` se registra `(origen, SHA-256)`
+en `consumed_inputs`, con referencia al lote. Una interrupción antes de registrar esa
+marca reevalúa la versión frente al destino ya confirmado, sin duplicar filas. Una
+interrupción posterior continúa con las versiones restantes. Un resultado `PARTIAL`
+significa que las filas aceptadas y las contradicciones están conservadas; no resuelve
+los casos de negocio pendientes ni habilita sus grupos para sumar inspeccionadas.
+
+Los archivos se siguen capturando/verificando y cada intento conserva sus recepciones,
+incluidos renombrados. Una versión ya consumida no se vuelve a analizar ni replica su
+evidencia de incidencia. Un contenido nuevo bajo el mismo nombre tiene otro hash y se
+procesa normalmente. Las columnas y claves de Silver se mantienen. Los contadores de
+transformación se suman por grupos procesados (`stats_scope`); las bases de inspección
+se calculan globalmente sobre registros aceptados y casos abiertos, sin sumar repetidos.
+
+SIGTERM permite terminar el grupo en curso y salir antes del siguiente. El resultado
+`STOPPED_AFTER_BATCH` indica cobertura incompleta y registra cuántas versiones restan.
+El siguiente arranque retoma esos grupos. El presupuesto del worker continúa siendo
+4 GiB, con `--memory-swap=4g` para impedir que la paginación oculte presión de memoria.
+El 20/10 el motor WSL2 exponía 8.328.400.896 bytes (unos 7,8 GiB), aunque Windows
+disponga de 16 GB. El archivo MIA mayor medido ocupaba 1.454.719 bytes. Estos límites
+son de entrada y contenedor: no prometen un factor fijo de expansión en Python ni
+un tiempo máximo universal. El historial aceptado también consume memoria y debe
+seguirse midiendo. El ajuste diagnóstico temporal a 6 GiB de la primera imagen
+no sustituye esta corrección.
+
+
+La cola `input_versions` se identifica por `(origen, SHA-256)`. Su creación migra los
+recibos anteriores una sola vez, de forma transaccional; no relee toda la auditoría
+histórica en cada ciclo. La captura y su alta en cola se confirman juntas. Los CSV
+capturados pendientes se recuperan desde Bronze aunque ya no estén en la entrada.
+Las versiones sin hora se ordenan primero, después por marca de exportación,
+mtime, origen, ruta y hash. Este orden no modifica fechas de negocio.
+
+Para versiones ya capturadas se verifica siempre el hash del archivo de entrada y
+de su evidencia Bronze. Si coinciden con una captura estable anterior, se reutiliza
+esta sin esperar otra ventana de estabilización ni generar una nueva copia diaria.
+Un cambio que conserve nombre, tamaño y mtime también se detecta por contenido.
+Las versiones nuevas mantienen la doble lectura de estabilidad y los reintentos.
+Los grupos emiten `INPUT_BATCH_CONFIRMED` con duración, bytes, versión Delta y
+versiones pendientes. Las llegadas posteriores al descubrimiento se incorporan en
+el siguiente ciclo; el intervalo comienza tras terminar el ciclo en curso.
+
+### Reinicio explícito del almacenamiento de pruebas
+
+Tras la autorización expresa del usuario para reconstruir el piloto desde los CSV,
+se utiliza `python -m deployment.reset_develop --site <site-develop.json>
+--confirm-volume fenix-aiala-develop --run-url <URL-del-job>`. Esta operación destructiva
+es independiente del despliegue ordinario y solo admite el volumen confirmado de
+develop. Los despliegues habituales continúan rechazando un volumen desaparecido;
+nunca lo recrean silenciosamente para ocultar una pérdida de histórico.
+
+El reinicio verifica motor, identidad y etiquetas, exige que ningún contenedor
+esté adjunto al volumen, registra un recibo y recrea el volumen vacío mediante Docker.
+Los descriptores antiguos de activación se archivan como ficheros individuales bajo
+`state_root/develop/resets/<id>/`, sin mover ni borrar carpetas del host. `main` y
+el montaje CSV permanecen fuera del alcance de la operación. El siguiente despliegue
+hace bootstrap del volumen vacío e inicia la carga con lotes acotados y controles nuevos.
+
+Los fallos de escritura futuros se recuperan por su intención y `operation_id`,
+conciliados con la historia Delta. El reinicio no sustituye esa recuperación ordinaria.
+
+También se reconcilian capturas huérfanas: si el proceso cae después de sincronizar
+Bronze y antes de confirmar su recepción SQLite, el siguiente intento verifica el
+CSV por su hash y lo incorpora a la cola. Solo se admite el espacio de nombres
+controlado planta/origen/familia/hash. Cuando ya no existe la entrada original,
+se conserva la ruta Bronze como procedencia y se deja desconocida la marca de
+exportación, sin inventar un nombre o fecha de negocio. En Linux se sincronizan
+los directorios de captura antes de confirmar su recepción.
+
+La interpretación consumida queda vinculada a contrato, codificación y política
+temporal. Cambiarla exige una migración explícita; no permite reutilizar marcas
+anteriores y omitir silenciosamente una nueva interpretación de los mismos bytes.
+
+Prueba local aislada del 20/10: veinte versiones solapadas de un CSV real de
+1.172.329 bytes, 23,4 MB acumulados, siete lotes y 28.837 registros únicos.
+La primera carga tardó 78,9 s y el replay 6,4 s, sin otra versión Delta.
+El pico de working set medido en Windows fue 980.705.280 bytes (935,3 MiB).
+Es una referencia del ensayo, no una garantía de consumo o latencia para cualquier
+histórico; la comprobación del conjunto del servidor sigue siendo obligatoria.
+
+La reconciliación de una intención técnica pendiente se ejecuta antes de descubrir
+y capturar nuevas entregas. Un fallo de acceso a un CSV nuevo no puede impedir
+confirmar o reconciliar una operación anterior que ya tenga evidencia durable.

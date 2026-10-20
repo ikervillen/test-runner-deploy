@@ -3,8 +3,9 @@
 import json
 
 from . import lista_defectos as defects
-from .common import canonical, now
+from .common import IntegrityError, canonical, now
 from .control import Control
+from .sources import Snapshot
 
 
 class DefectsControl(Control):
@@ -12,6 +13,20 @@ class DefectsControl(Control):
 
     def __init__(self, config):
         super().__init__(config)
+        processing = canonical(
+            {
+                "contract": config.contract.name,
+                "encoding": config.encoding,
+                "timestamp_policy": config.timestamp_policy,
+            }
+        )
+        if self.setting("input_processing_binding") not in (None, processing):
+            self.close()
+            raise IntegrityError("Input interpretation changed; an explicit migration is required")
+        with self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO settings VALUES('input_processing_binding',?)", (processing,)
+            )
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS observation_intents(
               operation_id TEXT NOT NULL, record_key TEXT NOT NULL, key_json TEXT NOT NULL,
@@ -21,7 +36,60 @@ class DefectsControl(Control):
             CREATE TABLE IF NOT EXISTS inspection_groups(
               batch_id TEXT NOT NULL, group_id TEXT NOT NULL, payload_json TEXT NOT NULL,
               PRIMARY KEY(batch_id,group_id));
+            CREATE TABLE IF NOT EXISTS consumed_inputs(
+              origin TEXT NOT NULL, sha256 TEXT NOT NULL,
+              batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+              PRIMARY KEY(origin,sha256));
+            CREATE TABLE IF NOT EXISTS input_versions(
+              origin TEXT NOT NULL, sha256 TEXT NOT NULL, descriptor_json TEXT NOT NULL,
+              PRIMARY KEY(origin,sha256));
         """)
+        if self.setting("input_queue_migrated") is None:
+            with self.db:
+                for (text,) in self.db.execute(
+                    "SELECT descriptor_json FROM receipts ORDER BY rowid"
+                ):
+                    snapshot = Snapshot(**json.loads(text))
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO input_versions VALUES(?,?,?)",
+                        (snapshot.origin, snapshot.sha256, text),
+                    )
+                self.db.execute("INSERT INTO settings VALUES('input_queue_migrated','1')")
+
+    def receipts(self, attempt, snapshots):
+        # Capture acknowledgement and enqueue are one durable SQLite transaction.
+        with self.db:
+            self.db.executemany(
+                "INSERT INTO receipts VALUES(?,?,?)",
+                [(attempt, s.source_path, canonical(s.descriptor())) for s in snapshots],
+            )
+            self.db.executemany(
+                "INSERT OR IGNORE INTO input_versions VALUES(?,?,?)",
+                [(s.origin, s.sha256, canonical(s.descriptor())) for s in snapshots],
+            )
+
+    def consumed_inputs(self):
+        return {(r[0], r[1]) for r in self.db.execute("SELECT origin,sha256 FROM consumed_inputs")}
+
+    def acknowledge_inputs(self, batch_id, snapshots):
+        batch = self.db.execute(
+            "SELECT state FROM batches WHERE batch_id=?", (batch_id,)
+        ).fetchone()
+        if batch is None or batch[0] not in {"COMPLETED", "PARTIAL"}:
+            raise IntegrityError("Cannot acknowledge input before durable batch confirmation")
+        with self.db:
+            self.db.executemany(
+                "INSERT OR IGNORE INTO consumed_inputs VALUES(?,?,?)",
+                [(s.origin, s.sha256, batch_id) for s in snapshots],
+            )
+
+    def captured_inputs(self):
+        """Receipts are also the durable queue; include files no longer in /input."""
+        versions = {}
+        for (text,) in self.db.execute("SELECT descriptor_json FROM input_versions ORDER BY rowid"):
+            snapshot = Snapshot(**json.loads(text))
+            versions.setdefault((snapshot.origin, snapshot.sha256), snapshot)
+        return versions
 
     def cases(self):
         return [

@@ -114,9 +114,11 @@ def test_sigterm_finishes_current_unit_and_never_starts_next_one(mounted, monkey
     )
 
     def unit(config, **kwargs):
-        assert kwargs == {"runtime_owner": True}
+        assert kwargs["runtime_owner"] is True
+        assert kwargs["stop_requested"]() is False
         processed.append(config.family)
         callbacks[signal.SIGTERM]()
+        assert kwargs["stop_requested"]() is True
         return {"status": "NO_CHANGE"}
 
     monkeypatch.setattr(service, "run", unit)

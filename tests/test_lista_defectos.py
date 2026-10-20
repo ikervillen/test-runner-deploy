@@ -162,12 +162,14 @@ def test_changed_rejections_keep_full_candidate_and_never_overwrite(config, sour
     assert case["evidence"][0]["raw"]
     assert run(config)["inserted_this_attempt"] == 0
     assert query(config, "SELECT COUNT(*) FROM issues") == [(1,)]
-    # La revisión semántica es única; cada lote conserva su propia evidencia.
+    # La versión ya consumida conserva su evidencia original; cada intento deja recepción.
     assert query(
         config,
         "SELECT COUNT(DISTINCT issue_id), COUNT(DISTINCT evidence_hash), "
         "COUNT(DISTINCT batch_id) FROM issue_evidence",
-    ) == [(1, 1, 2)]
+    ) == [(1, 1, 1)]
+    assert query(config, "SELECT COUNT(*) FROM consumed_inputs") == [(2,)]
+    assert query(config, "SELECT COUNT(*) FROM receipts") == [(3,)]
     assert inspection_bases(config)["complete"] is False
 
 
