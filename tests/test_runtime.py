@@ -184,3 +184,40 @@ def test_runtime_settings_reject_invalid_or_unknown_input(mounted, monkeypatch, 
     monkeypatch.setenv(key, value)
     with pytest.raises(IngestaError):
         runtime.settings()
+
+
+def test_backlog_rotates_sources_without_idle_interval_and_defers_derived(mounted, monkeypatch):
+    from ingesta_delta_lake import service
+
+    runtime.bootstrap()
+    _, _, activation = runtime.token_paths()
+    runtime.atomic_json(activation, {"token": "a" * 32})
+    callbacks, calls, waits = {}, [], []
+    monkeypatch.setattr(signal, "signal", lambda n, f: callbacks.update({n: f}))
+    original_wait = runtime.threading.Event.wait
+
+    def wait(event, timeout=None):
+        if timeout is not None:
+            waits.append(timeout)
+        return original_wait(event, None if timeout is None else min(timeout, 0.01))
+
+    monkeypatch.setattr(runtime.threading.Event, "wait", wait)
+
+    def unit(cfg, **kwargs):
+        calls.append(cfg.family)
+        assert cfg.mia_batches_per_turn == 1
+        if cfg.family == "ASIGNACION_PRODUCCION_RAMAL":
+            callbacks[signal.SIGTERM]()
+        remaining = 2 if calls.count("LISTA_AR") == 1 and cfg.family == "LISTA_RECH" else 0
+        return {"status": "NO_CHANGE", "remaining_versions": remaining}
+
+    monkeypatch.setattr(service, "run", unit)
+    runtime.worker(600)
+    assert calls.count("LISTA_AR") == calls.count("CONT_ZC") == 2
+    assert calls.count("ASIGNACION_PRODUCCION_RAMAL") == 1
+    assert 1 in waits and 600 not in waits
+    events = [
+        json.loads(line)
+        for line in next((mounted / "lake/logs").glob("*.jsonl")).read_text().splitlines()
+    ]
+    assert any(e["result"]["status"] == "DEFERRED_BACKLOG" for e in events)

@@ -8,7 +8,7 @@ from .common import IntegrityError, digest
 from .mp9_control import CONFLICTS, DEPENDENCIES
 from .mp9_storage import Mp9Store, load_models
 from .service import _apply
-from .sources import capture, discover
+from .sources import capture_inputs
 
 
 def process(config, control, attempt):
@@ -34,8 +34,7 @@ def process(config, control, attempt):
     recorded = control.setting("last_version")
     if recorded is not None and recorded != str(version):
         raise IntegrityError("El snapshot MP9 no coincide con su control")
-    snapshots = [capture(config, origin, path, stamp) for origin, path, stamp in discover(config)]
-    control.receipts(attempt, snapshots)
+    snapshots = capture_inputs(config, control, attempt)
     parsed = mp9.parse(snapshots, config.encoding)
     input_variants = len(parsed.entries)
     descriptors = [s.descriptor() for s in snapshots]

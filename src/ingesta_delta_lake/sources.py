@@ -107,6 +107,29 @@ def discover(config: Config) -> list[tuple[str, Path, str | None]]:
     return result
 
 
+def capture_inputs(config, control, attempt):
+    """Stable cache speeds aliases/replay; every live file is still hashed.
+
+    Failed attempts retain all captured revisions, including overwritten/rotated
+    paths. Only finish_attempt after durable handling acknowledges this queue.
+    """
+    known = control.known_captures()
+    snapshots, included = [], set()
+    for origin, path, stamp in discover(config):
+        snapshot = capture(config, origin, path, stamp, known=known)
+        control.receipts(attempt, [snapshot])
+        snapshots.append(snapshot)
+        included.add((origin, snapshot.sha256))
+        known.setdefault((origin, snapshot.sha256), snapshot)
+    for snapshot in orphan_captures(config, known):
+        control.receipts(attempt, [snapshot])
+        known[(snapshot.origin, snapshot.sha256)] = snapshot
+    for key, snapshot in control.known_captures(pending=True).items():
+        if key not in included:
+            snapshots.append(snapshot)
+    return snapshots
+
+
 def _read_limited(path: Path, maximum: int) -> bytes:
     with path.open("rb") as file:
         data = file.read(maximum + 1)

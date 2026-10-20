@@ -11,7 +11,7 @@ from .common import IngestaError, IntegrityError, digest
 from .config import Config
 from .control import Control
 from .delta import DeltaStore
-from .sources import Snapshot, capture, discover
+from .sources import capture_inputs
 
 
 def _check_evidence(config: Config, prepared: dict) -> None:
@@ -170,10 +170,7 @@ def _process(config: Config, control: Control, attempt: str, stop_requested=None
     recorded = control.setting("last_version")
     if recorded is not None and recorded != str(version):
         raise IntegrityError("El snapshot Delta no coincide con la última confirmación del control")
-    snapshots: list[Snapshot] = [
-        capture(config, origin, path, stamp) for origin, path, stamp in discover(config)
-    ]
-    control.receipts(attempt, snapshots)
+    snapshots = capture_inputs(config, control, attempt)
     common = {
         "attempt_id": attempt,
         "contract": contract.name,

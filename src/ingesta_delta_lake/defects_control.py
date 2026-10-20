@@ -1,6 +1,7 @@
 """Auditoría por clave compuesta y revisión persistente de filas/bases MIA."""
 
 import json
+import time
 
 from . import lista_defectos as defects
 from .common import IntegrityError, canonical, now
@@ -76,6 +77,24 @@ class DefectsControl(Control):
     def consumed_inputs(self):
         return {(r[0], r[1]) for r in self.db.execute("SELECT origin,sha256 FROM consumed_inputs")}
 
+    def progress(self, consumed, remaining):
+        stamp = time.time()
+        previous = json.loads(self.setting("mia_progress") or "null")
+        rate = None
+        if previous and consumed > previous["consumed"] and stamp > previous["at"]:
+            rate = (consumed - previous["consumed"]) / (stamp - previous["at"])
+        with self.db:
+            self.db.execute(
+                "INSERT INTO settings VALUES('mia_progress',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (canonical({"at": stamp, "consumed": consumed}),),
+            )
+        return {
+            "consumed_versions": consumed,
+            "versions_per_wall_second": rate,
+            "estimated_backlog_seconds": remaining / rate if rate else None,
+        }
+
     def acknowledge_inputs(self, batch_id, snapshots):
         batch = self.db.execute(
             "SELECT state FROM batches WHERE batch_id=?", (batch_id,)
@@ -87,6 +106,12 @@ class DefectsControl(Control):
                 "INSERT OR IGNORE INTO consumed_inputs VALUES(?,?,?)",
                 [(s.origin, s.sha256, batch_id) for s in snapshots],
             )
+            if snapshots:
+                self.db.execute(
+                    "INSERT INTO settings VALUES('last_mia_origin',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (snapshots[-1].origin,),
+                )
 
     def captured_inputs(self):
         """Receipts are also the durable queue; include files no longer in /input."""

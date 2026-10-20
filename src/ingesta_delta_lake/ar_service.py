@@ -8,7 +8,7 @@ from . import lista_ar as ar
 from .ar_storage import ArStore, load_references
 from .common import IntegrityError, digest
 from .service import _apply
-from .sources import capture, discover
+from .sources import capture_inputs
 
 
 def process(config, control, attempt):
@@ -33,8 +33,7 @@ def process(config, control, attempt):
     version, existing = store.read()
     if control.setting("last_version") not in (None, str(version)):
         raise IntegrityError("Snapshot LISTA_AR distinto de su control")
-    snapshots = [capture(config, origin, path, stamp) for origin, path, stamp in discover(config)]
-    control.receipts(attempt, snapshots)
+    snapshots = capture_inputs(config, control, attempt)
     parsed = ar.parse(snapshots, config.encoding)
     input_variants = len(parsed.entries)
     descriptors = [s.descriptor() for s in snapshots]

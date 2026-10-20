@@ -68,6 +68,37 @@ class Control:
             self.close()
             raise IntegrityError("El control pertenece a otra planta, rutas o contrato")
         self.control_id = self.setting("control_id")
+        self.capture_cached = config.family not in {
+            "LISTA_RECH",
+            "LISTA_DEFECTOS",
+            "CATALOGO_PRODUCCIONES",
+            "ASIGNACION_PRODUCCION_RAMAL",
+        }
+        if self.capture_cached:
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS capture_cache("
+                "origin TEXT NOT NULL,sha256 TEXT NOT NULL,"
+                "descriptor_json TEXT NOT NULL,handled INTEGER NOT NULL,PRIMARY KEY(origin,sha256))"
+            )
+            if self.setting("capture_cache_seeded") is None:
+                with self.db:
+                    for row in self.db.execute(
+                        "SELECT r.descriptor_json,a.status FROM receipts r "
+                        "JOIN attempts a USING(attempt_id) ORDER BY r.rowid"
+                    ):
+                        snap = Snapshot(**json.loads(row[0]))
+                        self.db.execute(
+                            "INSERT INTO capture_cache VALUES(?,?,?,?) "
+                            "ON CONFLICT(origin,sha256) DO UPDATE SET handled="
+                            "max(capture_cache.handled,excluded.handled)",
+                            (
+                                snap.origin,
+                                snap.sha256,
+                                row[0],
+                                int(row[1] not in {"RUNNING", "FAILED"}),
+                            ),
+                        )
+                    self.db.execute("INSERT INTO settings VALUES('capture_cache_seeded','1')")
 
     def close(self) -> None:
         self.db.close()
@@ -91,6 +122,9 @@ class Control:
                 "WHERE attempt_id=?",
                 (result.get("batch_id"), now(), result["status"], canonical(result), attempt),
             )
+            if self.capture_cached and result["status"] != "FAILED":
+                # The sole writer processes every pending cached revision in capture_inputs.
+                self.db.execute("UPDATE capture_cache SET handled=1 WHERE handled=0")
 
     def receipts(self, attempt: str, snapshots: list[Snapshot]) -> None:
         with self.db:
@@ -98,6 +132,19 @@ class Control:
                 "INSERT INTO receipts VALUES(?, ?, ?)",
                 [(attempt, s.source_path, canonical(s.descriptor())) for s in snapshots],
             )
+            if self.capture_cached:
+                self.db.executemany(
+                    "INSERT OR IGNORE INTO capture_cache VALUES(?,?,?,0)",
+                    [(s.origin, s.sha256, canonical(s.descriptor())) for s in snapshots],
+                )
+
+    def known_captures(self, *, pending=False):
+        clause = " WHERE handled=0" if pending else ""
+        return {
+            (s.origin, s.sha256): s
+            for (text,) in self.db.execute("SELECT descriptor_json FROM capture_cache" + clause)
+            for s in [Snapshot(**json.loads(text))]
+        }
 
     def batch(self, batch_id: str) -> dict | None:
         row = self.db.execute("SELECT * FROM batches WHERE batch_id=?", (batch_id,)).fetchone()
