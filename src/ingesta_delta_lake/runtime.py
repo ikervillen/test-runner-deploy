@@ -28,9 +28,9 @@ ORDER = (
     "MP9_CAMBIO_MODELO",
     "CATALOGO_PRODUCCIONES",
     "LISTA_AR",
+    "CONT_ZC",
     "LISTA_RECH",
     "LISTA_DEFECTOS",
-    "CONT_ZC",
     "ASIGNACION_PRODUCCION_RAMAL",
 )
 PROTOCOL = 1
@@ -76,6 +76,7 @@ def settings():
         encoding=value["encoding"],
         environment="development",
         topology_enabled=True,
+        mia_batches_per_turn=1,
         timestamp_policy="local_naive_test_v1",
         line_by_origin=tuple(value["line_by_origin"].items()),
         line_code_by_origin=tuple(value["line_code_by_origin"].items()),
@@ -235,6 +236,8 @@ def worker(interval=600):
             if activation.exists() and json.loads(activation.read_text()) != {"token": token}:
                 raise IntegrityError("Activación de otra instancia")
             while not stop.is_set():
+                cycle_started = time.monotonic()
+                backlog = False
                 for family in ORDER:
                     if stop.is_set():
                         break
@@ -244,13 +247,17 @@ def worker(interval=600):
                     try:
                         from .service import run
 
-                        result = run(
-                            replace(base, family=family),
-                            runtime_owner=True,
-                            stop_requested=stop.is_set,
-                        )
+                        if family == "ASIGNACION_PRODUCCION_RAMAL" and backlog:
+                            result = {"status": "DEFERRED_BACKLOG", "complete": False}
+                        else:
+                            result = run(
+                                replace(base, family=family),
+                                runtime_owner=True,
+                                stop_requested=stop.is_set,
+                            )
                     except Exception as exc:
                         result = {"status": "FAILED", "error": str(exc)}
+                    backlog = backlog or bool(result.get("remaining_versions", 0))
                     event = {
                         "activation_token": token,
                         "channel": os.environ["INGESTA_CHANNEL"],
@@ -270,7 +277,11 @@ def worker(interval=600):
                     print(canonical(event), flush=True)
                 with guard:
                     status.update(phase="IDLE", family=None)
-                stop.wait(interval)
+                # Rotate immediately while a durable backlog exists. When caught
+                # up, schedule scans from cycle start instead of adding 10 minutes
+                # on top of however long processing took. Errors retain backoff.
+                delay = 1 if backlog else max(1, interval - (time.monotonic() - cycle_started))
+                stop.wait(delay)
         finally:
             heartbeat_stop.set()
             thread.join()

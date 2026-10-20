@@ -4,6 +4,7 @@ import json
 import sqlite3
 import sys
 import time
+from collections import Counter, deque
 from contextlib import closing
 from dataclasses import replace
 
@@ -32,6 +33,22 @@ def chunks(snapshots):
         size += snapshot.size
     if batch:
         yield batch
+
+
+def turns(pending, last_origin):
+    """FIFO within each origin; rotate origins only between durable batches."""
+    queues = {}
+    for snapshot in pending:
+        queues.setdefault(snapshot.origin, []).append(snapshot)
+    origins = sorted(queues)
+    order = [o for o in origins if o > last_origin] + [o for o in origins if o <= last_origin]
+    ready = deque((origin, iter(chunks(queues[origin]))) for origin in order)
+    while ready:
+        origin, batches = ready.popleft()
+        batch = next(batches, None)
+        if batch is not None:
+            yield batch
+            ready.append((origin, batches))
 
 
 def reconcile_pending(config, control, store_class):
@@ -105,10 +122,19 @@ def process(
     )
     wrote = recovery_count > 0
     stopped = False
+    yielded = False
+    selected = (
+        turns(pending, control.setting("last_mia_origin") or "")
+        if config.mia_batches_per_turn
+        else chunks(pending)
+    )
     # An empty batch still reconciles old uncertain commits and reports current coverage.
-    for batch in chunks(pending) if pending else [[]]:
+    for batch in selected if pending else [[]]:
         if result is not None and stop_requested is not None and stop_requested():
             stopped = True
+            break
+        if config.mia_batches_per_turn and batch_count >= config.mia_batches_per_turn:
+            yielded = True
             break
         started = time.monotonic()
         result = process_batch(
@@ -148,14 +174,23 @@ def process(
         status = "APPLIED" if wrote else "NO_CHANGE" if snapshots else "NO_INPUTS"
     if stopped:
         status = "STOPPED_AFTER_BATCH"
+    if yielded:
+        status = "BACKLOG_PENDING" if result["complete"] else "PARTIAL_BACKLOG"
+    acknowledged = control.consumed_inputs()
+    remaining = [s for s in pending if (s.origin, s.sha256) not in acknowledged]
     return {
         **result,
         **totals,
         "status": status,
-        "complete": result["complete"] and not stopped,
+        "complete": result["complete"] and not stopped and not yielded,
+        "quality_complete": result["complete"],
         "source_files": len(snapshots),
         "processed_versions": completed,
         "remaining_versions": len(pending) - completed,
+        "pending_by_origin": dict(Counter(s.origin for s in remaining)),
+        "pending_bytes": sum(s.size for s in remaining),
+        "oldest_pending_received_at": min((s.received_at for s in remaining), default=None),
+        **control.progress(len(acknowledged), len(remaining)),
         "completed_batches": batch_count,
         "recovered_operations": recovered,
         "stats_scope": "sum_of_processed_batches",

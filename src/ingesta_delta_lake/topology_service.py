@@ -7,7 +7,7 @@ from . import __version__
 from . import topology as t
 from .common import IntegrityError, digest
 from .service import _apply
-from .sources import capture, discover
+from .sources import capture_inputs
 from .topology_storage import TopologyStore, snapshot
 
 
@@ -27,8 +27,7 @@ def process(config, control, attempt):
     version, old = store.read()
     if control.setting("last_version") not in (None, str(version)):
         raise IntegrityError("Topología y control no coinciden")
-    captures = [capture(config, origin, path, stamp) for origin, path, stamp in discover(config)]
-    control.receipts(attempt, captures)
+    captures = capture_inputs(config, control, attempt)
     parsed = t.parse(family, captures, config.encoding)
     descriptors = [s.descriptor() for s in captures]
     for case in control.cases():

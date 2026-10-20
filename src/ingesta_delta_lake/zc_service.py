@@ -11,7 +11,7 @@ from . import __version__
 from . import cont_zc as zc
 from .common import ConfigurationError, IntegrityError, canonical, digest, parse_int64
 from .service import _apply
-from .sources import capture, discover
+from .sources import capture_inputs
 from .zc_storage import ZcStore
 
 
@@ -33,8 +33,7 @@ def process(config, control, attempt):
     version, existing = store.read()
     if control.setting("last_version") not in (None, str(version)):
         raise IntegrityError("Snapshot CONT_ZC distinto de su control")
-    snapshots = [capture(config, origin, path, stamp) for origin, path, stamp in discover(config)]
-    control.receipts(attempt, snapshots)
+    snapshots = capture_inputs(config, control, attempt)
     parsed = zc.parse(snapshots, config.encoding)
     inserts, issues, matches = zc.decide(parsed, existing, control.held())
     merged = {**existing, **{zc.key(r): {f: r[f] for f in zc.SCHEMA.names} for r in inserts}}
