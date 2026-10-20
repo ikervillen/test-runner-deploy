@@ -280,7 +280,11 @@ class Deployment:
         self.journal_path = self.root / "transaction.json"
 
     def active(self):
-        return json.loads(self.active_path.read_text()) if self.active_path.exists() else None
+        return (
+            json.loads(self.active_path.read_text(encoding="utf-8"))
+            if self.active_path.exists()
+            else None
+        )
 
     def audit(self, journal, phase):
         journal["phase"] = phase
@@ -298,7 +302,7 @@ class Deployment:
     def recover(self):
         if not self.journal_path.exists():
             return
-        journal = json.loads(self.journal_path.read_text())
+        journal = json.loads(self.journal_path.read_text(encoding="utf-8"))
         if journal["phase"] == "COMPLETE":
             receipts = self.root / "receipts"
             receipts.mkdir(exist_ok=True)
@@ -506,7 +510,7 @@ class Deployment:
             self.recover()
             if not self.journal_path.exists():
                 raise RuntimeError("No existe historial de despliegue")
-            history = json.loads(self.journal_path.read_text())
+            history = json.loads(self.journal_path.read_text(encoding="utf-8"))
             current, target = self.active(), history.get("previous")
             if not current or not target or current["token"] == target["token"]:
                 raise RuntimeError("No existe una release previa diferente")

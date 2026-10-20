@@ -207,48 +207,24 @@ Los grupos emiten `INPUT_BATCH_CONFIRMED` con duración, bytes, versión Delta y
 versiones pendientes. Las llegadas posteriores al descubrimiento se incorporan en
 el siguiente ciclo; el intervalo comienza tras terminar el ciclo en curso.
 
-### Recuperación explícita de la carga inicial interrumpida
+### Reinicio explícito del almacenamiento de pruebas
 
-`python -m deployment.maintenance --site <site-develop.json> --family LISTA_RECH
---run-url <URL-del-job>` es una operación **manual y offline**, separada del despliegue
-automático. Requiere el volumen existente y la imagen propietaria exacta, retenida
-localmente. Funciona aunque se haya eliminado su contenedor. Nunca crea un volumen,
-arranca un worker ni procesa CSV como parte de la reparación.
+Tras la autorización expresa del usuario para reconstruir el piloto desde los CSV,
+se utiliza `python -m deployment.reset_develop --site <site-develop.json>
+--confirm-volume fenix-aiala-develop --run-url <URL-del-job>`. Esta operación destructiva
+es independiente del despliegue ordinario y solo admite el volumen confirmado de
+develop. Los despliegues habituales continúan rechazando un volumen desaparecido;
+nunca lo recrean silenciosamente para ocultar una pérdida de histórico.
 
-El controlador bloquea despliegues simultáneos, verifica motor, identidad, volumen,
-configuración e imagen; exige que no exista ningún contenedor activo con ese volumen.
-Ejecuta el script montado de solo lectura dentro de la imagen propietaria, sin red,
-con las raíces originales y el volumen persistente en escritura. El script adquiere
-los bloqueos de runtime y escritor y abre una transacción SQLite inmediata.
+El reinicio verifica motor, identidad y etiquetas, exige que ningún contenedor
+esté adjunto al volumen, registra un recibo y recrea el volumen vacío mediante Docker.
+Los descriptores antiguos de activación se archivan como ficheros individuales bajo
+`state_root/develop/resets/<id>/`, sin mover ni borrar carpetas del host. `main` y
+el montaje CSV permanecen fuera del alcance de la operación. El siguiente despliegue
+hace bootstrap del volumen vacío e inicia la carga con lotes acotados y controles nuevos.
 
-Solo se permite retirar una intención inicial en `PREPARED`, sin versión Delta,
-sin contenido alguno en el destino y sin intenciones de filas que puedan haberse
-escrito. `WRITING`, `UNKNOWN`, un Parquet huérfano, un hash alterado o cualquier duda
-bloquean la operación y requieren reconciliación. La inexistencia del contenedor
-no se utiliza como prueba de que no hubo commit.
-
-Se verifican los recibos Bronze y se copia el JSON preparado íntegro mediante bloques
-de 1 MiB, sin cargarlo completo en Python. El archivo se sincroniza y se verifica
-con SHA-256; se comprueba espacio libre antes de copiar. La evidencia queda bajo
-`/lake/control/recovery/<batch_id>.prepared.json`. Después se confirma atómicamente:
-
-- El lote y sus intenciones pasan a `ABORTED_UNWRITTEN`; no se marca ningún CSV como consumido.
-- El campo JSON grande se sustituye por la referencia al archivo íntegro archivado.
-- Se conserva el resto de intenciones, incidencias y recibos sin borrar ni sumar datos.
-- Se registra un evento de mantenimiento y una generación nueva para el reprocesamiento.
-
-Una interrupción antes del commit deja el lote original pendiente; el archivo ya
-archivado se verifica y reutiliza en el reintento. Una interrupción posterior deja
-la resolución persistida y el reintento no la duplica. El checkpoint WAL se exige
-antes de permitir el preflight de actualización. El controlador conserva también
-un recibo externo al checkout con imagen propietaria, hash del script y resultado.
-
-Tras validar esta reparación se despliega la imagen con lotes acotados. No se debe
-reanudar la imagen antigua para reconstruir la carga acumulada: volvería a agruparla
-entera. No ejecutar VACUUM, borrar SQLite, recrear el volumen ni eliminar Bronze
-para resolver este caso. Los commits inciertos ordinarios siguen reconciliándose
-por su `operation_id` y la historia Delta antes de escribir otra vez.
-
+Los fallos de escritura futuros se recuperan por su intención y `operation_id`,
+conciliados con la historia Delta. El reinicio no sustituye esa recuperación ordinaria.
 
 También se reconcilian capturas huérfanas: si el proceso cae después de sincronizar
 Bronze y antes de confirmar su recepción SQLite, el siguiente intento verifica el

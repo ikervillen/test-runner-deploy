@@ -186,7 +186,6 @@ def process_batch(
         [
             model.CONTRACT,
             POLICY,
-            control.setting("requeue_generation"),
             __version__,
             config.plant,
             config.encoding,
