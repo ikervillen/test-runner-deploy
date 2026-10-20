@@ -212,7 +212,11 @@ def worker(interval=600):
     if not 10 <= interval <= 86400:
         raise ConfigurationError("Intervalo fuera de rango")
     _, _, base = settings()
+    workers = int(os.environ.get("INGESTA_WORKERS", "2"))
+    if workers not in (1, 2):
+        raise ConfigurationError("INGESTA_WORKERS debe ser 1 o 2")
     token, status_path, activation = token_paths()
+    stop_path = status_path.with_suffix(".stop")
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
@@ -228,6 +232,7 @@ def worker(interval=600):
 
     with portalocker.Lock(str(base.silver_root / ".runtime.lock"), mode="a", timeout=0):
         check(allow_pending=True)
+        stop_path.unlink(missing_ok=True)
         thread = threading.Thread(target=heartbeat, daemon=True)
         thread.start()
         try:
@@ -238,26 +243,12 @@ def worker(interval=600):
             while not stop.is_set():
                 cycle_started = time.monotonic()
                 backlog = False
-                for family in ORDER:
-                    if stop.is_set():
-                        break
-                    with guard:
-                        status.update(phase="RUNNING", family=family)
-                    started = time.monotonic()
-                    try:
-                        from .service import run
+                failed = False
 
-                        if family == "ASIGNACION_PRODUCCION_RAMAL" and backlog:
-                            result = {"status": "DEFERRED_BACKLOG", "complete": False}
-                        else:
-                            result = run(
-                                replace(base, family=family),
-                                runtime_owner=True,
-                                stop_requested=stop.is_set,
-                            )
-                    except Exception as exc:
-                        result = {"status": "FAILED", "error": str(exc)}
+                def record(family, result, seconds):
+                    nonlocal backlog, failed
                     backlog = backlog or bool(result.get("remaining_versions", 0))
+                    failed = failed or result["status"] == "FAILED"
                     event = {
                         "activation_token": token,
                         "channel": os.environ["INGESTA_CHANNEL"],
@@ -265,9 +256,8 @@ def worker(interval=600):
                         "time": now(),
                         "family": family,
                         "result": result,
-                        "seconds": round(time.monotonic() - started, 3),
+                        "seconds": seconds,
                     }
-                    # Copia persistente además del log rotado de Docker.
                     with (Path("/lake/logs") / (now()[:10] + ".jsonl")).open(
                         "a", encoding="utf-8"
                     ) as stream:
@@ -275,12 +265,52 @@ def worker(interval=600):
                         stream.flush()
                         os.fsync(stream.fileno())
                     print(canonical(event), flush=True)
+
+                if workers == 2:
+                    from .workers import PHASES, run_phase
+
+                    def active(units):
+                        with guard:
+                            status.update(phase="RUNNING", family=None, workers=units)
+
+                    for phase in PHASES:
+                        if stop.is_set():
+                            break
+                        if phase == ("ASIGNACION_PRODUCCION_RAMAL",) and backlog:
+                            record(phase[0], {"status": "DEFERRED_BACKLOG", "complete": False}, 0)
+                            continue
+                        run_phase(base, phase, stop, stop_path, record, active)
+                else:
+                    for family in ORDER:
+                        if stop.is_set():
+                            break
+                        with guard:
+                            status.update(phase="RUNNING", family=family)
+                        started = time.monotonic()
+                        try:
+                            from .service import run
+
+                            if family == "ASIGNACION_PRODUCCION_RAMAL" and backlog:
+                                result = {"status": "DEFERRED_BACKLOG", "complete": False}
+                            else:
+                                result = run(
+                                    replace(base, family=family),
+                                    runtime_owner=True,
+                                    stop_requested=stop.is_set,
+                                )
+                        except Exception as exc:
+                            result = {"status": "FAILED", "error": str(exc)}
+                        record(family, result, round(time.monotonic() - started, 3))
                 with guard:
                     status.update(phase="IDLE", family=None)
                 # Rotate immediately while a durable backlog exists. When caught
                 # up, schedule scans from cycle start instead of adding 10 minutes
                 # on top of however long processing took. Errors retain backoff.
-                delay = 1 if backlog else max(1, interval - (time.monotonic() - cycle_started))
+                delay = (
+                    (30 if failed else 1)
+                    if backlog or failed
+                    else max(1, interval - (time.monotonic() - cycle_started))
+                )
                 stop.wait(delay)
         finally:
             heartbeat_stop.set()
