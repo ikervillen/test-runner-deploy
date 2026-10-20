@@ -1,20 +1,28 @@
-name: Pilot capacity and input inventory
+name: Recover unwritten initial MIA (offline)
 on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: ingesta-deploy-ikervillen/test-runner-deploy-develop
+  cancel-in-progress: false
 jobs:
-  observe:
+  recover:
     runs-on: [self-hosted, Windows, X64, fenix-ingesta]
-    timeout-minutes: 10
+    timeout-minutes: 40
     steps:
-      - shell: powershell
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: c0cf41b58d659965ba4d8ade944a919661762515
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Verify stopped owner and requeue only provably unwritten initial intent
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          docker --context desktop-linux info --format 'ENGINE_MEMORY={{.MemTotal}} ENGINE_CPUS={{.NCPU}}'
-          docker --context desktop-linux ps -a --format '{{.Names}} {{.Status}}' --filter label=es.fenix.ingesta.role=worker
-          docker --context desktop-linux volume inspect fenix-aiala-develop --format '{{json .Labels}}'
-          if ($LASTEXITCODE -ne 0) { throw 'Persistent volume missing' }
-          $script = "import base64;exec(base64.b64decode('ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCmltcG9ydCBqc29uLGNvbGxlY3Rpb25zCm91dD1bXQpmb3IgZm9sZGVyIGluIHNvcnRlZChQYXRoKCcvaW5wdXQnKS5pdGVyZGlyKCkpOgogaWYgbm90IGZvbGRlci5pc19kaXIoKTpjb250aW51ZQogZm9yIGZhbWlseSBpbiBbJ0xJU1RBX1JFQ0gnLCdMSVNUQV9ERUZFQ1RPUycsJ0xJU1RBX0FSJywnQ09OVF9aQyddOgogIGZpbGVzPVtwIGZvciBwIGluIGZvbGRlci5nbG9iKCcqLmNzdicpIGlmIHAuc3RlbS51cHBlcigpLmVuZHN3aXRoKGZhbWlseSldCiAgc2l6ZXM9c29ydGVkKHAuc3RhdCgpLnN0X3NpemUgZm9yIHAgaW4gZmlsZXMpCiAgb3V0LmFwcGVuZChkaWN0KG9yaWdpbj1mb2xkZXIubmFtZSxmYW1pbHk9ZmFtaWx5LGNvdW50PWxlbihzaXplcyksYnl0ZXM9c3VtKHNpemVzKSxtYXhpbXVtPW1heChzaXplcyxkZWZhdWx0PTApLG1lZGlhbj1zaXplc1tsZW4oc2l6ZXMpLy8yXSBpZiBzaXplcyBlbHNlIDApKQpwcmludChqc29uLmR1bXBzKG91dCkpCg=='))"
-          docker --context desktop-linux run --rm --pull never --network none --read-only --cap-drop ALL --memory 256m --cpus 1 --mount 'type=bind,src=C:/DataSharing/Fenix,dst=/input,readonly' --entrypoint python 'python:3.12.14-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e' -c $script
-          if ($LASTEXITCODE -ne 0) { throw 'Read-only input inventory failed' }
+          $site = Join-Path $env:LOCALAPPDATA 'FenixIngesta/site-develop.json'
+          $runUrl = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          python -m deployment.maintenance --site $site --family LISTA_RECH --run-url $runUrl
+          if ($LASTEXITCODE -ne 0) { throw 'Offline recovery did not complete; no worker is started' }
