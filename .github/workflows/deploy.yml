@@ -38,7 +38,7 @@ jobs:
               if ((Get-Date) -gt $deadline) { throw 'No safe boundary reached; never force-kill' }
               Start-Sleep -Seconds 3
             }
-            docker --context $ctx run --rm --pull never --network none --read-only --memory 512m --cpus 1 --volumes-from "$($active.container):ro" --env INGESTA_SETTINGS --env INGESTA_CHANNEL --env INGESTA_INSTANCE --env INGESTA_ACTIVATION $active.image check
+            docker --context $ctx run --rm --pull never --network none --read-only --tmpfs /tmp:rw,nosuid,size=64m --memory 512m --cpus 1 --volumes-from "$($active.container):ro" --env INGESTA_SETTINGS --env INGESTA_CHANNEL --env INGESTA_INSTANCE --env INGESTA_ACTIVATION $active.image check
             if ($LASTEXITCODE -ne 0) { throw 'Old image did not confirm a clean checkpoint' }
             docker --context $ctx volume create --label 'es.fenix.ingesta.role=backup' --label 'es.fenix.ingesta.channel=develop' --label "es.fenix.ingesta.source=$($active.volume)" $backup
             if ($LASTEXITCODE -ne 0) { throw 'Cannot create independent backup volume' }
