@@ -147,8 +147,12 @@ El descriptor y los recibos se guardan por canal bajo
 de familia tiene además una copia JSONL diaria persistente en el volumen, con estado,
 duración y referencia al control fuente. El heartbeat indica vida del proceso, **no** que
 todos los datos estén completos: revisar los resultados PARTIAL/BLOCKED/FAILED y sus auditorías.
-El ciclo procesa las once fuentes y dos derivados en orden de dependencias; espera el
-intervalo configurado tras cada ciclo, sin acumular ejecuciones solapadas.
+El ciclo atiende las once fuentes y dos derivados por fases de dependencias, con hasta
+dos procesos y un pesado simultáneo (entrega 15). Las fuentes MIA ceden tras un lote,
+rotando entre orígenes; CONT_ZC/AR reciben servicio en cada vuelta. Con backlog se vuelve
+a recorrer el ciclo tras un segundo. Al estar al día, el intervalo se mide desde el
+inicio del ciclo, sin acumular supervisores solapados. Las asociaciones se aplazan
+explícitamente mientras quedan versiones MIA inventariadas.
 
 La CI local no sustituye el ensayo real: primero diagnosticar acceso; después desplegar
 `develop`, conciliar fuente/atribuidas/pendientes, revisar las tándem y ZF_OK, comprobar replay,
@@ -181,22 +185,29 @@ se calculan globalmente sobre registros aceptados y casos abiertos, sin sumar re
 
 SIGTERM permite terminar el grupo en curso y salir antes del siguiente. El resultado
 `STOPPED_AFTER_BATCH` indica cobertura incompleta y registra cuántas versiones restan.
-El siguiente arranque retoma esos grupos. El presupuesto del worker continúa siendo
-4 GiB, con `--memory-swap=4g` para impedir que la paginación oculte presión de memoria.
+El siguiente arranque retoma esos grupos. Desde la entrega 15, el presupuesto se calcula
+con la capacidad real del motor: máximo cuatro CPU y 6 GiB, dejando al menos 1,5 GiB
+de margen en WSL2 y redondeando hacia abajo en pasos de 256 MiB. Con menos de 4 GiB
+de presupuesto o dos CPU se usa un proceso; con menos de 2 GiB se rechaza el despliegue.
+Los límites de memory y memory-swap coinciden para evitar paginación. El descriptor
+registra los valores; los rollback de releases previas conservan 2 CPU / 4 GiB.
 El 20/10 el motor WSL2 exponía 8.328.400.896 bytes (unos 7,8 GiB), aunque Windows
 disponga de 16 GB. El archivo MIA mayor medido ocupaba 1.454.719 bytes. Estos límites
 son de entrada y contenedor: no prometen un factor fijo de expansión en Python ni
-un tiempo máximo universal. El historial aceptado también consume memoria y debe
-seguirse midiendo. El ajuste diagnóstico temporal a 6 GiB de la primera imagen
-no sustituye esta corrección.
+un tiempo máximo universal. La lectura MIA por contexto y el índice incremental de
+grupos evitan repetir el histórico por lote. Los procesos liberan su memoria al salir.
+El historial de asociaciones aún se materializa en su construcción inicial, por lo
+que se sigue midiendo. Los techos no son reservas: varios entornos activos requieren
+dimensionar su consumo agregado. El ajuste de recursos no sustituye estas correcciones.
 
 
 La cola `input_versions` se identifica por `(origen, SHA-256)`. Su creación migra los
 recibos anteriores una sola vez, de forma transaccional; no relee toda la auditoría
 histórica en cada ciclo. La captura y su alta en cola se confirman juntas. Los CSV
 capturados pendientes se recuperan desde Bronze aunque ya no estén en la entrada.
-Las versiones sin hora se ordenan primero, después por marca de exportación,
-mtime, origen, ruta y hash. Este orden no modifica fechas de negocio.
+Dentro de cada origen, las versiones sin hora se ordenan primero, después por marca
+de exportación, mtime, ruta y hash. Entre orígenes se rota con un cursor persistente
+confirmado junto al acuse. Este orden no modifica fechas de negocio.
 
 Para versiones ya capturadas se verifica siempre el hash del archivo de entrada y
 de su evidencia Bronze. Si coinciden con una captura estable anterior, se reutiliza
@@ -204,8 +215,9 @@ esta sin esperar otra ventana de estabilización ni generar una nueva copia diar
 Un cambio que conserve nombre, tamaño y mtime también se detecta por contenido.
 Las versiones nuevas mantienen la doble lectura de estabilidad y los reintentos.
 Los grupos emiten `INPUT_BATCH_CONFIRMED` con duración, bytes, versión Delta y
-versiones pendientes. Las llegadas posteriores al descubrimiento se incorporan en
-el siguiente ciclo; el intervalo comienza tras terminar el ciclo en curso.
+versiones pendientes. Los resultados de cada turno añaden pendiente por origen/bytes,
+velocidad entre visitas y ETA orientativa. Las llegadas posteriores al descubrimiento
+se incorporan en el siguiente ciclo, sin esperar a vaciar el histórico de otra fuente.
 
 ### Reinicio explícito del almacenamiento de pruebas
 
