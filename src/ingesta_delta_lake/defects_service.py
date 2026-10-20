@@ -14,7 +14,7 @@ from .common import ConfigurationError, IntegrityError, canonical, digest
 from .defects_storage import DefectsStore
 from .mia_scope import files, group_holds, scope_for
 from .service import _apply
-from .sources import capture, discover, orphan_captures
+from .sources import capture, discover, input_scan, orphan_captures
 
 BATCH_FILES = 8
 BATCH_BYTES = 4 * 1024 * 1024
@@ -84,21 +84,23 @@ def process(
     recovered, recovery_count = reconcile_pending(config, control, store_class)
     captured = control.captured_inputs()
     snapshots = []
-    for origin, path, stamp in discover(config):
-        snapshot = capture(
-            replace(config, max_file_bytes=min(config.max_file_bytes, MAX_FILE_BYTES)),
-            origin,
-            path,
-            stamp,
-            known=captured,
-        )
-        # Durable as soon as captured: a later capture error cannot lose this input.
-        control.receipts(attempt, [snapshot])
-        snapshots.append(snapshot)
-        captured.setdefault((snapshot.origin, snapshot.sha256), snapshot)
-    for snapshot in orphan_captures(config, captured):
-        control.receipts(attempt, [snapshot])
-        captured[(snapshot.origin, snapshot.sha256)] = snapshot
+    with input_scan(config, control) as due:
+        if due:
+            for origin, path, stamp in discover(config):
+                snapshot = capture(
+                    replace(config, max_file_bytes=min(config.max_file_bytes, MAX_FILE_BYTES)),
+                    origin,
+                    path,
+                    stamp,
+                    known=captured,
+                )
+                # Durable as soon as captured: a later capture error cannot lose this input.
+                control.receipts(attempt, [snapshot])
+                snapshots.append(snapshot)
+                captured.setdefault((snapshot.origin, snapshot.sha256), snapshot)
+            for snapshot in orphan_captures(config, captured):
+                control.receipts(attempt, [snapshot])
+                captured[(snapshot.origin, snapshot.sha256)] = snapshot
     consumed = control.consumed_inputs()
     pending = [s for key, s in captured.items() if key not in consumed]
     if any(s.size > MAX_FILE_BYTES for s in pending):

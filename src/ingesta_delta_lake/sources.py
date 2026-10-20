@@ -1,15 +1,17 @@
 """Descubrimiento de las dos modalidades y captura inmutable de revisiones."""
 
 import hashlib
+import json
 import os
 import re
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .common import CaptureError, IntegrityError, now
+from .common import CaptureError, IntegrityError, canonical, digest, now
 from .config import Config
 
 FAMILY = "SIP_MODELO"
@@ -107,6 +109,41 @@ def discover(config: Config) -> list[tuple[str, Path, str | None]]:
     return result
 
 
+@contextmanager
+def input_scan(config, control):
+    """Separate periodic source verification from durable backlog consumption.
+
+    Timestamp the start, confirm only a complete discovery/capture pass. Failed
+    scans retry immediately; successful captures remain queued independently.
+    """
+    started = time.time()
+    signature = digest(
+        [
+            "periodic-input-scan-v1",
+            config.family,
+            config.encoding,
+            [(o, str(p)) for o, p in config.sources],
+            os.environ.get("INGESTA_ACTIVATION"),
+        ]
+    )
+    previous = json.loads(control.setting("last_input_scan") or "null")
+    due = not (
+        config.input_scan_interval_seconds
+        and previous
+        and previous["signature"] == signature
+        and 0 <= started - previous["started"] < config.input_scan_interval_seconds
+    )
+    control.input_scan_performed = due
+    yield due
+    if due:
+        with control.db:
+            control.db.execute(
+                "INSERT INTO settings VALUES('last_input_scan',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (canonical({"signature": signature, "started": started}),),
+            )
+
+
 def capture_inputs(config, control, attempt):
     """Stable cache speeds aliases/replay; every live file is still hashed.
 
@@ -115,15 +152,17 @@ def capture_inputs(config, control, attempt):
     """
     known = control.known_captures()
     snapshots, included = [], set()
-    for origin, path, stamp in discover(config):
-        snapshot = capture(config, origin, path, stamp, known=known)
-        control.receipts(attempt, [snapshot])
-        snapshots.append(snapshot)
-        included.add((origin, snapshot.sha256))
-        known.setdefault((origin, snapshot.sha256), snapshot)
-    for snapshot in orphan_captures(config, known):
-        control.receipts(attempt, [snapshot])
-        known[(snapshot.origin, snapshot.sha256)] = snapshot
+    with input_scan(config, control) as due:
+        if due:
+            for origin, path, stamp in discover(config):
+                snapshot = capture(config, origin, path, stamp, known=known)
+                control.receipts(attempt, [snapshot])
+                snapshots.append(snapshot)
+                included.add((origin, snapshot.sha256))
+                known.setdefault((origin, snapshot.sha256), snapshot)
+            for snapshot in orphan_captures(config, known):
+                control.receipts(attempt, [snapshot])
+                known[(snapshot.origin, snapshot.sha256)] = snapshot
     for key, snapshot in control.known_captures(pending=True).items():
         if key not in included:
             snapshots.append(snapshot)

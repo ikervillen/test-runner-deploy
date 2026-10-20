@@ -2630,6 +2630,20 @@ capturadas en intentos fallidos. Se vuelve a calcular el hash del archivo vivo a
 nombre, tamaño y mtime coincidan. Se soportan simultáneamente nombres fijos sobrescritos
 y nombres con fecha/hora; la marca del nombre no sustituye las fechas de negocio.
 
+**Revisión de entradas independiente del consumo.** Un turno observado de ocho versiones
+LISTA_RECH tardó 68,373 s al volver a verificar más de mil CSV. La entrega 17 limita
+el descubrimiento/captura de cada fuente a una revisión cada 600 segundos desde el
+inicio de la última revisión completa. Entre revisiones se continúa consumiendo
+la cola duradera y resolviendo dependencias, sin repetir las lecturas del directorio
+Windows. Una revisión fallida se reintenta sin esperar; un fallo posterior no bloquea
+los reintentos de las capturas pendientes. Una nueva activación Docker, un cambio de
+orígenes/interpretación o un retroceso de reloj fuerzan revisión inmediata. El CLI
+mantiene revisión en cada invocación por defecto. Los logs distinguen si hubo revisión
+y cuándo corresponde la siguiente; al vaciar la cola el supervisor respeta ese plazo,
+sin añadir otros diez minutos desde la última vuelta de consumo. Esta cadencia más
+el tiempo de servicio delimita el descubrimiento; una versión nueva de MIA sigue
+esperando las versiones anteriores de su origen mientras exista histórico pendiente.
+
 CONT_ZC y LISTA_AR reciben servicio en cada vuelta, sin esperar a agotar ambas fuentes
 MIA. Con backlog se inicia otra vuelta tras una pausa mínima de un segundo; al estar
 al día se mide el intervalo desde el inicio del ciclo. Los resultados separan calidad

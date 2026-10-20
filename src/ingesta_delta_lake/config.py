@@ -31,6 +31,7 @@ class Config:
     topology_enabled: bool = False
     line_code_by_origin: tuple[tuple[str, int], ...] = ()
     mia_batches_per_turn: int | None = None
+    input_scan_interval_seconds: int = 0
 
     @property
     def contract(self):
@@ -54,6 +55,11 @@ class Config:
 
     def validate(self) -> None:
         _ = self.contract  # Rechazar familias no implementadas antes de crear destinos.
+        if (
+            type(self.input_scan_interval_seconds) is not int
+            or not 0 <= self.input_scan_interval_seconds <= 86400
+        ):
+            raise ConfigurationError("input_scan_interval_seconds debe estar entre 0 y 86400")
         if self.mia_batches_per_turn is not None and (
             type(self.mia_batches_per_turn) is not int or not 1 <= self.mia_batches_per_turn <= 100
         ):

@@ -219,6 +219,18 @@ versiones pendientes. Los resultados de cada turno añaden pendiente por origen/
 velocidad entre visitas y ETA orientativa. Las llegadas posteriores al descubrimiento
 se incorporan en el siguiente ciclo, sin esperar a vaciar el histórico de otra fuente.
 
+Desde la entrega 17, la revisión del directorio es independiente del consumo: cada
+fuente vuelve a descubrir y verificar sus CSV cada 600 s desde el inicio de la última
+revisión completa. Entre revisiones sigue drenando la cola, sin repetir las lecturas
+de todos los archivos conocidos por cada lote. Un fallo de revisión reintenta sin
+esperar; un fallo de transformación no retrasa las capturas pendientes. Una nueva
+activación o cambio de orígenes fuerza revisión inmediata. El CLI usa intervalo cero
+por defecto. Los resultados muestran `input_scan_performed`, el intervalo y
+`next_input_scan_at` (Unix, operación). Un NO_INPUTS sin revisión significa que esa
+unidad no ha tratado capturas nuevas; no borra los datos ni resuelve incidencias.
+Al vaciar la cola el supervisor espera al plazo de revisión más cercano, sin añadir
+otro intervalo completo. Las versiones MIA nuevas respetan la cola FIFO de su origen.
+
 ### Reinicio explícito del almacenamiento de pruebas
 
 Tras la autorización expresa del usuario para reconstruir el piloto desde los CSV,

@@ -256,3 +256,32 @@ def test_backlog_rotates_sources_without_idle_interval_and_defers_derived(mounte
         for line in next((mounted / "lake/logs").glob("*.jsonl")).read_text().splitlines()
     ]
     assert any(e["result"]["status"] == "DEFERRED_BACKLOG" for e in events)
+
+
+def test_idle_after_catchup_uses_next_scan_deadline_not_another_full_interval(mounted, monkeypatch):
+    from ingesta_delta_lake import service
+
+    runtime.bootstrap()
+    _, _, activation = runtime.token_paths()
+    runtime.atomic_json(activation, {"token": "a" * 32})
+    callbacks, calls, waits = {}, [], []
+    monkeypatch.setattr(signal, "signal", lambda n, f: callbacks.update({n: f}))
+    original = runtime.threading.Event.wait
+
+    def wait(event, timeout=None):
+        if timeout is not None:
+            waits.append(timeout)
+        return original(event, None if timeout is None else min(timeout, 0.001))
+
+    def unit(cfg, **_):
+        calls.append(cfg.family)
+        if calls.count("SIP_MODELO") > 1:
+            callbacks[signal.SIGTERM]()
+        return {"status": "NO_CHANGE", "next_input_scan_at": time.time() + 2}
+
+    monkeypatch.setattr(runtime.threading.Event, "wait", wait)
+    monkeypatch.setattr(service, "run", unit)
+    runtime.worker(600)
+    assert calls.count("SIP_MODELO") == 2
+    assert any(1 <= delay <= 2 for delay in waits)
+    assert not any(500 < delay <= 600 for delay in waits)
