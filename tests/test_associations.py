@@ -372,6 +372,75 @@ def test_immutable_artifact_tampering_is_rejected(config, foundation):
         inspect(config)
 
 
+def test_unchanged_sources_reuse_publication_without_loading_or_reassigning(
+    config, foundation, monkeypatch
+):
+    from ingesta_delta_lake import association_service
+
+    first = run(config)
+    before = query(config, "SELECT COUNT(*) FROM publications")
+
+    def forbidden(*_, **__):
+        raise AssertionError("Unchanged historical facts must not be materialized again")
+
+    monkeypatch.setattr(association_service, "load_bundle", forbidden)
+    monkeypatch.setattr(association_service, "read_artifact", forbidden)
+    monkeypatch.setattr(a, "assign", forbidden)
+    replay = run(config)
+    assert replay["recomputed_source_rows"] == 0
+    assert replay["counts"] == first["counts"] and replay["batch_id"] == first["batch_id"]
+    assert replay["inserted_this_attempt"] == replay["updated_this_attempt"] == 0
+    assert query(config, "SELECT COUNT(*) FROM publications") == before
+
+
+def test_changed_source_invalidates_publication_cache(config, foundation):
+    run(config)
+    (foundation / "LISTA_RECH.csv").write_text(
+        "14/10/2026 8:20:00;35;1;13;90;1;0;3F;;\n", encoding="utf-8"
+    )
+    run(replace(config, family="LISTA_RECH"))
+    assert run(config)["counts"]["LISTA_RECH"]["source_rows"] == 3
+
+
+def test_previous_publication_without_registry_is_adopted_once(config, foundation):
+    run(config)
+    with sqlite3.connect(config.control_path) as db:
+        no, text = db.execute(
+            "SELECT no,payload_json FROM publications ORDER BY no DESC LIMIT 1"
+        ).fetchone()
+        publication = json.loads(text)
+        for key in (
+            "registry",
+            "registry_hash",
+            "input_fingerprint",
+            "review_hash",
+            "assignment_hash",
+        ):
+            publication.pop(key)
+        db.execute(
+            "UPDATE publications SET payload_json=? WHERE no=?", (json.dumps(publication), no)
+        )
+    db.close()
+    # Same logical payload may reuse an existing completed batch. It must remain valid.
+    assert run(config)["counts"]["LISTA_RECH"]["source_rows"] == 2
+
+
+def test_tampered_registry_prevents_fast_replay(config, foundation):
+    run(config)
+    with sqlite3.connect(config.control_path) as db:
+        no, text = db.execute(
+            "SELECT no,payload_json FROM publications ORDER BY no DESC LIMIT 1"
+        ).fetchone()
+        publication = json.loads(text)
+        publication["registry_hash"] = "0" * 64
+        db.execute(
+            "UPDATE publications SET payload_json=? WHERE no=?", (json.dumps(publication), no)
+        )
+    db.close()
+    with pytest.raises(IntegrityError, match="decisiones"):
+        run(config)
+
+
 @pytest.fixture
 def bundle(config, foundation):
     return load_bundle(config)

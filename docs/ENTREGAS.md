@@ -32,6 +32,10 @@ ZF_OK conserva su revisión independiente. Reconstrucción real en servidor desp
 | [11A](entregas/11a_identidad_tandem.md) | Prerrequisito MP9 v2 y contrato tándem | Máquina recuperada/validada en código; migración real pendiente |
 | [11B/11C](entregas/11bc_catalogos_derivados.md) | Catálogos físicos y derivados v2 | Implementados y probados con datos sintéticos; reconstrucción/conciliación real en servidor tras GitHub/CI |
 | [12](entregas/12_consumo_operacion.md) | Consulta, operación y despliegue | CI/CD Docker implementado; piloto/consumo de la app y aceptación operativa pendientes |
+| [13](entregas/13_ingesta_incremental.md) | Contextos MIA e índice incremental | CI Windows/Linux e imagen superadas; desplegado en develop conservando datos y copia verificada |
+| [14](entregas/14_turnos_fuentes.md) | Turnos, continuidad de capturas y progreso | CI Windows/Linux e imagen superadas; desplegado en develop, validación continua de vueltas y colas |
+| [15](entregas/15_procesos_acotados.md) | Procesos por tabla y recursos Docker/WSL2 | Implementado; pruebas locales con procesos/Delta y comprobación Docker en CI antes de despliegue |
+| [16](entregas/16_artefactos_asociaciones.md) | Artefactos por bloques y reutilización sin cambios | Implementado; compatibilidad, hashes, memoria, repetición y regresión verificadas localmente; CI antes de despliegue |
 
 Cada cambio mantiene las pruebas de las entregas anteriores. Una entrega aceptada en local
 no acredita operación productiva en el servidor. AV31 dispone de una relación física

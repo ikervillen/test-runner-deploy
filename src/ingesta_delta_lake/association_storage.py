@@ -169,43 +169,71 @@ def load_bundle(config):
 
 
 def artifact(config, payload):
-    raw = canonical(payload).encode("utf-8")
-    data = gzip.compress(raw, compresslevel=6, mtime=0)
-    sha = hashlib.sha256(data).hexdigest()
-    path = config.control_root / "association-artifacts" / (sha + ".json.gz")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        if path.read_bytes() != data:
-            raise IntegrityError("Artefacto inmutable alterado")
-    else:
-        temp = path.with_name("." + uuid.uuid4().hex + ".tmp")
+    root = config.control_root / "association-artifacts"
+    root.mkdir(parents=True, exist_ok=True)
+    temp = root / ("." + uuid.uuid4().hex + ".tmp")
+    payload_hash = hashlib.sha256()
+    encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    try:
+        with temp.open("xb") as f:
+            with gzip.GzipFile(filename="", fileobj=f, mode="wb", compresslevel=6, mtime=0) as out:
+                parts, size = [], 0
+                for text in encoder.iterencode(payload):
+                    parts.append(text)
+                    size += len(text)
+                    if size >= 65536:
+                        data = "".join(parts).encode("utf-8")
+                        payload_hash.update(data)
+                        out.write(data)
+                        parts, size = [], 0
+                if parts:
+                    data = "".join(parts).encode("utf-8")
+                    payload_hash.update(data)
+                    out.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        with temp.open("rb") as stream:
+            sha = hashlib.file_digest(stream, "sha256").hexdigest()
+        path = root / (sha + ".json.gz")
         try:
-            with temp.open("xb") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
             os.link(temp, path)
-        finally:
-            temp.unlink(missing_ok=True)
-    return {"path": str(path), "sha256": sha, "payload_hash": hashlib.sha256(raw).hexdigest()}
+        except FileExistsError:
+            with path.open("rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != sha:
+                    raise IntegrityError("Artefacto inmutable alterado") from None
+        if os.name != "nt":
+            handle = os.open(root, os.O_RDONLY)
+            try:
+                os.fsync(handle)
+            finally:
+                os.close(handle)
+        return {"path": str(path), "sha256": sha, "payload_hash": payload_hash.hexdigest()}
+    finally:
+        temp.unlink(missing_ok=True)
 
 
-def read_artifact(config, descriptor):
+def verify_artifact(config, descriptor):
     path = Path(descriptor["path"]).resolve()
     if not path.is_relative_to(config.control_root):
         raise IntegrityError("Artefacto fuera de control")
-    data = path.read_bytes()
-    if hashlib.sha256(data).hexdigest() != descriptor["sha256"]:
-        raise IntegrityError("Artefacto de asociación alterado")
-    raw = gzip.decompress(data)
-    if hashlib.sha256(raw).hexdigest() != descriptor["payload_hash"]:
-        raise IntegrityError("Payload de asociación alterado")
-    return json.loads(raw)
+    with path.open("rb") as stream:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != descriptor["sha256"]:
+            raise IntegrityError("Artefacto de asociación alterado")
+    with gzip.open(path, "rb") as stream:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != descriptor["payload_hash"]:
+            raise IntegrityError("Payload de asociación alterado")
+    return path
+
+
+def read_artifact(config, descriptor):
+    path = verify_artifact(config, descriptor)
+    with gzip.open(path, "rt", encoding="utf-8") as stream:
+        return json.load(stream)
 
 
 def verify_artifacts(config, prepared):
     for descriptor in prepared["artifacts"].values():
-        read_artifact(config, descriptor)
+        verify_artifact(config, descriptor)
 
 
 class AssociationControl(Control):
