@@ -202,11 +202,12 @@ def artifact(config, payload):
                 if hashlib.file_digest(stream, "sha256").hexdigest() != sha:
                     raise IntegrityError("Artefacto inmutable alterado") from None
         if os.name != "nt":
-            handle = os.open(root, os.O_RDONLY)
-            try:
-                os.fsync(handle)
-            finally:
-                os.close(handle)
+            for directory in (root, config.control_root):
+                handle = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(handle)
+                finally:
+                    os.close(handle)
         return {"path": str(path), "sha256": sha, "payload_hash": payload_hash.hexdigest()}
     finally:
         temp.unlink(missing_ok=True)
