@@ -36,6 +36,7 @@ ZF_OK conserva su revisión independiente. Reconstrucción real en servidor desp
 | [14](entregas/14_turnos_fuentes.md) | Turnos, continuidad de capturas y progreso | CI Windows/Linux e imagen superadas; desplegado en develop, validación continua de vueltas y colas |
 | [15](entregas/15_procesos_acotados.md) | Procesos por tabla y recursos Docker/WSL2 | Implementado; pruebas locales con procesos/Delta y comprobación Docker en CI antes de despliegue |
 | [16](entregas/16_artefactos_asociaciones.md) | Artefactos por bloques y reutilización sin cambios | Implementado; compatibilidad, hashes, memoria, repetición y regresión verificadas localmente; CI antes de despliegue |
+| [17](entregas/17_cadencia_entrada.md) | Revisión periódica de entradas y consumo continuo | Implementado; cola independiente de la ventana de revisión, reintentos/activación/reloj y ambas modalidades de CSV probados antes de despliegue |
 
 Cada cambio mantiene las pruebas de las entregas anteriores. Una entrega aceptada en local
 no acredita operación productiva en el servidor. AV31 dispone de una relación física

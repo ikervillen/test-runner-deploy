@@ -1,6 +1,7 @@
 """Orquestación y reconciliación de fuentes y catálogo, con control por contrato."""
 
 import hashlib
+import json
 from contextlib import ExitStack, closing
 from pathlib import Path
 
@@ -183,7 +184,16 @@ def _process(config: Config, control: Control, attempt: str, stop_requested=None
         "inserted_this_attempt": inserted_recovery,
     }
     if not snapshots:
-        return {**common, "status": "NO_INPUTS", "batch_id": None}
+        reviews = control.db.execute(
+            "SELECT count(*) FROM issues WHERE status!='RESOLVED'"
+        ).fetchone()[0]
+        return {
+            **common,
+            "status": "NO_INPUTS",
+            "batch_id": None,
+            "open_reviews": reviews,
+            "quality_complete": not reviews,
+        }
     batch_id = digest(
         [
             contract.name,
@@ -314,6 +324,15 @@ def run(config: Config, *, runtime_owner: bool = False, stop_requested=None) -> 
                 attempt = control.start_attempt()
                 try:
                     result = _process(config, control, attempt, stop_requested=stop_requested)
+                    if hasattr(control, "input_scan_performed"):
+                        result["input_scan_performed"] = control.input_scan_performed
+                        result["input_scan_interval_seconds"] = config.input_scan_interval_seconds
+                        scan = json.loads(control.setting("last_input_scan") or "null")
+                        result["next_input_scan_at"] = (
+                            scan["started"] + config.input_scan_interval_seconds
+                            if scan and config.input_scan_interval_seconds
+                            else None
+                        )
                 except Exception as exc:
                     control.finish_attempt(attempt, {"status": "FAILED", "error": str(exc)})
                     raise

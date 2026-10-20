@@ -77,6 +77,7 @@ def settings():
         environment="development",
         topology_enabled=True,
         mia_batches_per_turn=1,
+        input_scan_interval_seconds=600,
         timestamp_policy="local_naive_test_v1",
         line_by_origin=tuple(value["line_by_origin"].items()),
         line_code_by_origin=tuple(value["line_code_by_origin"].items()),
@@ -244,11 +245,14 @@ def worker(interval=600):
                 cycle_started = time.monotonic()
                 backlog = False
                 failed = False
+                next_scans = []
 
-                def record(family, result, seconds):
+                def record(family, result, seconds, *, scan_deadlines=next_scans):
                     nonlocal backlog, failed
                     backlog = backlog or bool(result.get("remaining_versions", 0))
                     failed = failed or result["status"] == "FAILED"
+                    if result.get("next_input_scan_at") is not None:
+                        scan_deadlines.append(result["next_input_scan_at"])
                     event = {
                         "activation_token": token,
                         "channel": os.environ["INGESTA_CHANNEL"],
@@ -311,6 +315,8 @@ def worker(interval=600):
                     if backlog or failed
                     else max(1, interval - (time.monotonic() - cycle_started))
                 )
+                if next_scans and not backlog and not failed:
+                    delay = max(1, min(delay, min(next_scans) - time.time()))
                 stop.wait(delay)
         finally:
             heartbeat_stop.set()
