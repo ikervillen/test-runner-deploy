@@ -40,10 +40,17 @@ def _apply(
     config: Config, control: Control, store: DeltaStore, batch: dict
 ) -> tuple[int | None, bool]:
     prepared = control.prepared(batch)
+    scoped = "read_scope" in prepared
+    if scoped:
+        if config.family not in {"LISTA_RECH", "LISTA_DEFECTOS"}:
+            raise IntegrityError("Scoped intentions are restricted to MIA sources")
+        store.set_scope(prepared["read_scope"])
     content_hash = config.contract.content_hash
     operation = batch["operation_id"]
     _check_evidence(config, prepared)
     table = store.table()
+    if scoped:
+        from .mia_scope import verify_files
     version, rows = store.read(table)
     commits = (
         [h for h in table.history() if h.get("ingesta_operation_id") == operation] if table else []
@@ -61,12 +68,17 @@ def _apply(
             or content_hash(rows) != prepared["after_hash"]
         ):
             raise IntegrityError("No se puede reconciliar el resultado del commit pendiente")
+        if scoped:
+            verify_files(table, prepared, after=True)
         control.confirm(batch["batch_id"], version)
         return version, False
     if version != prepared["before_version"] or content_hash(rows) != prepared["before_hash"]:
         raise IntegrityError(
             "Resultado incierto: cambió el destino sin evidencia de esta operación"
         )
+    if scoped:
+        verify_files(table, prepared, after=False)
+    del rows  # Do not retain a second historical snapshot during append/confirmation.
     if not prepared["inserts"] and not prepared.get("updates"):
         control.confirm(batch["batch_id"], version)
         return version, False
@@ -93,6 +105,8 @@ def _apply(
             or not any(h.get("ingesta_operation_id") == operation for h in history)
         ):
             raise IntegrityError("La confirmación Delta no corresponde a la intención preparada")
+        if scoped:
+            verify_files(table, prepared, after=True)
         control.confirm(batch["batch_id"], after_version)
         return after_version, True
     except Exception as exc:

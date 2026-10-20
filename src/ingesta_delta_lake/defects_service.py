@@ -11,13 +11,14 @@ from . import __version__
 from . import lista_defectos as defects
 from .common import ConfigurationError, IntegrityError, canonical, digest
 from .defects_storage import DefectsStore
+from .mia_scope import files, group_holds, scope_for
 from .service import _apply
 from .sources import capture, discover, orphan_captures
 
 BATCH_FILES = 8
 BATCH_BYTES = 4 * 1024 * 1024
 MAX_FILE_BYTES = 8 * 1024 * 1024
-POLICY = "bounded-input-v1"
+POLICY = "bounded-context-v2"
 
 
 def chunks(snapshots):
@@ -173,10 +174,17 @@ def process_batch(
 ):
     store = store_class(config, control.control_id)
     recovered, recovery_count = reconcile_pending(config, control, store_class)
+    parsed = model.parse(snapshots, config.encoding)
+    scope = scope_for(parsed, model)
+    store.set_scope(scope)
+    before_files = files(store.table())
+    published_rows = sum(row[2] for row in before_files)
+    control.ensure_inspection_index(
+        store.table().version() if before_files else None, published_rows
+    )
     version, existing = store.read()
     if control.setting("last_version") not in (None, str(version)):
         raise IntegrityError(f"El snapshot {config.family} no coincide con su control")
-    parsed = model.parse(snapshots, config.encoding)
     inserts, issues, matches = model.decide(parsed, existing, *control.held())
     merged = {
         **existing,
@@ -224,16 +232,21 @@ def process_batch(
         "outcome_state": "COMPLETED" if complete else "PARTIAL",
         "stats": stats,
         "inspection_groups": groups,
+        "read_scope": scope,
+        "before_files": before_files,
+        "inspection_holds": group_holds(cases),
     }
     prior = control.batch(batch_id)
     wrote = False
+    scoped_rows = len(merged)
+    del existing, merged, parsed
     if prior is None:
         control.prepare(batch_id, digest([batch_id, operation_kind]), prepared)
         version, wrote = _apply(config, control, store, control.batch(batch_id))
     elif inserts:
         raise IntegrityError(f"Un lote {config.family} confirmado exige nuevas inserciones")
     status = (
-        ("PARTIAL" if merged else "BLOCKED")
+        ("PARTIAL" if published_rows + len(inserts) else "BLOCKED")
         if not complete
         else ("APPLIED" if wrote else "NO_CHANGE" if snapshots else "NO_INPUTS")
     )
@@ -249,11 +262,10 @@ def process_batch(
         "control_path": str(config.control_path),
         "delta_version": version,
         "inserted_this_attempt": recovery_count + (len(inserts) if wrote else 0),
-        "published_rows": len(merged),
+        "published_rows": published_rows + len(inserts),
+        "context_rows": scoped_rows,
         "open_reviews": len(cases),
-        "resolved_groups": sum(g["status"] == "RESOLVED" for g in groups),
-        "unresolved_groups": sum(g["status"] != "RESOLVED" for g in groups),
-        "resolved_inspection_total": sum(g["INSPECC"] for g in groups if g["status"] == "RESOLVED"),
+        **control.inspection_summary(),
         "inspection_metric": "inspections_by_context_not_unique_bottles",
         "recovered_operations": recovered,
         **stats,

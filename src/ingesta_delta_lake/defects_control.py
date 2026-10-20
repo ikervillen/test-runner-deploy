@@ -5,6 +5,7 @@ import json
 from . import lista_defectos as defects
 from .common import IntegrityError, canonical, now
 from .control import Control
+from .mia_scope import group_holds
 from .sources import Snapshot
 
 
@@ -43,6 +44,10 @@ class DefectsControl(Control):
             CREATE TABLE IF NOT EXISTS input_versions(
               origin TEXT NOT NULL, sha256 TEXT NOT NULL, descriptor_json TEXT NOT NULL,
               PRIMARY KEY(origin,sha256));
+            CREATE TABLE IF NOT EXISTS inspection_current(
+              group_id TEXT PRIMARY KEY, origin TEXT NOT NULL, payload_json TEXT NOT NULL,
+              status TEXT NOT NULL, inspected INTEGER, row_count INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS inspection_current_origin ON inspection_current(origin);
         """)
         if self.setting("input_queue_migrated") is None:
             with self.db:
@@ -113,6 +118,88 @@ class DefectsControl(Control):
                 groups.add(tuple(issue["group"]))
         return keys, signatures, groups
 
+    def ensure_inspection_index(self, version, published_rows):
+        """Adopt the last complete legacy group snapshot once; retain all old audit."""
+        if self.setting("inspection_index_version") == str(version):
+            if (
+                self.db.execute(
+                    "SELECT coalesce(sum(row_count),0) FROM inspection_current"
+                ).fetchone()[0]
+                != published_rows
+            ):
+                raise IntegrityError("MIA inspection index row coverage is inconsistent")
+            return
+        latest = self.db.execute(
+            "SELECT batch_id FROM batches WHERE delta_version IS ? "
+            "AND state IN ('COMPLETED','PARTIAL') ORDER BY confirmed_at DESC LIMIT 1",
+            (version,),
+        ).fetchone()
+        with self.db:
+            self.db.execute("DELETE FROM inspection_current")
+            if latest:
+                self.db.execute(
+                    "INSERT INTO inspection_current SELECT group_id,"
+                    "json_extract(payload_json,'$.group[0]'),payload_json,"
+                    "json_extract(payload_json,'$.status'),"
+                    "json_extract(payload_json,'$.INSPECC'),"
+                    "coalesce(json_extract(payload_json,'$.defect_rows'),"
+                    "json_extract(payload_json,'$.observation_rows')) "
+                    "FROM inspection_groups WHERE batch_id=?",
+                    (latest[0],),
+                )
+            count = self.db.execute(
+                "SELECT coalesce(sum(row_count),0) FROM inspection_current"
+            ).fetchone()[0]
+            if count != published_rows:
+                raise IntegrityError("Legacy MIA group snapshot does not cover its Delta version")
+            self.update_inspection_holds(group_holds(self.cases()))
+            self.db.execute(
+                "INSERT INTO settings VALUES('inspection_index_version',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(version),),
+            )
+
+    def update_inspection_holds(self, holds):
+        old_groups, old_origins = json.loads(self.setting("inspection_index_holds") or "[[],[]]")
+        groups, origins = holds
+        reset = (
+            "UPDATE inspection_current SET status='RESOLVED',inspected="
+            "json_extract(payload_json,'$.accepted_inspection_values[0]') "
+        )
+        self.db.executemany(
+            reset + "WHERE group_id=?", [(g,) for g in set(old_groups) - set(groups)]
+        )
+        self.db.executemany(
+            reset + "WHERE origin=?", [(o,) for o in set(old_origins) - set(origins)]
+        )
+        self.db.executemany(
+            "UPDATE inspection_current SET status='REVIEW',inspected=NULL "
+            "WHERE group_id=? AND status!='REVIEW'",
+            [(g,) for g in groups],
+        )
+        self.db.executemany(
+            "UPDATE inspection_current SET status='REVIEW',inspected=NULL "
+            "WHERE origin=? AND status!='REVIEW'",
+            [(o,) for o in origins],
+        )
+        self.db.execute(
+            "INSERT INTO settings VALUES('inspection_index_holds',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (canonical(holds),),
+        )
+
+    def inspection_summary(self):
+        row = self.db.execute(
+            "SELECT count(*),coalesce(sum(status='RESOLVED'),0),"
+            "coalesce(sum(CASE WHEN status='RESOLVED' THEN inspected ELSE 0 END),0) "
+            "FROM inspection_current"
+        ).fetchone()
+        return {
+            "resolved_groups": row[1],
+            "unresolved_groups": row[0] - row[1],
+            "resolved_inspection_total": row[2],
+        }
+
     def prepare(self, batch_id, operation_id, prepared):
         with self.db:
             self.db.execute(
@@ -157,3 +244,26 @@ class DefectsControl(Control):
                 "INSERT OR IGNORE INTO inspection_groups VALUES(?,?,?)",
                 [(batch_id, g["group_id"], canonical(g)) for g in prepared["inspection_groups"]],
             )
+            if "read_scope" in prepared:
+                self.db.executemany(
+                    "INSERT INTO inspection_current VALUES(?,?,?,?,?,?) "
+                    "ON CONFLICT(group_id) DO UPDATE SET payload_json=excluded.payload_json,"
+                    "status=excluded.status,inspected=excluded.inspected,row_count=excluded.row_count",
+                    [
+                        (
+                            g["group_id"],
+                            g["group"][0],
+                            canonical(g),
+                            g["status"],
+                            g["INSPECC"],
+                            g.get("defect_rows", g.get("observation_rows")),
+                        )
+                        for g in prepared["inspection_groups"]
+                    ],
+                )
+                self.update_inspection_holds(prepared["inspection_holds"])
+                self.db.execute(
+                    "INSERT INTO settings VALUES('inspection_index_version',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (str(version),),
+                )

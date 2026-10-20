@@ -11,6 +11,7 @@ from . import lista_rech as rech
 from .common import IntegrityError
 from .defects_control import DefectsControl
 from .delta import DeltaStore
+from .mia_scope import ScopedRead
 
 
 class RejectionsControl(DefectsControl):
@@ -23,42 +24,47 @@ class RejectionsControl(DefectsControl):
         return keys, signatures, groups
 
 
-class RejectionsStore(DeltaStore):
+class RejectionsStore(ScopedRead, DeltaStore):
+    model = rech
+
     def read(self, table=None):
         table = table if table is not None else self.table()
         if table is None:
             return None, {}
-        arrow = table.to_pyarrow_table()
-        if arrow.schema != rech.SCHEMA:
-            raise IntegrityError("Esquema LISTA_RECH incompatible")
         rows, signatures = {}, set()
-        for row in arrow.to_pylist():
-            if any(row[f] is None for f in rech.SCHEMA.names if f not in {"CAVIDAD", "FECHA_R"}):
-                raise IntegrityError("Campo obligatorio LISTA_RECH nulo")
-            for column in ("FECHA", "FECHA_R"):
-                stamp = row[column]
-                if stamp is not None:
-                    if stamp.microsecond or stamp.tzinfo is not None:
-                        raise IntegrityError("Precisión o zona horaria LISTA_RECH inesperadas")
-                    row[column] = stamp.isoformat(timespec="seconds")
-            if (
-                not row["origen_fenix"]
-                or row["MOLDE"] < 0
-                or any(row[f] < 0 for f in rech.FIELDS[4:7])
-                or (
-                    row["CAVIDAD"] is not None
-                    and (not row["CAVIDAD"] or row["CAVIDAD"] != row["CAVIDAD"].strip())
-                )
-            ):
-                raise IntegrityError("Contenido LISTA_RECH publicado inválido")
-            k, s = rech.key(row), rech.signature(row)
-            if k in rows or s in signatures:
-                raise IntegrityError("Clave/firma LISTA_RECH duplicada, incluida cavidad nula")
-            rows[k] = row
-            signatures.add(s)
+        for batch in self.batches(table, rech.SCHEMA):
+            for row in batch.to_pylist():
+                if any(
+                    row[f] is None for f in rech.SCHEMA.names if f not in {"CAVIDAD", "FECHA_R"}
+                ):
+                    raise IntegrityError("Campo obligatorio LISTA_RECH nulo")
+                for column in ("FECHA", "FECHA_R"):
+                    stamp = row[column]
+                    if stamp is not None:
+                        if stamp.microsecond or stamp.tzinfo is not None:
+                            raise IntegrityError("Precisión o zona horaria LISTA_RECH inesperadas")
+                        row[column] = stamp.isoformat(timespec="seconds")
+                if (
+                    not row["origen_fenix"]
+                    or row["MOLDE"] < 0
+                    or any(row[f] < 0 for f in rech.FIELDS[4:7])
+                    or (
+                        row["CAVIDAD"] is not None
+                        and (not row["CAVIDAD"] or row["CAVIDAD"] != row["CAVIDAD"].strip())
+                    )
+                ):
+                    raise IntegrityError("Contenido LISTA_RECH publicado inválido")
+                if self.scope is not None and not self.includes(row):
+                    continue
+                k, s = rech.key(row), rech.signature(row)
+                if k in rows or s in signatures:
+                    raise IntegrityError("Clave/firma LISTA_RECH duplicada, incluida cavidad nula")
+                rows[k] = row
+                signatures.add(s)
         return table.version(), rows
 
     def insert(self, rows, operation, before_version):
+        self.validate_scope(rows)
         table = self.table()
         version, existing = self.read(table)
         if version != before_version or not rows:
