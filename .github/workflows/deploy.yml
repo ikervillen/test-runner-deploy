@@ -20,6 +20,7 @@ jobs:
           $tablesPath = '\\wsl$\docker-desktop\mnt\docker-desktop-disk\data\docker\volumes\fenix-aiala-develop\_data\silver\AIALA'
           Write-Output ('WINDOWS_TABLE_PATH='+$tablesPath+' EXISTS='+(Test-Path -LiteralPath $tablesPath))
           if (Test-Path -LiteralPath $tablesPath) { Get-ChildItem -LiteralPath $tablesPath -Directory | Select-Object -ExpandProperty Name }
+          docker --context $ctx container inspect --format 'RESTART_COUNT={{.RestartCount}} MEMORY_LIMIT={{.HostConfig.Memory}} SWAP_LIMIT={{.HostConfig.MemorySwap}}' $active.container
           docker --context $ctx stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' $active.container
           $metrics = "import base64;exec(base64.b64decode('ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoDQppbXBvcnQganNvbg0Kc3RhdHVzPVBhdGgoJy9wcm9jLzEvc3RhdHVzJykucmVhZF90ZXh0KCkuc3BsaXRsaW5lcygpDQpwcmludChqc29uLmR1bXBzKHsncHJvY2Vzcyc6W3MgZm9yIHMgaW4gc3RhdHVzIGlmIHMuc3RhcnRzd2l0aCgoJ1ZtUlNTOicsJ1ZtU3dhcDonLCdSc3NBbm9uOicpKV0sICdjZ3JvdXAnOntmOihQYXRoKCcvc3lzL2ZzL2Nncm91cC8nK2YpLnJlYWRfdGV4dCgpLnN0cmlwKCkgaWYgUGF0aCgnL3N5cy9mcy9jZ3JvdXAvJytmKS5leGlzdHMoKSBlbHNlIE5vbmUpIGZvciBmIGluIFsnbWVtb3J5LmN1cnJlbnQnLCdtZW1vcnkucGVhaycsJ21lbW9yeS5tYXgnLCdtZW1vcnkuc3dhcC5jdXJyZW50JywnbWVtb3J5LmV2ZW50cyddfX0pKQ0K'))"
           docker --context $ctx exec $active.container python -c $metrics
