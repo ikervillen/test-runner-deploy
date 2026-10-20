@@ -1,4 +1,4 @@
-name: Inspect failed recovery space (read-only)
+name: Inspect develop storage before requested reset
 on:
   workflow_dispatch:
 permissions:
@@ -11,11 +11,16 @@ jobs:
       - shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          Get-PSDrive -Name C | Select-Object Name,Used,Free | ConvertTo-Json
+          docker --context desktop-linux info --format 'ENGINE={{.ID}} MEMORY={{.MemTotal}} TYPE={{.OSType}}'
+          if ($LASTEXITCODE -ne 0) { throw 'Docker engine unavailable' }
+          docker --context desktop-linux ps -a --format '{{.Names}} {{.Status}}' --filter volume=fenix-aiala-develop
+          $volumes = docker --context desktop-linux volume ls --format '{{.Name}}'
+          if ($volumes -contains 'fenix-aiala-develop') { docker --context desktop-linux volume inspect fenix-aiala-develop }
           $site = Get-Content -LiteralPath (Join-Path $env:LOCALAPPDATA 'FenixIngesta/site-develop.json') -Raw | ConvertFrom-Json
-          $active = Get-Content -LiteralPath (Join-Path $site.state_root 'develop/active.json') -Raw | ConvertFrom-Json
-          docker --context desktop-linux volume inspect $active.volume --format '{{json .Labels}}'
-          if ($LASTEXITCODE -ne 0) { throw 'Persistent volume absent' }
-          $code = "import base64;exec(base64.b64decode('ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCmltcG9ydCBqc29uLHNxbGl0ZTMsc2h1dGlsCmZyb20gY29udGV4dGxpYiBpbXBvcnQgY2xvc2luZwpyb290PVBhdGgoJy9sYWtlJyk7b3V0PXsnc3BhY2UnOntwOnNodXRpbC5kaXNrX3VzYWdlKHApLl9hc2RpY3QoKSBmb3IgcCBpbiBbJy9sYWtlJywnL3RtcCddfSwnYXJjaGl2ZXMnOlt7J25hbWUnOnAubmFtZSwnYnl0ZXMnOnAuc3RhdCgpLnN0X3NpemV9IGZvciBwIGluIChyb290Lydjb250cm9sJy8ncmVjb3ZlcnknKS5nbG9iKCcqJykgaWYgcC5pc19maWxlKCldLCd0YWJsZXMnOnNvcnRlZChwLm5hbWUgZm9yIHAgaW4gKHJvb3QvJ3NpbHZlcicvJ0FJQUxBJykuaXRlcmRpcigpIGlmIHAuaXNfZGlyKCkpfQpwPXJvb3QvJ2NvbnRyb2wnLydjb250cm9sLWxpc3RhX3JlY2guc3FsaXRlJztvdXRbJ2NvbnRyb2xfYnl0ZXMnXT1wLnN0YXQoKS5zdF9zaXplCndhbD1QYXRoKHN0cihwKSsnLXdhbCcpO291dFsnd2FsX2J5dGVzJ109d2FsLnN0YXQoKS5zdF9zaXplIGlmIHdhbC5leGlzdHMoKSBlbHNlIDAKdHJ5Ogogd2l0aCBjbG9zaW5nKHNxbGl0ZTMuY29ubmVjdChwLmFzX3VyaSgpKyc/bW9kZT1ybycsdXJpPVRydWUsdGltZW91dD0yKSkgYXMgZGI6CiAgZGIuZXhlY3V0ZSgnUFJBR01BIHF1ZXJ5X29ubHk9T04nKTtkYi5leGVjdXRlKCdQUkFHTUEgY2FjaGVfc2l6ZT0tMjA0OCcpCiAgb3V0WydiYXRjaGVzJ109ZGIuZXhlY3V0ZSgnU0VMRUNUIGJhdGNoX2lkLHN0YXRlLGRlbHRhX3ZlcnNpb24gRlJPTSBiYXRjaGVzJykuZmV0Y2hhbGwoKQogIG91dFsnc2FtcGxlX2ludGVudF9zdGF0ZXMnXT1kYi5leGVjdXRlKCdTRUxFQ1Qgc3RhdGUsZGVsdGFfdmVyc2lvbiBGUk9NIG9ic2VydmF0aW9uX2ludGVudHMgTElNSVQgMycpLmZldGNoYWxsKCkKICBvdXRbJ21haW50ZW5hbmNlX3RhYmxlJ109ZGIuZXhlY3V0ZSgiU0VMRUNUIG5hbWUgRlJPTSBzcWxpdGVfbWFzdGVyIFdIRVJFIG5hbWU9J21haW50ZW5hbmNlX2V2ZW50cyciKS5mZXRjaGFsbCgpCmV4Y2VwdCBFeGNlcHRpb24gYXMgZTpvdXRbJ3JlYWRvbmx5X2NvbnRyb2xfZXJyb3InXT1zdHIoZSkKcHJpbnQoanNvbi5kdW1wcyhvdXQpKQo='))"
-          docker --context desktop-linux run --rm --pull never --network none --read-only --cap-drop ALL --memory 512m --tmpfs '/tmp:rw,nosuid,size=512m' --mount "type=volume,src=$($active.volume),dst=/lake,readonly" --entrypoint python $active.image -c $code
-          if ($LASTEXITCODE -ne 0) { throw 'Read-only inspection failed' }
+          Write-Output ('STATE_ROOT='+$site.state_root)
+          $active = Join-Path $site.state_root 'develop/active.json'
+          if (Test-Path -LiteralPath $active) { Get-Content -LiteralPath $active -Raw }
+          foreach ($p in @('\\wsl$\docker-desktop', '\\wsl$\docker-desktop\mnt\docker-desktop-disk\data\docker\volumes', '\\wsl$\docker-desktop\mnt\docker-desktop-disk\data\docker\volumes\fenix-aiala-develop\_data')) {
+            Write-Output ($p+' EXISTS='+(Test-Path -LiteralPath $p))
+          }
+          Get-ChildItem -LiteralPath 'C:\DataSharing\Fenix' -Directory | Select-Object -ExpandProperty Name
