@@ -1,39 +1,61 @@
-name: Verify bounded ingestion (read-only)
+name: Checkpoint develop before incremental upgrade
 on:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  verify:
+  checkpoint:
     runs-on: [self-hosted, Windows, X64, fenix-ingesta]
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $site = Get-Content -LiteralPath (Join-Path $env:LOCALAPPDATA 'FenixIngesta/site-develop.json') -Raw | ConvertFrom-Json
           $active = Get-Content -LiteralPath (Join-Path $site.state_root 'develop/active.json') -Raw | ConvertFrom-Json
-          $active | Select-Object commit,image,container,volume,channel | ConvertTo-Json
           $ctx = $site.docker_context
-          docker --context $ctx container inspect --format '{{json .State}}' $active.container
-          if ($LASTEXITCODE -ne 0) { throw 'New worker absent' }
-          $tablesPath = '\\wsl$\docker-desktop\mnt\docker-desktop-disk\data\docker\volumes\fenix-aiala-develop\_data\silver\AIALA'
-          Write-Output ('WINDOWS_TABLE_PATH='+$tablesPath+' EXISTS='+(Test-Path -LiteralPath $tablesPath))
-          if (Test-Path -LiteralPath $tablesPath) { Get-ChildItem -LiteralPath $tablesPath -Directory | Select-Object -ExpandProperty Name }
-          docker --context $ctx container inspect --format 'RESTART_COUNT={{.RestartCount}} MEMORY_LIMIT={{.HostConfig.Memory}} SWAP_LIMIT={{.HostConfig.MemorySwap}}' $active.container
-          docker --context $ctx stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' $active.container
-          $metrics = "import base64;exec(base64.b64decode('ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoDQppbXBvcnQganNvbg0Kc3RhdHVzPVBhdGgoJy9wcm9jLzEvc3RhdHVzJykucmVhZF90ZXh0KCkuc3BsaXRsaW5lcygpDQpwcmludChqc29uLmR1bXBzKHsncHJvY2Vzcyc6W3MgZm9yIHMgaW4gc3RhdHVzIGlmIHMuc3RhcnRzd2l0aCgoJ1ZtUlNTOicsJ1ZtU3dhcDonLCdSc3NBbm9uOicpKV0sICdjZ3JvdXAnOntmOihQYXRoKCcvc3lzL2ZzL2Nncm91cC8nK2YpLnJlYWRfdGV4dCgpLnN0cmlwKCkgaWYgUGF0aCgnL3N5cy9mcy9jZ3JvdXAvJytmKS5leGlzdHMoKSBlbHNlIE5vbmUpIGZvciBmIGluIFsnbWVtb3J5LmN1cnJlbnQnLCdtZW1vcnkucGVhaycsJ21lbW9yeS5tYXgnLCdtZW1vcnkuc3dhcC5jdXJyZW50JywnbWVtb3J5LmV2ZW50cyddfX0pKQ0K'))"
-          docker --context $ctx exec $active.container python -c $metrics
-          docker --context $ctx volume inspect $active.volume --format '{{json .Labels}}'
-          if ($LASTEXITCODE -ne 0) { throw 'Persistent volume absent' }
-          $code = "import base64;exec(base64.b64decode('aW1wb3J0IGRhdGV0aW1lLGpzb24sc3FsaXRlMw0KZnJvbSBwYXRobGliIGltcG9ydCBQYXRoDQpmcm9tIGNvbnRleHRsaWIgaW1wb3J0IGNsb3NpbmcNCmltcG9ydCBweWFycm93IGFzIHBhDQpmcm9tIGRlbHRhbGFrZSBpbXBvcnQgRGVsdGFUYWJsZQ0Kcm9vdD1QYXRoKCcvbGFrZScpO3JlcG9ydD17J2F0JzpkYXRldGltZS5kYXRldGltZS5ub3coZGF0ZXRpbWUudGltZXpvbmUudXRjKS5pc29mb3JtYXQoKSwndGFibGVzJzpbXSwnY29udHJvbHMnOltdfQ0KZm9yIHAgaW4gc29ydGVkKChyb290LydzaWx2ZXInLydBSUFMQScpLml0ZXJkaXIoKSkgaWYgKHJvb3QvJ3NpbHZlcicvJ0FJQUxBJykuZXhpc3RzKCkgZWxzZSBbXToNCiBpZiBub3QgcC5pc19kaXIoKTpjb250aW51ZQ0KIHRyeToNCiAgdGFibGU9RGVsdGFUYWJsZShzdHIocCkpO2FkZHM9cGEudGFibGUodGFibGUuZ2V0X2FkZF9hY3Rpb25zKCkpO2NvdW50cz1hZGRzWydudW1fcmVjb3JkcyddLnRvX3B5bGlzdCgpDQogIHJlcG9ydFsndGFibGVzJ10uYXBwZW5kKHsnZmFtaWx5JzpwLm5hbWUsJ3ZlcnNpb24nOnRhYmxlLnZlcnNpb24oKSwncm93cyc6c3VtKGNvdW50cyksJ2ZpbGVzJzphZGRzLm51bV9yb3dzfSkNCiBleGNlcHQgRXhjZXB0aW9uIGFzIGVycm9yOnJlcG9ydFsndGFibGVzJ10uYXBwZW5kKHsnZmFtaWx5JzpwLm5hbWUsJ2Vycm9yJzpzdHIoZXJyb3IpfSkNCmZvciBwIGluIHNvcnRlZCgocm9vdC8nY29udHJvbCcpLmdsb2IoJyouc3FsaXRlJykpOg0KIGl0ZW09eydmaWxlJzpwLm5hbWUsJ2J5dGVzJzpwLnN0YXQoKS5zdF9zaXplfQ0KIHRyeToNCiAgd2l0aCBjbG9zaW5nKHNxbGl0ZTMuY29ubmVjdChwLmFzX3VyaSgpKyc/bW9kZT1ybycsdXJpPVRydWUsdGltZW91dD0yKSkgYXMgZGI6DQogICBkYi5leGVjdXRlKCdQUkFHTUEgcXVlcnlfb25seT1PTicpO2RiLmV4ZWN1dGUoJ1BSQUdNQSBjYWNoZV9zaXplPS0yMDQ4Jyk7ZGIuZXhlY3V0ZSgnQkVHSU4nKQ0KICAgaXRlbVsnYmF0Y2hlcyddPWRiLmV4ZWN1dGUoJ1NFTEVDVCBzdGF0ZSxjb3VudCgqKSBGUk9NIGJhdGNoZXMgR1JPVVAgQlkgc3RhdGUnKS5mZXRjaGFsbCgpDQogICBpdGVtWydyZXZpZXdzJ109ZGIuZXhlY3V0ZSgiU0VMRUNUIHJlYXNvbixjb3VudCgqKSBGUk9NIGlzc3VlcyBXSEVSRSBzdGF0dXMhPSdSRVNPTFZFRCcgR1JPVVAgQlkgcmVhc29uIikuZmV0Y2hhbGwoKQ0KICAgaWYgZGIuZXhlY3V0ZSgiU0VMRUNUIDEgRlJPTSBzcWxpdGVfbWFzdGVyIFdIRVJFIG5hbWU9J2lucHV0X3ZlcnNpb25zJyIpLmZldGNob25lKCk6DQogICAgaXRlbVsncXVldWVkJ109ZGIuZXhlY3V0ZSgnU0VMRUNUIGNvdW50KCopIEZST00gaW5wdXRfdmVyc2lvbnMnKS5mZXRjaG9uZSgpWzBdDQogICAgaXRlbVsnY29uc3VtZWQnXT1kYi5leGVjdXRlKCdTRUxFQ1QgY291bnQoKikgRlJPTSBjb25zdW1lZF9pbnB1dHMnKS5mZXRjaG9uZSgpWzBdDQogZXhjZXB0IEV4Y2VwdGlvbiBhcyBlcnJvcjppdGVtWydkZWZlcnJlZF9yZWFkb25seV9jb250cm9sJ109c3RyKGVycm9yKQ0KIHJlcG9ydFsnY29udHJvbHMnXS5hcHBlbmQoaXRlbSkNCmxhc3Q9e30NCmZvciBwIGluIHNvcnRlZCgocm9vdC8nbG9ncycpLmdsb2IoJyouanNvbmwnKSlbLTI6XToNCiBmb3IgbGluZSBpbiBwLm9wZW4oZW5jb2Rpbmc9J3V0Zi04Jyk6DQogIHRyeTpldmVudD1qc29uLmxvYWRzKGxpbmUpDQogIGV4Y2VwdCBWYWx1ZUVycm9yOmNvbnRpbnVlDQogIGxhc3RbZXZlbnRbJ2ZhbWlseSddXT17J3RpbWUnOmV2ZW50Wyd0aW1lJ10sJ3NlY29uZHMnOmV2ZW50WydzZWNvbmRzJ10sJ3Jlc3VsdCc6ZXZlbnRbJ3Jlc3VsdCddfQ0KcmVwb3J0WydsYXRlc3RfZmFtaWx5X3Jlc3VsdHMnXT1sYXN0DQpwcmludChqc29uLmR1bXBzKHJlcG9ydCxlbnN1cmVfYXNjaWk9VHJ1ZSkpDQo='))"
-          $out = docker --context $ctx run --rm --pull never --network none --read-only --cap-drop ALL --memory 512m --cpus 1 --tmpfs '/tmp:rw,nosuid,size=64m' --mount "type=volume,src=$($active.volume),dst=/lake,readonly" --entrypoint python $active.image -c $code
-          if ($LASTEXITCODE -ne 0) { throw 'Lake metadata inventory failed' }
-          $target = Join-Path $env:RUNNER_TEMP 'bounded-pilot-inventory.json'
-          [IO.File]::WriteAllText($target, ($out -join "`n"), [Text.UTF8Encoding]::new($false))
-          Write-Output $out
+          if ($active.channel -ne 'develop' -or $active.volume -ne 'fenix-aiala-develop' -or $active.commit -ne '558c1f6ab637c70e64123c3202a7e16735cd4dce') { throw 'Unexpected active release; refuse maintenance' }
+          $engine = docker --context $ctx info --format '{{.ID}}'
+          if ($LASTEXITCODE -ne 0 -or $engine -ne $active.engine_id) { throw 'Unexpected engine' }
+          $inspection = docker --context $ctx container inspect $active.container | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $inspection.Config.Labels.'es.fenix.ingesta.channel' -ne 'develop') { throw 'Unexpected container' }
+          $settingsEntry = @($inspection.Config.Env | Where-Object { $_.StartsWith('INGESTA_SETTINGS=') })
+          $env:INGESTA_SETTINGS = $settingsEntry[0].Substring('INGESTA_SETTINGS='.Length)
+          $env:INGESTA_CHANNEL='develop'
+          $env:INGESTA_INSTANCE=$active.instance
+          $env:INGESTA_ACTIVATION=$active.token
+          $backup = 'fenix-aiala-develop-backup-' + $env:GITHUB_RUN_ID
+          if ((docker --context $ctx volume ls -q --filter "name=^$backup`$").Length -gt 0) { throw 'Backup volume already exists' }
+          try {
+            docker --context $ctx update --restart=no $active.container
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot set graceful maintenance policy' }
+            if ((docker --context $ctx inspect --format '{{.State.Running}}' $active.container) -eq 'true') {
+              docker --context $ctx kill --signal=SIGTERM $active.container
+              if ($LASTEXITCODE -ne 0) { throw 'Cannot request graceful stop' }
+            }
+            $deadline=(Get-Date).AddMinutes(15)
+            while ((docker --context $ctx inspect --format '{{.State.Running}}' $active.container) -eq 'true') {
+              if ((Get-Date) -gt $deadline) { throw 'No safe boundary reached; never force-kill' }
+              Start-Sleep -Seconds 3
+            }
+            docker --context $ctx run --rm --pull never --network none --read-only --memory 512m --cpus 1 --volumes-from "$($active.container):ro" --env INGESTA_SETTINGS --env INGESTA_CHANNEL --env INGESTA_INSTANCE --env INGESTA_ACTIVATION $active.image check
+            if ($LASTEXITCODE -ne 0) { throw 'Old image did not confirm a clean checkpoint' }
+            docker --context $ctx volume create --label 'es.fenix.ingesta.role=backup' --label 'es.fenix.ingesta.channel=develop' --label "es.fenix.ingesta.source=$($active.volume)" $backup
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot create independent backup volume' }
+            $code="import base64;exec(base64.b64decode('aW1wb3J0IGhhc2hsaWIsanNvbixvcyx0YXJmaWxlLHRpbWUNCmZyb20gcGF0aGxpYiBpbXBvcnQgUGF0aA0Kcm9vdD1QYXRoKCcvbGFrZScpO291dD1QYXRoKCcvYmFja3VwJyk7YXJjaGl2ZT1vdXQvJ2xha2UudGFyLmd6Jzt0ZW1wb3Jhcnk9b3V0LydsYWtlLnRhci5nei5wYXJ0aWFsJw0KaWYgYXJjaGl2ZS5leGlzdHMoKSBvciB0ZW1wb3JhcnkuZXhpc3RzKCk6cmFpc2UgUnVudGltZUVycm9yKCdCYWNrdXAgZGVzdGluYXRpb24gaXMgbm90IGVtcHR5JykNCmZpbGVzPXNvcnRlZChwIGZvciBwIGluIHJvb3Qucmdsb2IoJyonKSBpZiBwLmlzX2ZpbGUoKSk7bWFuaWZlc3Q9e307c3RhcnRlZD10aW1lLm1vbm90b25pYygpDQpjbGFzcyBSZWFkZXI6DQogZGVmIF9faW5pdF9fKHNlbGYsc3RyZWFtKTpzZWxmLnN0cmVhbT1zdHJlYW07c2VsZi5zaGE9aGFzaGxpYi5zaGEyNTYoKQ0KIGRlZiByZWFkKHNlbGYsc2l6ZT0tMSk6DQogIGRhdGE9c2VsZi5zdHJlYW0ucmVhZChzaXplKTtzZWxmLnNoYS51cGRhdGUoZGF0YSk7cmV0dXJuIGRhdGENCndpdGggdGFyZmlsZS5vcGVuKHRlbXBvcmFyeSwndzpneicsY29tcHJlc3NsZXZlbD0xLGNvcHlidWZzaXplPTEwMjQqMTAyNCkgYXMgdGFyOg0KIGZvciBwIGluIGZpbGVzOg0KICBpZiBwLmlzX3N5bWxpbmsoKTpyYWlzZSBSdW50aW1lRXJyb3IoJ1VuZXhwZWN0ZWQgc3ltbGluayBpbiBsYWtlJykNCiAgbmFtZT1wLnJlbGF0aXZlX3RvKHJvb3QpLmFzX3Bvc2l4KCk7YmVmb3JlPXAuc3RhdCgpO2luZm89dGFyLmdldHRhcmluZm8oc3RyKHApLGFyY25hbWU9bmFtZSkNCiAgd2l0aCBwLm9wZW4oJ3JiJykgYXMgc291cmNlOg0KICAgcmVhZGVyPVJlYWRlcihzb3VyY2UpO3Rhci5hZGRmaWxlKGluZm8scmVhZGVyKQ0KICBhZnRlcj1wLnN0YXQoKQ0KICBpZiAoYmVmb3JlLnN0X3NpemUsYmVmb3JlLnN0X210aW1lX25zKSE9KGFmdGVyLnN0X3NpemUsYWZ0ZXIuc3RfbXRpbWVfbnMpOnJhaXNlIFJ1bnRpbWVFcnJvcignTGFrZSBjaGFuZ2VkIGR1cmluZyBiYWNrdXAnKQ0KICBtYW5pZmVzdFtuYW1lXT17J2J5dGVzJzpiZWZvcmUuc3Rfc2l6ZSwnc2hhMjU2JzpyZWFkZXIuc2hhLmhleGRpZ2VzdCgpfQ0KdmVyaWZpZWQ9c2V0KCkNCndpdGggdGFyZmlsZS5vcGVuKHRlbXBvcmFyeSwncnxneicpIGFzIHRhcjoNCiBmb3IgbWVtYmVyIGluIHRhcjoNCiAgaWYgbm90IG1lbWJlci5pc2ZpbGUoKSBvciBtZW1iZXIubmFtZSBub3QgaW4gbWFuaWZlc3Q6cmFpc2UgUnVudGltZUVycm9yKCdVbmV4cGVjdGVkIGJhY2t1cCBtZW1iZXInKQ0KICB3aXRoIHRhci5leHRyYWN0ZmlsZShtZW1iZXIpIGFzIHN0cmVhbTpzaGE9aGFzaGxpYi5maWxlX2RpZ2VzdChzdHJlYW0sJ3NoYTI1NicpLmhleGRpZ2VzdCgpDQogIGlmIG1hbmlmZXN0W21lbWJlci5uYW1lXSE9eydieXRlcyc6bWVtYmVyLnNpemUsJ3NoYTI1Nic6c2hhfTpyYWlzZSBSdW50aW1lRXJyb3IoJ0JhY2t1cCB2ZXJpZmljYXRpb24gZmFpbGVkJykNCiAgdmVyaWZpZWQuYWRkKG1lbWJlci5uYW1lKQ0KaWYgdmVyaWZpZWQhPXNldChtYW5pZmVzdCk6cmFpc2UgUnVudGltZUVycm9yKCdJbmNvbXBsZXRlIGJhY2t1cCcpDQp3aXRoIHRlbXBvcmFyeS5vcGVuKCdyYicpIGFzIHN0cmVhbTpvcy5mc3luYyhzdHJlYW0uZmlsZW5vKCkpO2FyY2hpdmVfc2hhPWhhc2hsaWIuZmlsZV9kaWdlc3Qoc3RyZWFtLCdzaGEyNTYnKS5oZXhkaWdlc3QoKQ0Kb3MucmVwbGFjZSh0ZW1wb3JhcnksYXJjaGl2ZSkNCnJlcG9ydD17J3N0YXR1cyc6J1ZFUklGSUVEJywnZmlsZXMnOmxlbihtYW5pZmVzdCksJ3NvdXJjZV9ieXRlcyc6c3VtKHJbJ2J5dGVzJ10gZm9yIHIgaW4gbWFuaWZlc3QudmFsdWVzKCkpLCdhcmNoaXZlX2J5dGVzJzphcmNoaXZlLnN0YXQoKS5zdF9zaXplLCdhcmNoaXZlX3NoYTI1Nic6YXJjaGl2ZV9zaGEsJ3NlY29uZHMnOnJvdW5kKHRpbWUubW9ub3RvbmljKCktc3RhcnRlZCwyKSwnbWFuaWZlc3QnOm1hbmlmZXN0fQ0Kd2l0aCAob3V0LydyZWNlaXB0Lmpzb24nKS5vcGVuKCd3JyxlbmNvZGluZz0ndXRmLTgnKSBhcyBzdHJlYW06anNvbi5kdW1wKHJlcG9ydCxzdHJlYW0pO3N0cmVhbS5mbHVzaCgpO29zLmZzeW5jKHN0cmVhbS5maWxlbm8oKSkNCmZkPW9zLm9wZW4ob3V0LG9zLk9fUkRPTkxZKTtvcy5mc3luYyhmZCk7b3MuY2xvc2UoZmQpDQpwcmludChqc29uLmR1bXBzKHtrOnYgZm9yIGssdiBpbiByZXBvcnQuaXRlbXMoKSBpZiBrIT0nbWFuaWZlc3QnfSkpDQo='))"
+            $out=docker --context $ctx run --rm --pull never --network none --read-only --memory 256m --cpus 1 --mount "type=volume,src=$($active.volume),dst=/lake,readonly" --mount "type=volume,src=$backup,dst=/backup" --entrypoint python $active.image -c $code
+            if ($LASTEXITCODE -ne 0) { throw 'Backup verification failed' }
+            $receipt=[pscustomobject]@{ status='CHECKPOINTED_AND_BACKED_UP'; at=(Get-Date).ToString('o'); volume=$active.volume; backup_volume=$backup; stopped_container=$active.container; commit=$active.commit; backup=($out -join "`n" | ConvertFrom-Json) }
+            $target=Join-Path $env:RUNNER_TEMP 'pre-incremental-checkpoint.json'
+            [IO.File]::WriteAllText($target,($receipt | ConvertTo-Json -Depth 6),[Text.UTF8Encoding]::new($false))
+            Write-Output ($receipt | ConvertTo-Json -Depth 6)
+          } catch {
+            docker --context $ctx update --restart=unless-stopped $active.container
+            if ((docker --context $ctx inspect --format '{{.State.Running}}' $active.container) -eq 'false') { docker --context $ctx start $active.container }
+            throw
+          }
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
-          name: bounded-pilot-inventory
-          path: ${{ runner.temp }}/bounded-pilot-inventory.json
-          retention-days: 14
+          name: pre-incremental-checkpoint
+          path: ${{ runner.temp }}/pre-incremental-checkpoint.json
+          retention-days: 30
