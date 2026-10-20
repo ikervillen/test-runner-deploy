@@ -4,8 +4,8 @@
 
 Estado: borrador de trabajo para revisión conjunta.  
 Fecha inicial: 14 de octubre de 2026.  
-Revisión: 34 — CI/CD Docker preparado para GitHub Actions y el runner Windows/WSL2 existente, con entornos independientes main/develop, activación segura y almacenamiento persistente. Diagnóstico remoto de motor y montaje de entrada superado; reconstrucción/ingesta real aún pendientes. ZF_OK conserva su revisión independiente.  
-Última revisión: 19 de octubre de 2026.  
+Revisión: 35 — Piloto develop activo con datos reales; carga histórica recuperable, comprobaciones MIA por contexto y turnos por fuente/origen. Ampliación por entregas a procesos independientes con presupuesto Docker/WSL2 y publicación de asociaciones sin copias completas de serialización. La conciliación global y la aceptación productiva siguen pendientes; ZF_OK conserva su revisión independiente.
+Última revisión: 20 de octubre de 2026.
 Proyecto: `calidad_serie`.
 
 ## 1. Objetivo y alcance
@@ -2588,5 +2588,96 @@ El worker ejecuta fuentes/derivados en orden, registra resultados por familia y 
 Documentación operativa: Ingesta_Delta_Lake/docs/GITHUB_CICD.md. El plan maestro permanece aquí; una copia de publicación identificada se exporta al repositorio independiente para que sus contratos sean revisables desde GitHub. La primera integración se prepara mediante PR hacia develop; no fusionar automáticamente esta preparación ni iniciar la ingesta real como parte del diagnóstico.
 
 La siguiente aceptación sigue siendo desplegar develop en el servidor, conciliar datos reales y llegadas sucesivas, revisar tándem/ZF_OK, probar replay/recuperación/reinicio sin RDP y medir recursos. Posteriormente se promueve a main. La integración de la app y el cálculo de score permanecen separados. Un diagnóstico de mounts o CI sintética satisfactoria no sustituye esa aceptación real.
+
+### 17.18. Carga histórica continua, equidad y recursos — 20/10/2026
+
+El usuario autoriza implementar, validar y desplegar las mejoras en entregas pequeñas,
+sin confirmaciones entre ellas. La secuencia de PR separa comprobaciones MIA,
+planificación de turnos, procesos/recursos y artefactos de asociaciones. Main y los CSV
+originales permanecen fuera de estos despliegues del piloto develop. La ingesta debe
+consumir el histórico pendiente mientras siguen llegando versiones nuevas; no requiere
+que se detenga la exportación Fenix ni un modo distinto al terminar la carga inicial.
+
+**Continuidad y recuperación.** Se conservan las tablas, capturas y controles existentes.
+Antes de la primera actualización se solicitó SIGTERM, se alcanzó una frontera sin
+intenciones pendientes y se verificó una copia independiente de todo el volumen:
+`fenix-aiala-develop-backup-39400530708`, archivo `lake.tar.gz`, recibo `receipt.json`.
+El recibo acredita 1.399 archivos, 11.358.234.361 bytes originales y 2.527.764.381 bytes
+comprimidos; SHA-256 del archivo
+`4818c85e03b57791d9aa9e44f24be93bfd04cff63e9f1a65a5b9f2addc5a2878`.
+La copia no se elimina por actualizar código. No se vacían auditorías antiguas para
+disimular su tamaño: el objetivo es evitar que cada lote vuelva a ampliarlas con
+copias de todos los grupos históricos.
+
+**MIA incremental.** Cada unidad admite hasta ocho versiones y 4 MiB de CSV; un
+archivo individual mayor se atiende solo, con máximo 8 MiB. Una entrada mayor provoca
+un error explícito y requiere soporte de división, sin omitirla o marcarla consumida.
+Se compara la fila completa dentro de los contextos de inspección afectados, conservando
+las claves y reglas de conflicto originales. Las intenciones guardan alcance, versión,
+huellas de contexto y manifiesto de archivos Delta; antes/después del commit se verifican
+esas evidencias y la cobertura global. Las intenciones antiguas se recuperan con su
+protocolo original. El índice actual de grupos se inicializa una sola vez desde la última
+publicación completa y se actualiza únicamente para los grupos afectados; las revisiones
+siguen excluyendo las bases dudosas y se mantienen las consultas explícitas de histórico.
+
+**Turnos y entradas.** El runtime procesa un lote MIA por turno, FIFO dentro de cada origen
+y rotación entre orígenes con cursor confirmado junto al acuse. El CLI conserva el modo
+de drenar toda la cola, con cuota opcional entre 1 y 100. Las recepciones y versiones
+pendientes son duraderas: no se pierden al ceder turno, reiniciar o desaparecer el CSV
+original. Se recuperan capturas Bronze huérfanas de una interrupción entre fsync y recibo.
+Las fuentes no MIA reutilizan su caché de capturas estables y recuperan revisiones
+capturadas en intentos fallidos. Se vuelve a calcular el hash del archivo vivo aunque
+nombre, tamaño y mtime coincidan. Se soportan simultáneamente nombres fijos sobrescritos
+y nombres con fecha/hora; la marca del nombre no sustituye las fechas de negocio.
+
+CONT_ZC y LISTA_AR reciben servicio en cada vuelta, sin esperar a agotar ambas fuentes
+MIA. Con backlog se inicia otra vuelta tras una pausa mínima de un segundo; al estar
+al día se mide el intervalo desde el inicio del ciclo. Los resultados separan calidad
+y trabajo pendiente e incluyen versiones por origen, bytes, recepción pendiente más
+antigua, consumidas, velocidad entre visitas y ETA orientativa. La ETA no cuenta archivos
+aún no descubiertos ni supone que todas las versiones tengan el mismo coste. La primera
+visita o una visita sin avance pueden carecer de estimación; nunca se interpreta como cero.
+
+**Procesos independientes.** Hasta dos hijos, con un pesado simultáneo. Un proceso posee
+el bloqueo de su tabla y control SQLite; el supervisor posee el bloqueo global del
+entorno. Las dependencias se ordenan por fases: diccionarios/máquinas → ramales/MP9 →
+catálogo → hechos → asociaciones. CONT_ZC/AR pueden acompañar un lote MIA; no se habilitan
+escritores concurrentes sobre una misma tabla ni conexiones SQLite compartidas. La memoria
+de cada unidad se libera al salir su proceso. Los resultados atómicos se incorporan al
+log duradero; una salida sin resultado válido se registra como fallo y el siguiente
+intento reconcilia el control antes de reescribir. SIGTERM no inicia nuevas unidades y
+espera las activas en su frontera segura, sin escalado a SIGKILL. El cambio de imagen
+mantiene el preflight de operaciones pendientes y los recibos de despliegue.
+
+**Presupuesto efectivo.** Windows dispone de 16 GiB, pero el motor observado expone
+cuatro CPU y unos 7,76 GiB. El techo propuesto de 8 GiB consumiría prácticamente todo
+el presupuesto de WSL2. Se fija un máximo de cuatro CPU y 6 GiB, reservando al menos
+1,5 GiB dentro del motor, redondeando hacia abajo en pasos de 256 MiB. Por debajo de
+4 GiB de presupuesto o de dos CPU se usa un solo proceso; por debajo de 2 GiB se rechaza
+el despliegue. Memory y memory-swap coinciden: no se habilita intercambio. Los pools
+Arrow/Rayon de cada hijo se limitan a dos hilos y BLAS/OpenMP a uno. El descriptor registra
+los límites; un rollback conserva el presupuesto original de su release. Son límites
+máximos, no reservas: activar varios entornos exige dimensionar su demanda agregada.
+
+**Asociaciones.** Se aplaza su construcción mientras las colas MIA inventariadas tengan
+trabajo pendiente. Su fase no comparte recursos con otros trabajadores. La publicación
+serializa/comprime JSON canónico y verifica archivos/payloads por bloques, sin copias
+completas adicionales ni deserialización para comprobar hashes. Se conserva el registro
+pequeño de decisiones aceptadas junto con su huella; las publicaciones anteriores
+siguen siendo legibles. Una publicación sin cambios de fuentes, calidad, decisiones,
+reglas, políticas o revisiones se reutiliza tras verificar sus evidencias, sin volver a
+cargar/atribuir el histórico ni generar otra versión Delta. La primera construcción
+sigue necesitando los hechos aceptados en memoria: no se declara un algoritmo de
+atribución de memoria constante ni capacidad ilimitada.
+
+**Evidencia y aceptación.** PR 4 (contextos) y PR 5 (turnos) han superado CI Windows/Linux,
+imagen, ciclo Docker y despliegue develop. Durante el segundo relevo, LISTA_RECH terminó
+en versión 54 con 756.222 filas, partiendo de 603.027; LISTA_AR incorporó cuatro filas.
+Son puntos de observación, no conciliación completa de toda la carga. Los procesos y
+artefactos se validan en sus propias entregas antes de desplegarlos. Se deben comprobar
+varias vueltas, llegada a CONT_ZC/defectos, avance de colas, consumo real, ausencia de
+duplicados y recuperación. Los conflictos de MP9/ZF_OK, topología y candidatos de
+producción permanecen visibles y separados de fallos técnicos. No se promueve a main
+ni se conecta la app por el mero hecho de que un contenedor esté healthy.
 
 Este archivo será el punto de referencia para refinamientos y decisiones posteriores. Las propuestas de arquitectura y los asuntos pendientes no deben confundirse con capacidades ya implementadas o comprobadas en el servidor.

@@ -14,9 +14,12 @@ from .association_storage import (
     load_bundle,
     read_artifact,
     source_snapshot,
+    verify_artifacts,
 )
 from .common import ConfigurationError, IntegrityError, canonical, digest
 from .service import _apply
+
+PUBLICATION_POLICY = "streamed-publication-v1"
 
 
 def decisions(config):
@@ -61,6 +64,19 @@ def _can_resolve(payload, registry, current_ids):
     return True
 
 
+def _review_hash(control, omit=()):
+    return digest(
+        [
+            list(row)
+            for row in control.db.execute(
+                "SELECT issue_id,reason,status,payload_json FROM issues "
+                "WHERE status!='RESOLVED' ORDER BY issue_id"
+            )
+            if row[0] not in omit
+        ]
+    )
+
+
 def process(config, control, attempt):
     store = AssociationStore(config, control.control_id)
     recovered = []
@@ -78,11 +94,64 @@ def process(config, control, attempt):
         raise IntegrityError("Asociación y control no coinciden")
     latest = control.latest()
     prior_pub = json.loads(latest["payload_json"]) if latest else None
-    prior_bundle = read_artifact(config, prior_pub["artifacts"]["bundle"]) if prior_pub else None
-    old_registry = prior_bundle["registry"] if prior_bundle else {}
-    bundle = load_bundle(config)
     doc = decisions(config)
     lines = dict(config.line_by_origin)
+    fingerprint = {
+        "contract": a.CONTRACT,
+        "rule": a.RULE,
+        "policy": PUBLICATION_POLICY,
+        "transformer_version": __version__,
+        "timestamp_policy": config.timestamp_policy,
+        "manifest": {
+            family: source_snapshot(config, family, read=False)[2]
+            for family in (
+                f
+                for f in a.SOURCE_KEYS
+                if config.topology_enabled or f not in {"SIP_MAQUINA_MOLDEO", "SIP_LINEA_ZF"}
+            )
+        },
+        "decision_hash": digest(doc),
+        "lines": lines,
+        "topology_enabled": config.topology_enabled,
+        "line_codes": dict(config.line_code_by_origin),
+    }
+    old_registry = None
+    if prior_pub and "registry" in prior_pub:
+        old_registry = prior_pub["registry"]
+        if digest(old_registry) != prior_pub["registry_hash"]:
+            raise IntegrityError("Registro de decisiones de la publicación alterado")
+    if (
+        prior_pub
+        and prior_pub.get("input_fingerprint") == fingerprint
+        and prior_pub.get("review_hash") == _review_hash(control)
+        and prior_pub.get("assignment_hash") == a.content_hash(previous)
+    ):
+        verify_artifacts(config, prior_pub)
+        return {
+            "status": "NO_CHANGE" if prior_pub["complete"] else "PARTIAL",
+            "complete": prior_pub["complete"],
+            "batch_id": latest["batch_id"],
+            "attempt_id": attempt,
+            "delta_version": version,
+            "accepted_associations": len(previous),
+            "approved_operational_decisions": len(prior_pub["registry"]),
+            "candidate_associations": prior_pub["candidate_associations"],
+            "pending_rows": prior_pub["pending_rows"],
+            "counts": prior_pub["counts"],
+            "inserted_this_attempt": 0,
+            "updated_this_attempt": 0,
+            "recovered_operations": recovered,
+            "artifacts": prior_pub["artifacts"],
+            "open_reviews": prior_pub["open_reviews"],
+            "recomputed_source_rows": 0,
+        }
+    if old_registry is None:
+        old_registry = (
+            read_artifact(config, prior_pub["artifacts"]["bundle"])["registry"] if prior_pub else {}
+        )
+    bundle = load_bundle(config)
+    if fingerprint["manifest"] != bundle["manifest"]:
+        raise IntegrityError("Las fuentes cambiaron durante la preparación de asociaciones")
     effective = list(doc["decisions"])
     if config.topology_enabled:
         automatic = physical_assignments.decisions(
@@ -176,6 +245,12 @@ def process(config, control, attempt):
         "changes": changes,
         "recomputed_source_rows": len(ledger),
         "rule": a.RULE,
+        "registry": registry,
+        "registry_hash": digest(registry),
+        "input_fingerprint": fingerprint,
+        "assignment_hash": a.content_hash(projected),
+        "review_hash": _review_hash(control, resolved),
+        "candidate_associations": len(proposals),
     }
     prepared = {
         "contract": a.CONTRACT,
