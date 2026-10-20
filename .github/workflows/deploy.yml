@@ -1,26 +1,31 @@
-name: Inspect develop storage before requested reset
+name: Recreate develop storage (user authorized)
 on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: ingesta-deploy-ikervillen/test-runner-deploy-develop
+  cancel-in-progress: false
 jobs:
-  inspect:
+  reset:
     runs-on: [self-hosted, Windows, X64, fenix-ingesta]
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - shell: powershell
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 45d87f2f9ddddbff8475dfb0aede89ba7ed934c9
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Recreate only the explicitly confirmed develop volume
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          docker --context desktop-linux info --format 'ENGINE={{.ID}} MEMORY={{.MemTotal}} TYPE={{.OSType}}'
-          if ($LASTEXITCODE -ne 0) { throw 'Docker engine unavailable' }
-          docker --context desktop-linux ps -a --format '{{.Names}} {{.Status}}' --filter volume=fenix-aiala-develop
-          $volumes = docker --context desktop-linux volume ls --format '{{.Name}}'
-          if ($volumes -contains 'fenix-aiala-develop') { docker --context desktop-linux volume inspect fenix-aiala-develop }
-          $site = Get-Content -LiteralPath (Join-Path $env:LOCALAPPDATA 'FenixIngesta/site-develop.json') -Raw | ConvertFrom-Json
-          Write-Output ('STATE_ROOT='+$site.state_root)
-          $active = Join-Path $site.state_root 'develop/active.json'
-          if (Test-Path -LiteralPath $active) { Get-Content -LiteralPath $active -Raw }
-          foreach ($p in @('\\wsl$\docker-desktop', '\\wsl$\docker-desktop\mnt\docker-desktop-disk\data\docker\volumes', '\\wsl$\docker-desktop\mnt\docker-desktop-disk\data\docker\volumes\fenix-aiala-develop\_data')) {
-            Write-Output ($p+' EXISTS='+(Test-Path -LiteralPath $p))
-          }
-          Get-ChildItem -LiteralPath 'C:\DataSharing\Fenix' -Directory | Select-Object -ExpandProperty Name
+          $site = Join-Path $env:LOCALAPPDATA 'FenixIngesta/site-develop.json'
+          $url = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          python -m deployment.reset_develop --site $site --confirm-volume fenix-aiala-develop --run-url $url
+          if ($LASTEXITCODE -ne 0) { throw 'Explicit reset did not complete' }
+          docker --context desktop-linux volume inspect fenix-aiala-develop
+          $p = '\\wsl$\docker-desktop\mnt\docker-desktop-disk\data\docker\volumes\fenix-aiala-develop\_data'
+          Write-Output ($p+' EXISTS='+(Test-Path -LiteralPath $p))
