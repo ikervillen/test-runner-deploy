@@ -10,40 +10,44 @@ from . import __version__
 from . import lista_defectos as defects
 from .common import IntegrityError
 from .delta import DeltaStore
+from .mia_scope import ScopedRead
 
 
-class DefectsStore(DeltaStore):
+class DefectsStore(ScopedRead, DeltaStore):
+    model = defects
+
     def read(self, table=None):
         table = table if table is not None else self.table()
         if table is None:
             return None, {}
-        arrow = table.to_pyarrow_table()
-        if arrow.schema != defects.SCHEMA:
-            raise IntegrityError("Esquema LISTA_DEFECTOS incompatible")
         rows = {}
-        for row in arrow.to_pylist():
-            if any(row[f] is None for f in defects.SCHEMA.names if f != "CAVIDAD"):
-                raise IntegrityError("Campo obligatorio LISTA_DEFECTOS nulo")
-            if row["FECHA"].microsecond or row["FECHA"].tzinfo is not None:
-                raise IntegrityError("Precisión o zona horaria LISTA_DEFECTOS inesperadas")
-            row["FECHA"] = row["FECHA"].isoformat(timespec="seconds")
-            if (
-                not row["origen_fenix"]
-                or row["MOLDE"] < 0
-                or any(row[f] < 0 for f in defects.FIELDS[5:17])
-                or (
-                    row["CAVIDAD"] is not None
-                    and (not row["CAVIDAD"] or row["CAVIDAD"] != row["CAVIDAD"].strip())
-                )
-            ):
-                raise IntegrityError("Contenido LISTA_DEFECTOS publicado inválido")
-            k = defects.key(row)
-            if k in rows:
-                raise IntegrityError("Clave LISTA_DEFECTOS duplicada, incluida cavidad nula")
-            rows[k] = row
+        for batch in self.batches(table, defects.SCHEMA):
+            for row in batch.to_pylist():
+                if any(row[f] is None for f in defects.SCHEMA.names if f != "CAVIDAD"):
+                    raise IntegrityError("Campo obligatorio LISTA_DEFECTOS nulo")
+                if row["FECHA"].microsecond or row["FECHA"].tzinfo is not None:
+                    raise IntegrityError("Precisión o zona horaria LISTA_DEFECTOS inesperadas")
+                row["FECHA"] = row["FECHA"].isoformat(timespec="seconds")
+                if (
+                    not row["origen_fenix"]
+                    or row["MOLDE"] < 0
+                    or any(row[f] < 0 for f in defects.FIELDS[5:17])
+                    or (
+                        row["CAVIDAD"] is not None
+                        and (not row["CAVIDAD"] or row["CAVIDAD"] != row["CAVIDAD"].strip())
+                    )
+                ):
+                    raise IntegrityError("Contenido LISTA_DEFECTOS publicado inválido")
+                if self.scope is not None and not self.includes(row):
+                    continue
+                k = defects.key(row)
+                if k in rows:
+                    raise IntegrityError("Clave LISTA_DEFECTOS duplicada, incluida cavidad nula")
+                rows[k] = row
         return table.version(), rows
 
     def insert(self, rows, operation, before_version):
+        self.validate_scope(rows)
         table = self.table()
         version, existing = self.read(table)
         if version != before_version or not rows:
