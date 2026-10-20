@@ -188,3 +188,20 @@ def test_consumed_versions_cannot_silently_change_interpretation(mia):
     run(mia)
     with pytest.raises(IntegrityError, match="explicit migration"):
         run(replace(mia, encoding="latin1"))
+
+
+def test_capture_survives_process_loss_before_enqueue_and_source_rotation(mia, monkeypatch):
+    path = sources(mia, 1)[0]
+
+    def fail(*_):
+        raise OSError("Process loss after Bronze fsync, before SQLite receipt")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(DefectsControl, "receipts", fail)
+        with pytest.raises(OSError):
+            run(mia)
+    path.unlink()
+    result = run(mia)
+    assert result["processed_versions"] == 1 and result["published_rows"] == 1
+    assert query(mia, "SELECT COUNT(*) FROM input_versions") == [(1,)]
+    assert run(mia)["processed_versions"] == 0

@@ -12,7 +12,7 @@ from . import lista_defectos as defects
 from .common import ConfigurationError, IntegrityError, canonical, digest
 from .defects_storage import DefectsStore
 from .service import _apply
-from .sources import capture, discover
+from .sources import capture, discover, orphan_captures
 
 BATCH_FILES = 8
 BATCH_BYTES = 4 * 1024 * 1024
@@ -57,6 +57,9 @@ def process(
         control.receipts(attempt, [snapshot])
         snapshots.append(snapshot)
         captured.setdefault((snapshot.origin, snapshot.sha256), snapshot)
+    for snapshot in orphan_captures(config, captured):
+        control.receipts(attempt, [snapshot])
+        captured[(snapshot.origin, snapshot.sha256)] = snapshot
     consumed = control.consumed_inputs()
     pending = [s for key, s in captured.items() if key not in consumed]
     if any(s.size > MAX_FILE_BYTES for s in pending):
