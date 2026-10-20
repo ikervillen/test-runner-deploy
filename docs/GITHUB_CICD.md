@@ -268,3 +268,7 @@ La primera carga tardó 78,9 s y el replay 6,4 s, sin otra versión Delta.
 El pico de working set medido en Windows fue 980.705.280 bytes (935,3 MiB).
 Es una referencia del ensayo, no una garantía de consumo o latencia para cualquier
 histórico; la comprobación del conjunto del servidor sigue siendo obligatoria.
+
+La reconciliación de una intención técnica pendiente se ejecuta antes de descubrir
+y capturar nuevas entregas. Un fallo de acceso a un CSV nuevo no puede impedir
+confirmar o reconciliar una operación anterior que ya tenga evidencia durable.

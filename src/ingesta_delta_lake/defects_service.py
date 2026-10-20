@@ -33,6 +33,24 @@ def chunks(snapshots):
         yield batch
 
 
+def reconcile_pending(config, control, store_class):
+    store = store_class(config, control.control_id)
+    recovered, count = [], 0
+    for pending in control.pending():
+        version, wrote = _apply(config, control, store, pending)
+        entries = len(control.prepared(pending)["inserts"])
+        count += entries if wrote else 0
+        recovered.append(
+            {
+                "operation_id": pending["operation_id"],
+                "delta_version": version,
+                "confirmed_rows": entries,
+                "wrote_this_attempt": wrote,
+            }
+        )
+    return recovered, count
+
+
 def process(
     config,
     control,
@@ -43,6 +61,9 @@ def process(
     operation_kind="lista_defectos_insert_v2",
     stop_requested=None,
 ):
+    # Technical recovery has priority over intake; an unavailable new CSV must
+    # never prevent reconciliation of an already prepared/committed operation.
+    recovered, recovery_count = reconcile_pending(config, control, store_class)
     captured = control.captured_inputs()
     snapshots = []
     for origin, path, stamp in discover(config):
@@ -68,7 +89,7 @@ def process(
     pending.sort(
         key=lambda s: (s.producer_time or "", s.mtime_ns, s.origin, s.source_path, s.sha256)
     )
-    result, totals, completed, batch_count = None, {}, 0, 0
+    result, totals, completed, batch_count = None, {"inserted_this_attempt": recovery_count}, 0, 0
     cumulative = (
         "rows_read",
         "normalized_rows",
@@ -81,9 +102,8 @@ def process(
         "inspection_conflicts",
         "inserted_this_attempt",
     )
-    wrote = False
+    wrote = recovery_count > 0
     stopped = False
-    recovered = []
     # An empty batch still reconciles old uncertain commits and reports current coverage.
     for batch in chunks(pending) if pending else [[]]:
         if result is not None and stop_requested is not None and stop_requested():
@@ -152,19 +172,7 @@ def process_batch(
     operation_kind="lista_defectos_insert_v2",
 ):
     store = store_class(config, control.control_id)
-    recovered, recovery_count = [], 0
-    for pending in control.pending():
-        version, wrote = _apply(config, control, store, pending)
-        count = len(control.prepared(pending)["inserts"])
-        recovery_count += count if wrote else 0
-        recovered.append(
-            {
-                "operation_id": pending["operation_id"],
-                "delta_version": version,
-                "confirmed_rows": count,
-                "wrote_this_attempt": wrote,
-            }
-        )
+    recovered, recovery_count = reconcile_pending(config, control, store_class)
     version, existing = store.read()
     if control.setting("last_version") not in (None, str(version)):
         raise IntegrityError(f"El snapshot {config.family} no coincide con su control")

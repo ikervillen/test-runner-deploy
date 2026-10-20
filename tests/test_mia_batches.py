@@ -205,3 +205,23 @@ def test_capture_survives_process_loss_before_enqueue_and_source_rotation(mia, m
     assert result["processed_versions"] == 1 and result["published_rows"] == 1
     assert query(mia, "SELECT COUNT(*) FROM input_versions") == [(1,)]
     assert run(mia)["processed_versions"] == 0
+
+
+def test_pending_commit_recovers_before_a_new_intake_failure(mia, monkeypatch):
+    sources(mia, 1)
+
+    def fail(*args, **kwargs):
+        raise OSError("Injected interruption")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(batching, "_apply", fail)
+        with pytest.raises(OSError):
+            run(mia)
+    with monkeypatch.context() as patch:
+        patch.setattr(batching, "capture", fail)
+        with pytest.raises(OSError):
+            run(mia)
+    assert query(mia, "SELECT state FROM batches") == [("COMPLETED",)]
+    assert DeltaTable(str(mia.table_path)).version() == 0
+    assert run(mia)["published_rows"] == 1
+    assert DeltaTable(str(mia.table_path)).version() == 0
