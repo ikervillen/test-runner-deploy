@@ -7,6 +7,7 @@ import pytest
 from deltalake import DeltaTable
 
 from ingesta_delta_lake import defects_service as batching
+from ingesta_delta_lake.common import IntegrityError
 from ingesta_delta_lake.defects_control import DefectsControl
 from ingesta_delta_lake.service import run
 
@@ -180,3 +181,10 @@ def test_partial_capture_is_durable_even_if_a_later_file_fails(mia, monkeypatch)
     paths[0].unlink()
     result = run(mia)
     assert result["processed_versions"] == 2 and result["published_rows"] == 2
+
+
+def test_consumed_versions_cannot_silently_change_interpretation(mia):
+    sources(mia, 1)
+    run(mia)
+    with pytest.raises(IntegrityError, match="explicit migration"):
+        run(replace(mia, encoding="latin1"))

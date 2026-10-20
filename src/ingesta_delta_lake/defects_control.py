@@ -13,6 +13,20 @@ class DefectsControl(Control):
 
     def __init__(self, config):
         super().__init__(config)
+        processing = canonical(
+            {
+                "contract": config.contract.name,
+                "encoding": config.encoding,
+                "timestamp_policy": config.timestamp_policy,
+            }
+        )
+        if self.setting("input_processing_binding") not in (None, processing):
+            self.close()
+            raise IntegrityError("Input interpretation changed; an explicit migration is required")
+        with self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO settings VALUES('input_processing_binding',?)", (processing,)
+            )
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS observation_intents(
               operation_id TEXT NOT NULL, record_key TEXT NOT NULL, key_json TEXT NOT NULL,

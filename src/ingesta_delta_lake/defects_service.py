@@ -59,6 +59,8 @@ def process(
         captured.setdefault((snapshot.origin, snapshot.sha256), snapshot)
     consumed = control.consumed_inputs()
     pending = [s for key, s in captured.items() if key not in consumed]
+    if any(s.size > MAX_FILE_BYTES for s in pending):
+        raise IntegrityError("Captured MIA file exceeds 8 MiB; split-file support is required")
     # Export timestamps order versions, never determine production or sample time.
     pending.sort(
         key=lambda s: (s.producer_time or "", s.mtime_ns, s.origin, s.source_path, s.sha256)
