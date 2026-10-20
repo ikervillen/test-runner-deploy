@@ -83,11 +83,37 @@ def _read_limited(path: Path, maximum: int) -> bytes:
     return data
 
 
-def capture(config: Config, origin: str, path: Path, producer_time: str | None) -> Snapshot:
+def capture(
+    config: Config, origin: str, path: Path, producer_time: str | None, *, known=None
+) -> Snapshot:
     for attempt in range(config.capture_attempts):
         try:
             before = path.stat()
             data = _read_limited(path, config.max_file_bytes)
+            sha = hashlib.sha256(data).hexdigest()
+            prior = (known or {}).get((origin, sha))
+            if prior is not None:
+                after = path.stat()
+                if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                    raise CaptureError(f"La entrada sigue cambiando: {path}")
+                bronze = Path(prior.bronze_path).resolve()
+                if not bronze.is_relative_to(config.bronze_root):
+                    raise IntegrityError("Evidencia conocida fuera de Bronze")
+                with bronze.open("rb") as stream:
+                    if hashlib.file_digest(stream, "sha256").hexdigest() != sha:
+                        raise IntegrityError("Copia Bronze alterada")
+                # The bytes match a previously stable immutable capture. Always hash
+                # input, including overwrites that preserve filename/size/mtime.
+                return Snapshot(
+                    origin,
+                    str(path),
+                    sha,
+                    str(bronze),
+                    len(data),
+                    after.st_mtime_ns,
+                    now(),
+                    producer_time,
+                )
             time.sleep(config.stable_wait_seconds)
             again = _read_limited(path, config.max_file_bytes)
             after = path.stat()
@@ -97,7 +123,6 @@ def capture(config: Config, origin: str, path: Path, producer_time: str | None) 
                 again,
             ):
                 raise CaptureError(f"La entrada sigue cambiando: {path}")
-            sha = hashlib.sha256(data).hexdigest()
             received_at = now()
             target = (
                 config.bronze_root
