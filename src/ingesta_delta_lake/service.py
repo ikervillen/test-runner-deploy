@@ -300,8 +300,15 @@ def run(config: Config, *, runtime_owner: bool = False, stop_requested=None) -> 
                 gates.enter_context(
                     portalocker.Lock(str(config.silver_root / ".runtime.lock"), mode="a", timeout=0)
                 )
+                gates.enter_context(
+                    portalocker.Lock(str(config.silver_root / ".writer.lock"), mode="a", timeout=0)
+                )
             gates.enter_context(
-                portalocker.Lock(str(config.silver_root / ".writer.lock"), mode="a", timeout=0)
+                portalocker.Lock(
+                    str(config.silver_root / f".writer-{config.plant}-{config.family}.lock"),
+                    mode="a",
+                    timeout=0,
+                )
             )
             with closing(control_class(config)) as control:
                 attempt = control.start_attempt()

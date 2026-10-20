@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from deployment.manager import Deployment, common_args, load_site, save
+from deployment.manager import Deployment, common_args, load_site, resource_budget, save
 
 SHA1, SHA2 = "a" * 40, "b" * 40
 IMAGE1 = "ghcr.io/company/ingesta@sha256:" + "1" * 64
@@ -29,6 +29,7 @@ class FakeDocker:
         self.events, self.containers, self.volumes = [], {}, {}
         self.failed, self.incompatible, self.pending = None, False, False
         self.latest = SHA1
+        self.capacity = {"NCPU": 4, "MemTotal": 8 * 1024**3}
 
     def call(self, *args, **kwargs):
         self.events.append(tuple(args))
@@ -60,7 +61,7 @@ class FakeDocker:
 
     def json(self, *args):
         if args[0] == "info":
-            return {"OSType": "linux", "Architecture": "x86_64", "ID": "engine-1"}
+            return {"OSType": "linux", "Architecture": "x86_64", "ID": "engine-1", **self.capacity}
         if args[:2] == ("volume", "inspect"):
             return [{"Labels": self.volumes[args[-1]]}]
         if args[:2] == ("image", "inspect"):
@@ -358,3 +359,41 @@ def test_rollback_drain_timeout_restores_current_without_reading_inflight_contro
         dep.rollback("rollback-run")
     assert dep.active() == current
     assert motor.containers[current["container"]]["running"]
+
+
+@pytest.mark.parametrize(
+    "cpus,memory_gib,expected",
+    [(4, 7.76, (4, 6, 2)), (16, 32, (4, 6, 2)), (1, 4, (1, 2.5, 1)), (2, 5, (2, 3.5, 1))],
+)
+def test_resource_budget_leaves_engine_headroom(cpus, memory_gib, expected):
+    budget = resource_budget({"NCPU": cpus, "MemTotal": int(memory_gib * 1024**3)})
+    assert (budget["cpus"], budget["memory_bytes"] / 1024**3, budget["workers"]) == expected
+
+
+@pytest.mark.parametrize(
+    "info", [{}, {"NCPU": True, "MemTotal": 8 * 1024**3}, {"NCPU": 4, "MemTotal": 3 * 1024**3}]
+)
+def test_invalid_or_insufficient_engine_capacity_fails_before_handoff(site, motor, info):
+    motor.capacity = info
+    with pytest.raises(ValueError):
+        deployer(site, motor).deploy(IMAGE1, SHA1, "run1")
+    assert not motor.containers and not any(e[0] == "drain" for e in motor.events)
+
+
+def test_resources_are_recorded_and_legacy_descriptor_keeps_original_limits(site, motor):
+    dep = deployer(site, motor)
+    record = dep.deploy(IMAGE1, SHA1, "run1")["release"]
+    args = common_args(record)
+    assert args[args.index("--memory") + 1] == str(6 * 1024**3)
+    assert args[args.index("--memory-swap") + 1] == str(6 * 1024**3)
+    assert args[args.index("--cpus") + 1] == "4"
+    assert "INGESTA_WORKERS=2" in args
+    legacy = {k: v for k, v in record.items() if k != "resources"}
+    args = common_args(legacy)
+    assert args[args.index("--memory") + 1] == str(4 * 1024**3)
+    assert "INGESTA_WORKERS=1" in args
+    save(dep.active_path, legacy)
+    # Same image + different operational limits is an explicit controlled handoff.
+    motor.events.clear()
+    assert dep.deploy(IMAGE1, SHA1, "budget-update")["status"] == "DEPLOYED"
+    assert any(e[0] == "drain" for e in motor.events)

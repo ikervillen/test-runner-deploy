@@ -29,6 +29,7 @@ def exercise(image):
             "image": image,
             "input_bind": folder,
             "interval_seconds": 10,
+            "resources": {"cpus": 2, "memory_bytes": 4 * 1024**3, "workers": 2},
             "settings": {
                 "plant": "CI",
                 "sources": {"AV32": "AV32"},

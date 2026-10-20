@@ -236,12 +236,31 @@ class Docker:
         self.activate(record)
 
 
+def resource_budget(info):
+    """Upper bounds, never allocations: leave headroom inside the WSL2 engine."""
+    cpus, memory = info.get("NCPU"), info.get("MemTotal")
+    if type(cpus) is not int or type(memory) is not int or cpus < 1:
+        raise ValueError("Docker no comunica una capacidad de CPU/RAM válida")
+    mib = 1024**2
+    available = min(6144 * mib, ((memory - 1536 * mib) // (256 * mib)) * 256 * mib)
+    if available < 2048 * mib:
+        raise ValueError("Docker requiere al menos 3,5 GiB para ingesta y margen operativo")
+    return {
+        "cpus": min(4, cpus),
+        "memory_bytes": available,
+        "workers": 2 if cpus >= 2 and available >= 4096 * mib else 1,
+    }
+
+
 def common_args(record):
+    # A previous descriptor must retain its original limits during rollback.
+    resources = record.get("resources", {"cpus": 2, "memory_bytes": 4 * 1024**3, "workers": 1})
     environment = {
         "INGESTA_CHANNEL": record["channel"],
         "INGESTA_INSTANCE": record["instance"],
         "INGESTA_ACTIVATION": record["token"],
         "INGESTA_SETTINGS": encoded(record["settings"]),
+        "INGESTA_WORKERS": str(resources["workers"]),
     }
     args = [
         "--network",
@@ -254,11 +273,11 @@ def common_args(record):
         "--pids-limit",
         "256",
         "--memory",
-        "4g",
+        str(resources["memory_bytes"]),
         "--memory-swap",
-        "4g",
+        str(resources["memory_bytes"]),
         "--cpus",
-        "2",
+        str(resources["cpus"]),
         "--tmpfs",
         "/tmp:rw,nosuid,size=512m",
         "--mount",
@@ -359,6 +378,7 @@ class Deployment:
             info = self.docker.json("info", "--format", "{{json .}}")
             if info["OSType"] != "linux" or info["Architecture"] not in {"x86_64", "amd64"}:
                 raise RuntimeError("Este paquete requiere motor Linux/amd64")
+            resources = resource_budget(info)
             self.recover()
             self.assert_latest(sha)
             self.docker.call("pull", image)
@@ -398,6 +418,7 @@ class Deployment:
                 "settings": self.site["settings"],
                 "input_bind": self.site["input_bind"],
                 "interval_seconds": self.site["interval_seconds"],
+                "resources": resources,
                 "manifest": manifest,
                 "token": token,
                 "container": self.site["namespace"] + "-" + self.channel + "-" + token[:12],
@@ -416,8 +437,8 @@ class Deployment:
                 raise RuntimeError(
                     "Contratos/protocolo incompatibles; exige migración independiente"
                 )
-            keys = ("image", "settings", "input_bind", "interval_seconds")
-            if old and all(old[k] == record[k] for k in keys):
+            keys = ("image", "settings", "input_bind", "interval_seconds", "resources")
+            if old and all(old.get(k) == record[k] for k in keys):
                 self.prepare_volume(record, allow_create=False)
                 self.docker.ready(old)
                 return {"status": "ALREADY_ACTIVE", "release": old}

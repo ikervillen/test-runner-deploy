@@ -34,6 +34,7 @@ def mounted(tmp_path, monkeypatch):
         "line_by_origin": {"AV32": "AV32"},
         "line_code_by_origin": {"AV32": 32},
     }
+    monkeypatch.setenv("INGESTA_WORKERS", "1")
     monkeypatch.setenv("INGESTA_CHANNEL", "develop")
     monkeypatch.setenv("INGESTA_INSTANCE", "1" * 32)
     monkeypatch.setenv("INGESTA_ACTIVATION", "a" * 32)
@@ -138,6 +139,40 @@ def test_manual_ingest_cannot_overlap_whole_worker(config, source):
             run(config)
         # El worker que ya posee ese bloqueo sigue usando el bloqueo por unidad.
         assert run(config, runtime_owner=True)["status"] == "APPLIED"
+
+
+def test_parallel_worker_runs_dependency_phases_and_audits_each_child(mounted, monkeypatch):
+    from ingesta_delta_lake import workers
+
+    monkeypatch.setenv("INGESTA_WORKERS", "2")
+    runtime.bootstrap()
+    token, status, activation = runtime.token_paths()
+    runtime.atomic_json(activation, {"token": token})
+    stop_file = status.with_suffix(".stop")
+    stop_file.touch()  # A stop request from a previous process must not stop this activation.
+    callbacks, phases = {}, []
+    monkeypatch.setattr(signal, "signal", lambda n, f: callbacks.update({n: f}))
+
+    def phase(base, families, stop, stop_path, record, active):
+        assert not stop_file.exists()
+        assert stop_path == stop_file
+        phases.append(families)
+        active([{"family": families[0], "pid": 123}])
+        for family in families:
+            record(family, {"status": "NO_CHANGE"}, 1)
+        active([])
+        if families == workers.PHASES[-1]:
+            callbacks[signal.SIGTERM]()
+
+    monkeypatch.setattr(workers, "run_phase", phase)
+    assert runtime.worker(10)["status"] == "STOPPED"
+    assert tuple(phases) == workers.PHASES
+    events = [
+        json.loads(line)
+        for line in next((mounted / "lake/logs").glob("*.jsonl")).read_text().splitlines()
+    ]
+    assert len(events) == len(runtime.ORDER)
+    assert all(e["activation_token"] == token and e["seconds"] == 1 for e in events)
 
 
 def test_image_selftest_runs_real_delta_recovery_without_test_dependencies():
