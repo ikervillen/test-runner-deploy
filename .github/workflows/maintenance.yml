@@ -1,0 +1,48 @@
+name: Inspect and compact develop controls
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        type: choice
+        options: [inspect, compact]
+        default: inspect
+        required: true
+      remove_backup:
+        type: boolean
+        default: false
+        description: Remove old controls only after each replacement is verified
+permissions:
+  contents: read
+jobs:
+  maintenance:
+    runs-on: [self-hosted, Windows, X64, fenix-ingesta]
+    environment: develop
+    timeout-minutes: 90
+    concurrency:
+      group: ingesta-deploy-${{ github.repository }}-develop
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with: {python-version: '3.12'}
+      - name: Operate only the active tested develop image
+        shell: powershell
+        env:
+          OPERATION: ${{ inputs.operation }}
+          REMOVE_BACKUP: ${{ inputs.remove_backup }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $site = Join-Path $env:LOCALAPPDATA 'FenixIngesta/site-develop.json'
+          $report = Join-Path $env:RUNNER_TEMP 'control-maintenance.json'
+          $arguments = @('-m', 'deployment.operations', '--site', $site,
+            '--operation', $env:OPERATION, '--report', $report)
+          if ($env:REMOVE_BACKUP -eq 'true') { $arguments += '--remove-backup' }
+          python @arguments
+          if ($LASTEXITCODE -ne 0) { throw 'Maintenance failed; inspect its durable report.' }
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        if: always()
+        with:
+          name: control-maintenance-${{ github.run_id }}
+          path: ${{ runner.temp }}/control-maintenance.json
+          retention-days: 30
