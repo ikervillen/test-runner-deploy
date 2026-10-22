@@ -1,5 +1,13 @@
 name: Inspect and compact develop controls
 on:
+  workflow_call:
+    inputs:
+      operation:
+        type: string
+        required: true
+      remove_backup:
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       operation:
