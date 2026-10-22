@@ -11,6 +11,7 @@ from .sources import Snapshot
 
 class Control:
     def __init__(self, config: Config):
+        self.config = config
         self.contract = config.contract
         self.intent_key = "id_modelo_fenix" if config.family == "SIP_MODELO" else "record_id"
         self.db = sqlite3.connect(config.control_path, timeout=5)
@@ -125,6 +126,9 @@ class Control:
             if self.capture_cached and result["status"] != "FAILED":
                 # The sole writer processes every pending cached revision in capture_inputs.
                 self.db.execute("UPDATE capture_cache SET handled=1 WHERE handled=0")
+        from .supervision_export import export
+
+        export(self, self.config, result)
 
     def receipts(self, attempt: str, snapshots: list[Snapshot]) -> None:
         with self.db:

@@ -261,6 +261,7 @@ def common_args(record):
         "INGESTA_ACTIVATION": record["token"],
         "INGESTA_SETTINGS": encoded(record["settings"]),
         "INGESTA_WORKERS": str(resources["workers"]),
+        "INGESTA_SUPERVISION_EXPORT": "1",
     }
     args = [
         "--network",
