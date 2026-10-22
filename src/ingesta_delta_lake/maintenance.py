@@ -20,6 +20,7 @@ import portalocker
 
 from .common import IntegrityError
 from .config import load_config
+from .inspection_retention import InspectionArchive
 from .retention import pack, unpack
 
 
@@ -39,23 +40,29 @@ def _check(db):
         raise IntegrityError("Control has invalid foreign keys")
 
 
+def _hash_row(result, row):
+    logical = [unpack(v) if isinstance(v, bytes) else v for v in row]
+    result.update(json.dumps(logical, ensure_ascii=False, separators=(",", ":")).encode())
+    result.update(b"\n")
+
+
 def _row_hash(rows):
     result = hashlib.sha256()
     count = 0
     for row in rows:
-        logical = [unpack(v) if isinstance(v, bytes) else v for v in row]
-        result.update(json.dumps(logical, ensure_ascii=False, separators=(",", ":")).encode())
-        result.update(b"\n")
+        _hash_row(result, row)
         count += 1
     return count, result.hexdigest()
 
 
-def _copy(source, target):
+def _copy(source, target, config=None):
     """One row in memory; new pages contain no historical free space."""
     objects = source.execute(
         "SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL "
         "AND name NOT LIKE 'sqlite_%' ORDER BY type='table' DESC,name"
     ).fetchall()
+    archive = InspectionArchive(source, config)
+    retained_groups, retained_hash = 0, hashlib.sha256()
     with target:
         for kind, name, sql in objects:
             if kind != "table":
@@ -64,6 +71,11 @@ def _copy(source, target):
             columns = [r[1] for r in source.execute(f'PRAGMA table_info("{name}")')]
             placeholders = ",".join("?" for _ in columns)
             for row in source.execute(f'SELECT * FROM "{name}" ORDER BY rowid'):
+                if name == "inspection_groups":
+                    if archive.omit(row):
+                        continue
+                    retained_groups += 1
+                    _hash_row(retained_hash, row)
                 values = list(row)
                 confirmed = (
                     name == "batches"
@@ -83,15 +95,21 @@ def _copy(source, target):
         for kind, _, sql in objects:
             if kind != "table":
                 target.execute(sql)
+    archival_evidence = archive.verify()
     _check(target)
     evidence = {}
     for kind, name, _ in objects:
         if kind == "table":
-            before = _row_hash(source.execute(f'SELECT * FROM "{name}" ORDER BY rowid'))
+            before = (
+                (retained_groups, retained_hash.hexdigest())
+                if name == "inspection_groups"
+                else _row_hash(source.execute(f'SELECT * FROM "{name}" ORDER BY rowid'))
+            )
             after = _row_hash(target.execute(f'SELECT * FROM "{name}" ORDER BY rowid'))
             if before != after:
                 raise IntegrityError(f"Logical contents changed during compaction: {name}")
             evidence[name] = {"rows": before[0], "sha256": before[1]}
+    evidence["_inspection_archive"] = archival_evidence
     return evidence
 
 
@@ -134,7 +152,7 @@ def replace_control(config, *, apply=False, remove_backup=False):
                 source.execute("BEGIN")
                 with closing(sqlite3.connect(temporary)) as target:
                     target.execute("PRAGMA synchronous=FULL")
-                    report["tables"] = _copy(source, target)
+                    report["tables"] = _copy(source, target, config)
                 source.rollback()
             os.chmod(temporary, stat.S_IMODE(original_permissions.st_mode))
             if os.name != "nt":

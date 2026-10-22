@@ -1,7 +1,7 @@
 # Controles compactos y resolución autorizada
 
-Estado: implementación local. No implica publicación en GitHub, despliegue,
-parada de servicios ni modificación del almacenamiento del servidor.
+Estado: primera versión desplegada en develop el 22/10/2026. La retención de
+materializaciones históricas MIA se amplía tras medir los controles reales.
 
 ## Entregas y dependencias
 
@@ -36,6 +36,21 @@ La compresión por lote reduce el crecimiento y libera páginas reutilizables,
 pero **el tamaño físico de un SQLite existente no disminuye hasta sustituirlo**.
 El tamaño final depende de sus contenidos y se mide, no se presupone.
 
+### Una sola copia del historial de grupos MIA
+
+Cada lote confirmado conserva íntegramente `inspection_groups` dentro de
+`prepared_json`. Mantener además una fila en `inspection_groups` por grupo y
+lote duplica esa misma auditoría. Los nuevos lotes con `read_scope` actualizan
+`inspection_current` y conservan su documento recuperable; dejan de materializar
+la segunda copia histórica. La migración de lotes antiguos sigue disponible.
+
+Durante el mantenimiento solo se omiten las filas históricas cuya cantidad,
+orden, identificador y contenido coinciden exactamente con el documento del lote
+confirmado. Se registran SHA-256 y cantidad por lote en `_inspection_archive`.
+El índice actual debe cubrir la misma versión y número de filas de Delta. Un
+desacuerdo aborta la sustitución. Los lotes pendientes, casos sin copia
+recuperable, evidencias e identidades se mantienen; no se borra auditoría única.
+
 ## Sustitución segura del SQLite existente
 
 La herramienta exige los mismos bloqueos globales y de familia que el escritor.
@@ -47,7 +62,9 @@ mediante el procedimiento cooperativo existente, sin SIGKILL.
 3. Copia a un archivo nuevo, fila a fila, con las compresiones aplicables. No se
    materializa la base completa en RAM ni se copian datos Delta.
 4. Validación de integridad y comparación por tabla del número de filas y SHA-256
-   de su contenido lógico descomprimido. Se conserva el orden de inserción.
+   de su contenido lógico descomprimido. Se conserva el orden de inserción. La
+   única excepción son las materializaciones MIA retiradas tras verificar su
+   copia íntegra en el documento confirmado, con su prueba de archivo separada.
 5. Enlace de respaldo al archivo anterior y reemplazo atómico del nombre activo.
    Si el sistema de archivos no admite el respaldo seguro, se aborta.
 6. Nueva validación y reporte `<control>.compaction-report.json`. Solo
