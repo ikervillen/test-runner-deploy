@@ -87,8 +87,18 @@ def load_site(path):
     if set(site["environments"]) != {"main", "develop"}:
         raise ValueError("Deben declararse main y develop")
     for env in site["environments"].values():
-        if set(env) != {"volume", "instance"}:
+        if set(env) - {"volume", "instance", "review_volumes"} or not {"volume", "instance"} <= set(
+            env
+        ):
             raise ValueError("Configuración de volumen inválida")
+        reviews = env.get("review_volumes", {})
+        if reviews and (
+            set(reviews) != {"commands", "results"}
+            or len(set(reviews.values())) != 2
+            or any(not re.fullmatch(r"[a-z][a-z0-9-]{2,60}", v) for v in reviews.values())
+            or env["volume"] in reviews.values()
+        ):
+            raise ValueError("Los canales de decisiones requieren dos volúmenes independientes")
         if not re.fullmatch(r"[a-z][a-z0-9-]{2,60}", env["volume"]):
             raise ValueError("Nombre de volumen inválido")
         if not re.fullmatch(r"[0-9a-f]{32}", env["instance"]):
@@ -96,6 +106,13 @@ def load_site(path):
     for field in ("volume", "instance"):
         if len({e[field] for e in site["environments"].values()}) != 2:
             raise ValueError("main y develop no pueden compartir volumen/identidad")
+    review_names = [
+        name
+        for env in site["environments"].values()
+        for name in env.get("review_volumes", {}).values()
+    ]
+    if len(review_names) != len(set(review_names)):
+        raise ValueError("main y develop no pueden compartir canales de decisiones")
     for field, minimum, maximum in (("interval_seconds", 10, 86400), ("drain_seconds", 10, 3600)):
         if type(site[field]) is not int or not minimum <= site[field] <= maximum:
             raise ValueError(f"{field} fuera de rango")
@@ -146,7 +163,7 @@ class Docker:
         c = self.container(name)
         return bool(c and c["State"]["Running"])
 
-    def helper(self, record, command, *, readonly=True, root=False):
+    def helper(self, record, command, *, readonly=True, root=False, timeout=900):
         args = common_args(record)
         if root:
             args += ["--user", "0:0", "--cap-add", "CHOWN"]
@@ -154,7 +171,9 @@ class Docker:
         if readonly:
             mount += ",readonly"
         return json.loads(
-            self.call("run", "--rm", *args, "--mount", mount, record["image"], *command)
+            self.call(
+                "run", "--rm", *args, "--mount", mount, record["image"], *command, timeout=timeout
+            )
         )
 
     def ready(self, record, timeout=120):
@@ -223,6 +242,53 @@ class Docker:
             record["interval_seconds"],
         )
 
+    def prepare_reviews(self, record, *, allow_create=True):
+        """Create only explicitly configured, scope-labelled command/result volumes."""
+        reviews = record.get("review_volumes", {})
+        if not reviews:
+            return
+        existing = self.call("volume", "ls", "--format", "{{.Name}}").splitlines()
+        for role, name in reviews.items():
+            labels = {
+                "es.fenix.review.channel": record["channel"],
+                "es.fenix.review.instance": record["instance"],
+                "es.fenix.review.role": role,
+            }
+            if name not in existing:
+                if not allow_create:
+                    raise RuntimeError(
+                        "Falta un canal persistente de decisiones; no se recrea vacío"
+                    )
+                args = ["volume", "create"]
+                for key, value in labels.items():
+                    args.extend(["--label", key + "=" + value])
+                self.call(*args, name)
+            actual = self.json("volume", "inspect", name)[0].get("Labels") or {}
+            if any(actual.get(k) != v for k, v in labels.items()):
+                raise RuntimeError("Canal de decisiones perteneciente a otro ámbito")
+        self.call(
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--user",
+            "0:0",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "CHOWN",
+            "--read-only",
+            "--mount",
+            "type=volume,src=" + reviews["commands"] + ",dst=/commands",
+            "--mount",
+            "type=volume,src=" + reviews["results"] + ",dst=/results",
+            "--entrypoint",
+            "python",
+            record["image"],
+            "-c",
+            "import os; os.chown('/commands',10001,10001); os.chown('/results',10001,10001)",
+        )
+
     def resume(self, record):
         if not self.container(record["container"]):
             raise RuntimeError("Falta el contenedor previo; requiere recuperación operativa")
@@ -286,6 +352,17 @@ def common_args(record):
     ]
     for key, value in environment.items():
         args += ["--env", key + "=" + value]
+    if record.get("review_volumes"):
+        args += [
+            "--env",
+            "INGESTA_REVIEW_ROOT=/reviews",
+            "--mount",
+            "type=volume,src="
+            + record["review_volumes"]["commands"]
+            + ",dst=/reviews/commands,readonly",
+            "--mount",
+            "type=volume,src=" + record["review_volumes"]["results"] + ",dst=/reviews/results",
+        ]
     return args
 
 
@@ -434,12 +511,28 @@ class Deployment:
                 raise RuntimeError(
                     "Cambiar almacenamiento/contexto no es una actualización de código"
                 )
-            if old and old["manifest"] != manifest:
+            prior_manifest = dict(old["manifest"]) if old else {}
+            current_manifest = dict(manifest)
+            prior_format = prior_manifest.pop("control_payload_format", 1)
+            current_format = current_manifest.pop("control_payload_format", 1)
+            if old and (
+                prior_manifest != current_manifest
+                or (prior_format != current_format and (prior_format, current_format) != (1, 2))
+            ):
                 raise RuntimeError(
                     "Contratos/protocolo incompatibles; exige migración independiente"
                 )
-            keys = ("image", "settings", "input_bind", "interval_seconds", "resources")
-            if old and all(old.get(k) == record[k] for k in keys):
+            keys = (
+                "image",
+                "settings",
+                "input_bind",
+                "interval_seconds",
+                "resources",
+                "review_volumes",
+            )
+            if old and all(old.get(k) == record.get(k) for k in keys):
+                if record.get("review_volumes"):
+                    self.docker.prepare_reviews(record, allow_create=False)
                 self.prepare_volume(record, allow_create=False)
                 self.docker.ready(old)
                 return {"status": "ALREADY_ACTIVE", "release": old}
@@ -463,6 +556,10 @@ class Deployment:
             )
             if tested.get("status") != "PASSED":
                 raise RuntimeError("La imagen candidata no supera la validación aislada")
+            if record.get("review_volumes"):
+                self.docker.prepare_reviews(
+                    record, allow_create=not bool(old and old.get("review_volumes"))
+                )
             self.prepare_volume(record, allow_create=old is None)
             self.assert_latest(sha)
             journal = {
@@ -512,6 +609,13 @@ class Deployment:
                     # Si queda pendiente, conservar puntero/journal para reanudarla, sin
                     # arrancar un escritor anterior sobre esa operación incierta.
                     self.docker.helper(record, ["check"])
+                    if old and prior_format < current_format:
+                        # The new writer may already have compacted a confirmed
+                        # payload. An old decoder must never resume on that volume.
+                        self.audit(journal, "SWITCHED")
+                        raise RuntimeError(
+                            "La recuperación requiere la nueva imagen: cambió el formato de control"
+                        ) from None
                     if old:
                         self.docker.resume(old)
                         save(self.active_path, old)

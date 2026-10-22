@@ -397,3 +397,45 @@ def test_resources_are_recorded_and_legacy_descriptor_keeps_original_limits(site
     motor.events.clear()
     assert dep.deploy(IMAGE1, SHA1, "budget-update")["status"] == "DEPLOYED"
     assert any(e[0] == "drain" for e in motor.events)
+
+
+def test_review_channels_have_opposite_mount_permissions_and_persistent_identity(site, motor):
+    from deployment.manager import Docker
+
+    record = deployer(site, motor).deploy(IMAGE1, SHA1, "run1")["release"]
+    record["review_volumes"] = {
+        "commands": "reviews-develop-commands",
+        "results": "reviews-develop-results",
+    }
+    args = common_args(record)
+    assert "type=volume,src=reviews-develop-commands,dst=/reviews/commands,readonly" in args
+    assert "type=volume,src=reviews-develop-results,dst=/reviews/results" in args
+    assert "INGESTA_REVIEW_ROOT=/reviews" in args
+    docker = Docker("default")
+
+    def call(*args):
+        if args[0] == "run":
+            assert "--user" in args and "0:0" in args
+            assert all("dst=/lake" not in arg for arg in args)
+            return ""
+        return motor.call(*args)
+
+    docker.call, docker.json = call, motor.json
+    docker.prepare_reviews(record)
+    docker.prepare_reviews(record, allow_create=False)
+    labels = motor.volumes["reviews-develop-results"]
+    assert labels["es.fenix.review.role"] == "results"
+    assert labels["es.fenix.review.instance"] == record["instance"]
+    del motor.volumes["reviews-develop-results"]
+    with pytest.raises(RuntimeError, match="no se recrea"):
+        docker.prepare_reviews(record, allow_create=False)
+
+
+def test_review_channels_cannot_be_shared_between_environments(site, tmp_path):
+    value = {"commands": "shared-commands", "results": "shared-results"}
+    for config in site["environments"].values():
+        config["review_volumes"] = value
+    path = tmp_path / "site.json"
+    path.write_text(json.dumps(site))
+    with pytest.raises(ValueError, match="compartir canales"):
+        load_site(path)

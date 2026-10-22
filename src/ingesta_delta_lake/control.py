@@ -1,6 +1,7 @@
 """Intenciones y confirmaciones duraderas; nunca asumir atomicidad SQLite/Delta."""
 
 import json
+import logging
 import sqlite3
 import uuid
 
@@ -126,7 +127,20 @@ class Control:
             if self.capture_cached and result["status"] != "FAILED":
                 # The sole writer processes every pending cached revision in capture_inputs.
                 self.db.execute("UPDATE capture_cache SET handled=1 WHERE handled=0")
+        from .retention import compact_batch
         from .supervision_export import export
+
+        if result.get("batch_id"):
+            try:
+                compact_batch(self.db, result["batch_id"])
+            except Exception as exc:
+                # Its transaction rolls back to the complete original payload.
+                # A maintenance failure must not undo a confirmed publication.
+                logging.getLogger(__name__).warning(
+                    "control_compaction_failed family=%s type=%s",
+                    self.config.family,
+                    type(exc).__name__,
+                )
 
         export(self, self.config, result)
 
@@ -215,7 +229,7 @@ class Control:
                 semantic = {k: v for k, v in issue.items() if k != "evidence"}
                 evidence = issue.get("evidence", {})
                 refs = evidence if isinstance(evidence, list) else [evidence]
-                # Para inválidos, la fila original forma parte de la identidad del caso.
+                # Para invÃ¡lidos, la fila original forma parte de la identidad del caso.
                 if self.contract.key not in semantic:
                     semantic["raw"] = [r.get("raw") for r in refs]
                 identifier = digest([plant, self.contract.name, semantic])
@@ -246,4 +260,6 @@ class Control:
                     )
 
     def prepared(self, row: dict) -> dict:
-        return json.loads(row["prepared_json"])
+        from .retention import payload
+
+        return payload(row["prepared_json"])

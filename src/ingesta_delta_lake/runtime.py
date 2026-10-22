@@ -42,6 +42,7 @@ def describe():
 
     return {
         "deployment_protocol": PROTOCOL,
+        "control_payload_format": 2,
         "data_policy": POLICY,
         "contracts": {f: {"name": c.name, "schema": str(c.schema)} for f, c in CONTRACTS.items()},
         "assignment_rule": RULE,
@@ -162,6 +163,12 @@ def check(allow_pending=False):
                 "SELECT operation_id,state FROM batches "
                 "WHERE state IN ('PREPARED','WRITING','UNKNOWN')"
             ).fetchall()
+            if db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_operations'"
+            ).fetchone():
+                batches += db.execute(
+                    "SELECT decision_id,state FROM review_operations WHERE state='PREPARED'"
+                ).fetchall()
             pending.extend({"family": family, "operation": o, "state": s} for o, s in batches)
             cls = AssociationStore if family == "ASIGNACION_PRODUCCION_RAMAL" else STORES[family]
             table = cls(cfg, values["control_id"]).table()
@@ -338,10 +345,14 @@ def main(argv=None):
             "health",
             "activate",
             "self-test",
+            "compact-control",
         ],
     )
     parser.add_argument("--allow-pending", action="store_true")
     parser.add_argument("--interval", type=int, default=600)
+    parser.add_argument("--family", choices=ORDER)
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--remove-backup", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "describe":
@@ -352,6 +363,17 @@ def main(argv=None):
             result = self_test()
         elif args.command == "check":
             result = check(args.allow_pending)
+        elif args.command == "compact-control":
+            from .maintenance import replace_control
+
+            marker()
+            if not args.family:
+                raise ConfigurationError("compact-control requires --family")
+            result = replace_control(
+                replace(settings()[2], family=args.family),
+                apply=args.apply,
+                remove_backup=args.remove_backup,
+            )
         elif args.command == "worker":
             result = worker(args.interval)
         else:
