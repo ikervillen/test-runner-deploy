@@ -35,6 +35,9 @@ def process(config, control, attempt):
         raise IntegrityError("Snapshot CONT_ZC distinto de su control")
     snapshots = capture_inputs(config, control, attempt)
     parsed = zc.parse(snapshots, config.encoding)
+    from .review_adapters import filter_rejected
+
+    filter_rejected(control, parsed)
     inserts, issues, matches = zc.decide(parsed, existing, control.held())
     merged = {**existing, **{zc.key(r): {f: r[f] for f in zc.SCHEMA.names} for r in inserts}}
     batch_id = digest(

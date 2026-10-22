@@ -70,6 +70,9 @@ class Control:
             self.close()
             raise IntegrityError("El control pertenece a otra planta, rutas o contrato")
         self.control_id = self.setting("control_id")
+        from .reviews import initialize
+
+        initialize(self.db)
         self.capture_cached = config.family not in {
             "LISTA_RECH",
             "LISTA_DEFECTOS",
@@ -229,7 +232,7 @@ class Control:
                 semantic = {k: v for k, v in issue.items() if k != "evidence"}
                 evidence = issue.get("evidence", {})
                 refs = evidence if isinstance(evidence, list) else [evidence]
-                # Para invÃ¡lidos, la fila original forma parte de la identidad del caso.
+                # Para inválidos, la fila original forma parte de la identidad del caso.
                 if self.contract.key not in semantic:
                     semantic["raw"] = [r.get("raw") for r in refs]
                 identifier = digest([plant, self.contract.name, semantic])

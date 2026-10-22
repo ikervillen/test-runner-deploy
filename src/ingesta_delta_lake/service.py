@@ -203,6 +203,8 @@ def _process(config: Config, control: Control, attempt: str, stop_requested=None
             sorted({(s.origin, s.sha256) for s in snapshots}),
         ]
     )
+    if control.setting("review_epoch"):
+        batch_id = digest([batch_id, control.setting("review_epoch")])
     prior = control.batch(batch_id)
     if prior and prior["state"] == "COMPLETED":
         original = control.prepared(prior)
@@ -223,6 +225,9 @@ def _process(config: Config, control: Control, attempt: str, stop_requested=None
             "issues": 0,
         }
     parsed = contract.parse(snapshots, config.encoding)
+    from .review_adapters import filter_rejected
+
+    filter_rejected(control, parsed)
     inserts, issues = contract.decide(parsed, existing)
     stats = contract.statistics(parsed)
     decision_stats = {"new_entries": len(inserts)}
@@ -323,6 +328,9 @@ def run(config: Config, *, runtime_owner: bool = False, stop_requested=None) -> 
             with closing(control_class(config)) as control:
                 attempt = control.start_attempt()
                 try:
+                    from .reviews import process as process_reviews
+
+                    process_reviews(config, control)
                     result = _process(config, control, attempt, stop_requested=stop_requested)
                     if hasattr(control, "input_scan_performed"):
                         result["input_scan_performed"] = control.input_scan_performed

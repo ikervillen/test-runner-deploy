@@ -14,6 +14,8 @@ IMAGE2 = "ghcr.io/company/ingesta@sha256:" + "2" * 64
 @pytest.fixture
 def site(tmp_path):
     value = json.loads(Path("deployment/site.example.json").read_text())
+    for config in value["environments"].values():
+        config.pop("review_volumes", None)
     value.update(
         repository="company/ingesta",
         state_root=str(tmp_path / "deploy"),
@@ -145,7 +147,7 @@ def test_unicode_contract_metadata_remains_compatible_across_updates(site, motor
 
     def call(*args, **kwargs):
         if args[0] == "run" and args[-1] == "describe":
-            return json.dumps({"schema": "ID_Agrupación"}, ensure_ascii=False)
+            return json.dumps({"schema": "ID_AgrupaciÃ³n"}, ensure_ascii=False)
         return original(*args, **kwargs)
 
     motor.call = call
@@ -153,7 +155,7 @@ def test_unicode_contract_metadata_remains_compatible_across_updates(site, motor
     dep.deploy(IMAGE1, SHA1, "first")
     motor.latest = SHA2
     assert dep.deploy(IMAGE2, SHA2, "update")["status"] == "DEPLOYED"
-    assert dep.active()["manifest"] == {"schema": "ID_Agrupación"}
+    assert dep.active()["manifest"] == {"schema": "ID_AgrupaciÃ³n"}
 
 
 def test_same_digest_configuration_replay_does_not_restart(site, motor):

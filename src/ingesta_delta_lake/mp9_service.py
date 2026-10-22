@@ -52,6 +52,9 @@ def process(config, control, attempt):
             )
         parsed.add(pending["candidate"], pending["evidence"])
         restored += 1
+    from .review_adapters import filter_rejected
+
+    filter_rejected(control, parsed)
     inserts, updates, issues, matches = mp9.decide(parsed, existing, set(models), control.held())
     identities = {(e[0], e[1]) for e in parsed.entries} | parsed.invalid_keys
     stats = {

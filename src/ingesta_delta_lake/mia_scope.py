@@ -34,7 +34,7 @@ def expression(scope):
         if first.tzinfo or last.tzinfo or first.microsecond or last.microsecond or first > last:
             raise IntegrityError("Invalid MIA read scope timestamps")
         result |= (
-            (ds.field("origen_fenix") == origin)
+            (ds.field("origen_fenix").cast(pa.string()) == origin)
             & (ds.field("FECHA") >= first)
             & (ds.field("FECHA") <= last)
         )
@@ -85,12 +85,24 @@ class ScopedRead:
         return self.scope_groups is None or digest(self.model.group(row)) in self.scope_groups
 
     def batches(self, table, schema):
-        dataset = table.to_pyarrow_dataset()
-        if dataset.schema != schema:
+        # MERGE files may carry Arrow string_view metadata. Dictionary decoding
+        # keeps Arrow's equality kernels compatible while preserving file/time
+        # pruning, bounded batches and the published (plain string) schema.
+        dataset = table.to_pyarrow_dataset(
+            parquet_read_options=ds.ParquetReadOptions(dictionary_columns=["origen_fenix"])
+        )
+        decoded = pa.schema(
+            [
+                f.with_type(f.type.value_type) if pa.types.is_dictionary(f.type) else f
+                for f in dataset.schema
+            ]
+        )
+        if decoded != schema:
             raise IntegrityError("Incompatible MIA schema")
-        return dataset.scanner(
+        for batch in dataset.scanner(
             filter=None if self.scope is None else expression(self.scope), batch_size=8192
-        ).to_batches()
+        ).to_batches():
+            yield batch.cast(schema)
 
     def validate_scope(self, rows):
         if self.scope is None:
