@@ -133,6 +133,10 @@ def current_head(repository, branch):
         return json.load(response)["object"]["sha"]
 
 
+class MaintenanceStillRunning(RuntimeError):
+    """An uncertain helper must retain exclusivity; never start a second writer."""
+
+
 class Docker:
     def __init__(self, context):
         self.context = context
@@ -164,17 +168,34 @@ class Docker:
         return bool(c and c["State"]["Running"])
 
     def helper(self, record, command, *, readonly=True, root=False, timeout=900):
-        args = common_args(record)
+        args = ["--init", "--no-healthcheck", *common_args(record)]
+        name = "fenix-control-" + uuid.uuid4().hex if command[0] == "compact-control" else None
+        if name:
+            args += ["--name", name]
         if root:
             args += ["--user", "0:0", "--cap-add", "CHOWN"]
         mount = "type=volume,src=" + record["volume"] + ",dst=/lake"
         if readonly:
             mount += ",readonly"
-        return json.loads(
-            self.call(
+        try:
+            result = self.call(
                 "run", "--rm", *args, "--mount", mount, record["image"], *command, timeout=timeout
             )
-        )
+        except subprocess.TimeoutExpired:
+            if name:
+                try:
+                    # --init forwards SIGTERM to Python; the volume remains
+                    # locked until this isolated copy process has really exited.
+                    self.call("kill", "--signal=SIGTERM", name, optional=True, timeout=30)
+                    self.call("wait", name, optional=True, timeout=60)
+                    if self.running(name):
+                        raise RuntimeError("Maintenance helper is still active")
+                except Exception as exc:
+                    raise MaintenanceStillRunning(
+                        "Confirm helper termination before resuming ingestion: " + name
+                    ) from exc
+            raise
+        return json.loads(result)
 
     def ready(self, record, timeout=120):
         deadline = time.monotonic() + timeout
