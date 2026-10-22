@@ -1,0 +1,14 @@
+{
+  "develop": {
+    "review_volumes": {
+      "commands": "fenix-aiala-develop-review-commands",
+      "results": "fenix-aiala-develop-review-results"
+    }
+  },
+  "main": {
+    "review_volumes": {
+      "commands": "fenix-aiala-main-review-commands",
+      "results": "fenix-aiala-main-review-results"
+    }
+  }
+}

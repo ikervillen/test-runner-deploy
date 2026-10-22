@@ -51,6 +51,9 @@ def process(config, control, attempt):
             )
         parsed.add(pending["candidate"], pending["evidence"])
         restored += 1
+    from .review_adapters import filter_rejected
+
+    filter_rejected(control, parsed)
     inserts, updates, issues, matches = ar.decide(parsed, existing, references, control.held())
     merged = {
         **existing,

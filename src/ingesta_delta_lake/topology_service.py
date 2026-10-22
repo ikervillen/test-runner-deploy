@@ -51,6 +51,9 @@ def process(config, control, attempt):
         machines, m, machine_cases = snapshot(config, t.MACHINES)
         manifest[t.MACHINES] = m
     cases = [c for c in control.cases() if c["reason"] != "MACHINE_PENDING"]
+    from .review_adapters import filter_rejected
+
+    filter_rejected(control, parsed)
     inserts, updates, issues = t.decide(
         family, parsed, old, cases, machines, machine_cases, dict(config.line_code_by_origin)
     )

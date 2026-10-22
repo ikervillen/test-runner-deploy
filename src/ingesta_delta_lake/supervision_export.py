@@ -9,6 +9,7 @@ import logging
 import os
 import time
 import uuid
+from pathlib import Path
 
 from .common import canonical, digest, now
 
@@ -98,13 +99,25 @@ def export(control, config, result):
                     )
                 if size > MAX_BYTES or time.monotonic() > deadline:
                     raise ValueError("Supervision observation budget exceeded")
+                payload = _payload(row[4])
+                from .review_adapters import offer
+
+                payload["resolution"] = offer(config, payload)
+                review_root = os.environ.get("INGESTA_REVIEW_ROOT")
+                payload["resolution"]["writer_enabled"] = bool(
+                    review_root
+                    and (Path(review_root) / "commands").is_dir()
+                    and (Path(review_root) / "results").is_dir()
+                )
+                if len(canonical(payload).encode("utf-8")) > MAX_PAYLOAD:
+                    raise ValueError("Supervision comparison payload budget exceeded")
                 issues.append(
                     {
                         "source_id": row[0],
                         "reason": row[1],
                         "source_status": row[2],
                         "first_seen": row[3],
-                        "payload": _payload(row[4]),
+                        "payload": payload,
                         "evidence": evidence,
                         "evidence_count": count,
                         "evidence_truncated": count > len(evidence),
@@ -119,7 +132,24 @@ def export(control, config, result):
                 "control_id": control.control_id,
                 "observed_at": observed_at,
                 "issues": issues,
-                "stats": {"last_attempt": {"finished_at": observed_at, "status": result["status"]}},
+                "stats": {
+                    "last_attempt": {"finished_at": observed_at, "status": result["status"]},
+                    "control_storage": {
+                        "payload_format": 2,
+                        "bytes": config.control_path.stat().st_size,
+                        "wal_bytes": (
+                            config.control_path.with_name(config.control_path.name + "-wal")
+                            .stat()
+                            .st_size
+                            if config.control_path.with_name(
+                                config.control_path.name + "-wal"
+                            ).exists()
+                            else 0
+                        ),
+                        "page_count": control.db.execute("PRAGMA page_count").fetchone()[0],
+                        "free_pages": control.db.execute("PRAGMA freelist_count").fetchone()[0],
+                    },
+                },
                 "publication": _publication(control, config),
             }
         finally:

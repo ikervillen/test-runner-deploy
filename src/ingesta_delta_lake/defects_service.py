@@ -212,6 +212,9 @@ def process_batch(
     store = store_class(config, control.control_id)
     recovered, recovery_count = reconcile_pending(config, control, store_class)
     parsed = model.parse(snapshots, config.encoding)
+    from .review_adapters import filter_rejected
+
+    filter_rejected(control, parsed)
     scope = scope_for(parsed, model)
     store.set_scope(scope)
     before_files = files(store.table())
