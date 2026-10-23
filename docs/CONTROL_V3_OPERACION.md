@@ -52,7 +52,7 @@ Después de aceptar el ensayo:
 
 1. Ejecutar `operation=reformulate`, inicialmente con `remove_backup=false`.
 2. El coordinador drena el escritor, verifica el estado y reconstruye cada control en un archivo nuevo, bajo los bloqueos de mantenimiento.
-3. El original se conserva como `<control>.before-compaction`. Se verifican páginas, claves foráneas, contenido transformado y evidencias de lo archivado antes de sustituirlo atómicamente.
+3. El original se conserva como `<control>.before-compaction`. La reformulación lee las tablas originales por bloques y compara las huellas del contenido transformado y de la auditoría; reconstruye los índices y verifica completamente páginas y claves foráneas del destino. No recorre además los índices antiguos que va a descartar: en el servidor ese recorrido redundante de todo el SQLite domina el tiempo de mantenimiento. Una página original ilegible hace fallar la lectura; no se acepta un destino incompleto ni una diferencia de contenido.
 4. Un informe `<control>.compaction-report.json` identifica el control, el original, los tamaños y las pruebas. Una repetición reconoce controles ya migrados y continúa con los restantes.
 5. El coordinador comprueba las tablas y reanuda el escritor. Contrastar nuevas llegadas, ausencia de duplicados, revisiones, versiones Delta y exportaciones de supervisión.
 6. Tras aceptar el piloto, repetir `operation=reformulate` con `remove_backup=true`. Para controles ya migrados, esto verifica la identidad y el informe antes de retirar únicamente su copia anterior. No reconstruye las tablas ni borra el control activo.

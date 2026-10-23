@@ -194,10 +194,13 @@ def replace_control(config, *, apply=False, remove_backup=False, reformulate=Fal
             # A clean checkpoint is necessary before retaining the old inode.
             if db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] != 0:
                 raise IntegrityError("Control still has active readers/writers")
-            # Source secondary indexes are rebuilt, never copied. Validate its
-            # pages/constraints linearly; compare logical contents explicitly
-            # and validate every rebuilt target index with integrity_check.
-            _check(db, full=False)
+            if not reformulate:
+                _check(db, full=False)
+            # Reformulation streams every retained source table, verifies the
+            # transformed hashes and rebuilds all target indexes. Scanning the
+            # discarded source indexes as well caused prohibitive duplicate I/O on
+            # the server's legacy control. Invalid source pages still fail the
+            # table reads; the replacement receives full integrity/FK checks.
         temporary = path.with_name(path.name + ".compact-" + uuid.uuid4().hex)
         backup = path.with_name(path.name + ".before-compaction")
         if backup.exists():
@@ -237,7 +240,11 @@ def replace_control(config, *, apply=False, remove_backup=False, reformulate=Fal
                 bytes_after=path.stat().st_size,
                 backup=str(backup),
                 backup_removed=False,
-                validation="source-quick-check,target-integrity-check,foreign-keys,logical-hashes",
+                validation=(
+                    "source-streamed-tables,target-integrity-check,foreign-keys,logical-hashes"
+                    if reformulate
+                    else "source-quick-check,target-integrity-check,foreign-keys,logical-hashes"
+                ),
             )
             if remove_backup:
                 backup.unlink()
