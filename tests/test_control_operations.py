@@ -106,6 +106,25 @@ def test_old_image_or_missing_active_is_rejected_before_drain(active_site):
     assert not a.calls
 
 
+def test_unconfirmed_helper_exit_cannot_launch_a_writer(active_site, monkeypatch):
+    from deployment.manager import MaintenanceStillRunning
+
+    a = active_site
+    original = a.motor.helper
+
+    def helper(release, command, **kwargs):
+        if command[0] == "compact-control":
+            raise MaintenanceStillRunning("helper termination unconfirmed")
+        return original(release, command, **kwargs)
+
+    monkeypatch.setattr(a.motor, "helper", helper)
+    with pytest.raises(MaintenanceStillRunning):
+        operations.execute(a.site, "compact", a.report)
+    assert all(command != "resume" for command, _ in a.calls)
+    report = json.loads(a.report.read_text())
+    assert report["status"] == "FAILED" and "recovery_required" in report
+
+
 def test_helper_forwards_maintenance_deadline_and_readwrite_mount():
     docker = Docker("test")
     record = {

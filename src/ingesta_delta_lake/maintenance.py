@@ -33,9 +33,17 @@ def _sync_directory(path):
             os.close(descriptor)
 
 
-def _check(db):
-    if db.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
-        raise IntegrityError("Control failed SQLite integrity_check")
+def _tune(db):
+    # Bound each connection's cache instead of using SQLite's 2 MiB default for
+    # multi-gigabyte controls. Mapped pages remain reclaimable by the kernel.
+    db.execute("PRAGMA cache_size=-131072")
+    db.execute("PRAGMA mmap_size=536870912")
+
+
+def _check(db, *, full=True):
+    pragma = "integrity_check" if full else "quick_check"
+    if db.execute("PRAGMA " + pragma).fetchall() != [("ok",)]:
+        raise IntegrityError("Control failed SQLite " + pragma)
     if db.execute("PRAGMA foreign_key_check").fetchone():
         raise IntegrityError("Control has invalid foreign keys")
 
@@ -128,6 +136,7 @@ def replace_control(config, *, apply=False, remove_backup=False):
                 portalocker.Lock(str(config.silver_root / lock), mode="a", timeout=0)
             )
         with closing(sqlite3.connect(path)) as db:
+            _tune(db)
             report = {
                 "status": "INVENTORY",
                 "path": str(path),
@@ -141,7 +150,10 @@ def replace_control(config, *, apply=False, remove_backup=False):
             # A clean checkpoint is necessary before retaining the old inode.
             if db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] != 0:
                 raise IntegrityError("Control still has active readers/writers")
-            _check(db)
+            # Source secondary indexes are rebuilt, never copied. Validate its
+            # pages/constraints linearly; compare logical contents explicitly
+            # and validate every rebuilt target index with integrity_check.
+            _check(db, full=False)
         temporary = path.with_name(path.name + ".compact-" + uuid.uuid4().hex)
         backup = path.with_name(path.name + ".before-compaction")
         if backup.exists():
@@ -149,8 +161,10 @@ def replace_control(config, *, apply=False, remove_backup=False):
         try:
             original_permissions = path.stat()
             with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as source:
+                _tune(source)
                 source.execute("BEGIN")
                 with closing(sqlite3.connect(temporary)) as target:
+                    _tune(target)
                     target.execute("PRAGMA synchronous=FULL")
                     report["tables"] = _copy(source, target, config)
                 source.rollback()
@@ -167,12 +181,14 @@ def replace_control(config, *, apply=False, remove_backup=False):
             os.replace(temporary, path)
             _sync_directory(path.parent)
             with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as verified:
+                _tune(verified)
                 _check(verified)
             report.update(
                 status="COMPACTED",
                 bytes_after=path.stat().st_size,
                 backup=str(backup),
                 backup_removed=False,
+                validation="source-quick-check,target-integrity-check,foreign-keys,logical-hashes",
             )
             if remove_backup:
                 backup.unlink()

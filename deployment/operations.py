@@ -5,7 +5,7 @@ import base64
 import json
 from pathlib import Path
 
-from .manager import Deployment, Docker, load_site, locked, save
+from .manager import Deployment, Docker, MaintenanceStillRunning, load_site, locked, save
 
 INVENTORY = """
 from pathlib import Path
@@ -54,6 +54,7 @@ def execute(site, operation, report_path, *, remove_backup=False):
             return report
         if active["manifest"].get("control_payload_format", 1) < 2:
             raise RuntimeError("Deploy a tested format-2 image before compacting controls")
+        safe_to_resume = True
         try:
             docker.drain(active, site["drain_seconds"])
             checked = docker.helper(active, ["check"])
@@ -74,13 +75,17 @@ def execute(site, operation, report_path, *, remove_backup=False):
             report["verification"] = docker.helper(active, ["check"])
             report["status"] = "COMPACTED"
         except Exception as exc:
+            safe_to_resume = not isinstance(exc, MaintenanceStillRunning)
             report.update(status="FAILED", error=str(exc))
             raise
         finally:
             # The same tested image reads both text and compact controls. Never
             # reactivate an older image, and never force-kill an in-flight batch.
-            docker.resume(active)
-            report["after"] = inspect(docker, active)
+            if safe_to_resume:
+                docker.resume(active)
+                report["after"] = inspect(docker, active)
+            else:
+                report["recovery_required"] = "Confirm isolated helper termination before resuming"
             save(report_path, report)
     return report
 

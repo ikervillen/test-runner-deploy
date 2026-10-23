@@ -58,7 +58,11 @@ Una ingesta activa impide el mantenimiento. Primero se debe drenar el worker
 mediante el procedimiento cooperativo existente, sin SIGKILL.
 
 1. Inventario sin `--apply`: tamaño, ruta y operaciones pendientes.
-2. Checkpoint completo del WAL y comprobación de integridad y claves foráneas.
+2. Checkpoint completo del WAL y `quick_check` del origen, que valida páginas y
+   restricciones sin revisar repetidamente sus índices secundarios. Estos se
+   reconstruyen en el destino, donde se ejecuta `integrity_check` completo y la
+   comprobación de claves foráneas. Cada conexión usa una caché acotada de 128 MiB
+   y como máximo 512 MiB mapeados; no se carga el SQLite entero en memoria.
 3. Copia a un archivo nuevo, fila a fila, con las compresiones aplicables. No se
    materializa la base completa en RAM ni se copian datos Delta.
 4. Validación de integridad y comparación por tabla del número de filas y SHA-256
@@ -75,6 +79,12 @@ reemplazo el nombre activo apunta a una copia previamente validada. Un respaldo
 ya existente bloquea otra sustitución hasta revisar la intervención anterior.
 No se debe restaurar ese respaldo tras reanudar escrituras nuevas: quedaría
 desfasado respecto a Delta.
+
+El auxiliar de copia lleva nombre único, `--init` y no usa el healthcheck del
+worker. Si vence su plazo, se envía SIGTERM y se confirma su terminación antes de
+reactivar la ingesta. Si no puede confirmarse, la operación registra recuperación
+operativa pendiente y mantiene detenido el escritor; nunca lo inicia encima de
+una copia que pudiera seguir activa.
 
 Ejemplo local, sobre una configuración aislada explícita:
 
