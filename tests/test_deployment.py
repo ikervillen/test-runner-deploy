@@ -158,6 +158,18 @@ def test_unicode_contract_metadata_remains_compatible_across_updates(site, motor
     assert dep.active()["manifest"] == {"schema": "ID_AgrupaciÃ³n"}
 
 
+def test_association_storage_downgrade_is_rejected_before_writer_handoff(site, motor):
+    dep = deployer(site, motor)
+    record = dep.deploy(IMAGE1, SHA1, "first")["release"]
+    record["manifest"]["association_artifact_format"] = 2
+    save(dep.active_path, record)
+    motor.events.clear()
+    motor.latest = SHA2
+    with pytest.raises(RuntimeError, match="Association artifact downgrade"):
+        dep.deploy(IMAGE2, SHA2, "old-reader")
+    assert not any(event[0] == "drain" for event in motor.events)
+
+
 def test_same_digest_configuration_replay_does_not_restart(site, motor):
     dep = deployer(site, motor)
     dep.deploy(IMAGE1, SHA1, "run1")

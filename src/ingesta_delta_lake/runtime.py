@@ -43,6 +43,7 @@ def describe():
     return {
         "deployment_protocol": PROTOCOL,
         "control_payload_format": 3,
+        "association_artifact_format": 2,
         "data_policy": POLICY,
         "contracts": {f: {"name": c.name, "schema": str(c.schema)} for f, c in CONTRACTS.items()},
         "assignment_rule": RULE,
