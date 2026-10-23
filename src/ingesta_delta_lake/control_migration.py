@@ -6,7 +6,14 @@ import os
 import shutil
 
 from .common import IntegrityError, canonical, now
-from .compact_control import WORK_KEY, initialize, inspection_payload, publish, summary
+from .compact_control import (
+    WORK_KEY,
+    blocked_manifest,
+    initialize,
+    inspection_payload,
+    publish,
+    summary,
+)
 from .control_archive import Archive, logical
 from .inspection_retention import InspectionArchive
 from .retention import payload
@@ -92,12 +99,18 @@ def migrate(source, target, config):
                         continue
                     if name == "batches":
                         document = payload(fields["prepared_json"])
-                        if fields["confirmed_at"] and fields["state"] in {"COMPLETED", "PARTIAL"}:
+                        if fields["state"] == "BLOCKED" or (
+                            fields["confirmed_at"] and fields["state"] in {"COMPLETED", "PARTIAL"}
+                        ):
                             archive = archives.get("legacy_preparations")
                             if archive is None:
                                 archive = archives["legacy_preparations"] = Archive(root, "legacy")
                             archive.append({"batch_id": fields["batch_id"], "prepared": document})
-                            document = summary(document)
+                            document = (
+                                blocked_manifest(document)
+                                if fields["state"] == "BLOCKED"
+                                else summary(document)
+                            )
                             document["legacy_audit"] = True
                         elif fields["state"] in {"PREPARED", "WRITING", "UNKNOWN"}:
                             document = publish(work, document)
