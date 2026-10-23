@@ -67,9 +67,7 @@ def fragments(snapshot, encoding, *, target_bytes=TARGET_BYTES):
 def expand(control, captures, *, max_file_bytes):
     """Publish the complete fragment graph atomically; parent ack waits for children."""
     db = control.db
-    parents = {
-        (r[0], r[1]) for r in db.execute("SELECT DISTINCT origin,parent_sha FROM input_fragments")
-    }
+    parents = set()
     additions = {}
     for key, snapshot in list(captures.items()):
         if snapshot.size <= max_file_bytes or key in parents:
@@ -91,7 +89,13 @@ def expand(control, captures, *, max_file_bytes):
                     "INSERT OR IGNORE INTO input_fragments VALUES(?,?,?)",
                     (snapshot.origin, snapshot.sha256, part.sha256),
                 )
+                db.execute(
+                    "INSERT OR IGNORE INTO pending_inputs SELECT ?,? "
+                    "WHERE NOT EXISTS(SELECT 1 FROM consumed_inputs WHERE origin=? AND sha256=?)",
+                    (part.origin, part.sha256, part.origin, part.sha256),
+                )
                 additions[(part.origin, part.sha256)] = part
+            db.execute("DELETE FROM pending_inputs WHERE origin=? AND sha256=?", key)
         parents.add(key)
     captures.update(additions)
     return parents

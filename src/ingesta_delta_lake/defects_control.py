@@ -57,6 +57,8 @@ class DefectsControl(Control):
                   PRIMARY KEY(origin,parent_sha,child_sha));
                 CREATE INDEX IF NOT EXISTS input_fragments_child
                   ON input_fragments(origin,child_sha);
+                CREATE TABLE IF NOT EXISTS pending_inputs(
+                  origin TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(origin,sha256));
             """)
         if self.setting("input_queue_migrated") is None:
             with self.db:
@@ -69,6 +71,16 @@ class DefectsControl(Control):
                         (snapshot.origin, snapshot.sha256, text),
                     )
                 self.db.execute("INSERT INTO settings VALUES('input_queue_migrated','1')")
+        if self.compact and self.setting("pending_queue_seeded") is None:
+            with self.db:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO pending_inputs SELECT v.origin,v.sha256 "
+                    "FROM input_versions v WHERE NOT EXISTS(SELECT 1 FROM consumed_inputs c "
+                    "WHERE c.origin=v.origin AND c.sha256=v.sha256) "
+                    "AND NOT EXISTS(SELECT 1 FROM input_fragments f "
+                    "WHERE f.origin=v.origin AND f.parent_sha=v.sha256)"
+                )
+                self.db.execute("INSERT INTO settings VALUES('pending_queue_seeded','1')")
 
     def receipts(self, attempt, snapshots):
         # Capture acknowledgement and enqueue are one durable SQLite transaction.
@@ -82,8 +94,22 @@ class DefectsControl(Control):
                 "INSERT OR IGNORE INTO input_versions VALUES(?,?,?)",
                 [(s.origin, s.sha256, canonical(s.descriptor())) for s in snapshots],
             )
+            if self.compact:
+                self.db.executemany(
+                    "INSERT OR IGNORE INTO pending_inputs SELECT ?,? "
+                    "WHERE NOT EXISTS(SELECT 1 FROM consumed_inputs WHERE origin=? AND sha256=?) "
+                    "AND NOT EXISTS(SELECT 1 FROM input_fragments WHERE origin=? AND parent_sha=?)",
+                    [
+                        (s.origin, s.sha256, s.origin, s.sha256, s.origin, s.sha256)
+                        for s in snapshots
+                    ],
+                )
 
     def consumed_inputs(self):
+        if self.compact:
+            from .input_queue import Consumed
+
+            return Consumed(self.db)
         return {(r[0], r[1]) for r in self.db.execute("SELECT origin,sha256 FROM consumed_inputs")}
 
     def progress(self, consumed, remaining):
@@ -115,6 +141,11 @@ class DefectsControl(Control):
                 "INSERT OR IGNORE INTO consumed_inputs VALUES(?,?,?)",
                 [(s.origin, s.sha256, batch_id) for s in snapshots],
             )
+            if self.compact:
+                self.db.executemany(
+                    "DELETE FROM pending_inputs WHERE origin=? AND sha256=?",
+                    [(s.origin, s.sha256) for s in snapshots],
+                )
             if snapshots:
                 if self.compact:
                     for snapshot in snapshots:
@@ -142,6 +173,10 @@ class DefectsControl(Control):
 
     def captured_inputs(self):
         """Receipts are also the durable queue; include files no longer in /input."""
+        if self.compact:
+            from .input_queue import Captures
+
+            return Captures(self.db)
         versions = {}
         for (text,) in self.db.execute("SELECT descriptor_json FROM input_versions ORDER BY rowid"):
             snapshot = Snapshot(**json.loads(text))
