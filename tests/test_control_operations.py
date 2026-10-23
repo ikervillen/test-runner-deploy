@@ -63,6 +63,34 @@ def test_inspection_does_not_drain_or_write_controls(active_site):
     assert json.loads(a.report.read_text()) == result
 
 
+def test_association_conversion_keeps_worker_running_and_records_bounded_batches(active_site):
+    a = active_site
+    a.record["manifest"]["association_artifact_format"] = 2
+    save(Path(a.site["state_root"]) / "develop" / "active.json", a.record)
+    results = iter(
+        [{"status": "MORE_PENDING", "converted": 32}, {"status": "COMPLETE", "converted": 5}]
+    )
+
+    def helper(release, command, **kwargs):
+        assert command == ["compact-associations", "--apply", "--limit", "32"]
+        assert kwargs == {"readonly": False, "timeout": 3600}
+        a.calls.append(("convert", {}))
+        return next(results)
+
+    a.motor.helper = helper
+    report = operations.execute(a.site, "compact-associations", a.report)
+    assert report["status"] == "ASSOCIATIONS_COMPACTED"
+    assert not report["writer_paused"] and len(report["controls"]) == 2
+    assert [entry[0] for entry in a.calls] == ["convert", "convert"]
+
+
+def test_association_conversion_rejects_legacy_reader_before_any_mutation(active_site):
+    a = active_site
+    with pytest.raises(RuntimeError, match="shared-block"):
+        operations.execute(a.site, "compact-associations", a.report)
+    assert not a.calls
+
+
 @pytest.mark.parametrize("remove", [False, True])
 def test_compaction_skips_missing_controls_and_resumes_same_image(active_site, remove):
     a = active_site

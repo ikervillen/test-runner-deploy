@@ -14,6 +14,13 @@ from deltalake import DeltaTable
 import pyarrow as pa
 root=Path('/lake'); controls=root/'control'
 data={'disk':shutil.disk_usage(root)._asdict(),'controls':[], 'tables':[], 'feeds':[]}
+data['control_directories']={}
+for directory in controls.iterdir():
+ if directory.is_dir() and not directory.is_symlink():
+  count=total=0
+  for p in directory.rglob('*'):
+   if p.is_file() and not p.is_symlink():count+=1;total+=p.stat().st_size
+  data['control_directories'][directory.name]={'files':count,'bytes':total}
 for p in sorted(controls.glob('*.sqlite*')):
  if p.is_file():data['controls'].append({'name':p.name,'bytes':p.stat().st_size})
 for p in sorted((root/'silver').glob('*/*')):
@@ -51,6 +58,34 @@ def execute(site, operation, report_path, *, remove_backup=False):
         if operation == "inspect":
             report["status"] = "INSPECTED"
             save(report_path, report)
+            return report
+        if operation == "compact-associations":
+            if active["manifest"].get("association_artifact_format", 1) < 2:
+                raise RuntimeError("Deploy the tested shared-block association reader first")
+            report["writer_paused"] = False
+            try:
+                for _ in range(64):
+                    result = docker.helper(
+                        active,
+                        ["compact-associations", "--apply", "--limit", "32"],
+                        readonly=False,
+                        timeout=3600,
+                    )
+                    report["controls"].append(result)
+                    save(report_path, report)
+                    if result["status"] == "COMPLETE":
+                        report["status"] = "ASSOCIATIONS_COMPACTED"
+                        break
+                    if not result["converted"]:
+                        raise RuntimeError("Association conversion made no progress")
+                else:
+                    report["status"] = "MORE_PENDING"
+            except Exception as exc:
+                report.update(status="FAILED", error=str(exc))
+                raise
+            finally:
+                report["after"] = inspect(docker, active)
+                save(report_path, report)
             return report
         if active["manifest"].get("control_payload_format", 1) < 2:
             raise RuntimeError("Deploy a tested format-2 image before compacting controls")
@@ -129,7 +164,14 @@ def main():
     parser.add_argument("--site", type=Path, required=True)
     parser.add_argument(
         "--operation",
-        choices=["inspect", "compact", "trial", "reformulate", "rebuild-index"],
+        choices=[
+            "inspect",
+            "compact",
+            "trial",
+            "reformulate",
+            "rebuild-index",
+            "compact-associations",
+        ],
         required=True,
     )
     parser.add_argument("--report", type=Path, required=True)

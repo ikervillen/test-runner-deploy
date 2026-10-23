@@ -355,6 +355,7 @@ def main(argv=None):
             "trial-control",
             "inventory-control",
             "rebuild-index",
+            "compact-associations",
         ],
     )
     parser.add_argument("--allow-pending", action="store_true")
@@ -364,6 +365,7 @@ def main(argv=None):
     parser.add_argument("--remove-backup", action="store_true")
     parser.add_argument("--reformulate", action="store_true")
     parser.add_argument("--trial-root", type=Path)
+    parser.add_argument("--limit", type=int, default=32)
     args = parser.parse_args(argv)
     try:
         if args.command == "describe":
@@ -385,6 +387,16 @@ def main(argv=None):
                 apply=args.apply,
                 remove_backup=args.remove_backup,
                 reformulate=args.reformulate,
+            )
+        elif args.command == "compact-associations":
+            from .association_migration import execute, inventory
+
+            marker()
+            config = replace(settings()[2], family="ASIGNACION_PRODUCCION_RAMAL")
+            result = (
+                execute(config, limit=args.limit)
+                if args.apply
+                else inventory(config.control_root / "association-artifacts")
             )
         elif args.command in {"trial-control", "inventory-control", "rebuild-index"}:
             marker()

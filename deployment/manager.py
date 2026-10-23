@@ -179,10 +179,16 @@ class Docker:
             ):
                 raise ValueError("Invalid isolated trial mount")
             record = {k: v for k, v in record.items() if k != "review_volumes"}
+        if command[0] == "compact-associations":
+            # Streaming maintenance runs beside ingestion, sharing neither its
+            # memory budget nor its review command/result write channels.
+            record = {k: v for k, v in record.items() if k != "review_volumes"}
+            record["resources"] = {"cpus": 1, "memory_bytes": 512 * 1024**2, "workers": 1}
         args = ["--init", "--no-healthcheck", *common_args(record)]
         name = (
             "fenix-control-" + uuid.uuid4().hex
-            if command[0] in {"compact-control", "trial-control", "rebuild-index"}
+            if command[0]
+            in {"compact-control", "trial-control", "rebuild-index", "compact-associations"}
             else None
         )
         if name:
