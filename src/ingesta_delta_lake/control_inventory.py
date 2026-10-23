@@ -5,9 +5,15 @@ import time
 from contextlib import closing
 
 
-def inventory(path, *, seconds=3):
+def inventory(path, *, seconds=3, stopped=False):
     deadline = time.monotonic() + seconds
-    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+    if stopped:
+        from .runtime import control_read
+
+        connection = control_read(path.resolve())
+    else:
+        connection = closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True))
+    with connection as db:
         db.execute("PRAGMA query_only=ON")
         db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         page_size = db.execute("PRAGMA page_size").fetchone()[0]

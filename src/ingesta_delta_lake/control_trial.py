@@ -20,10 +20,12 @@ def trial(config, root):
         raise IntegrityError("Trial storage overlaps industrial roots")
     cfg = replace(config, control_root=root / config.family)
     cfg.validate()
+    before = inventory(config.control_path, stopped=True)
     cfg.control_root.mkdir(parents=True, exist_ok=False)
-    before = inventory(config.control_path)
-    with closing(sqlite3.connect(config.control_path.as_uri() + "?mode=ro", uri=True)) as source:
-        source.execute("PRAGMA query_only=ON")
+    from .runtime import control_read
+
+    original = config.control_path.stat()
+    with control_read(config.control_path) as source:
         source.execute("BEGIN")
         _tune(source)
         if dict(source.execute("SELECT key,value FROM settings")).get("control_format") == "3":
@@ -34,6 +36,12 @@ def trial(config, root):
             proof = migrate(source, target, cfg)
         if source.total_changes:
             raise IntegrityError("Read-only source unexpectedly changed")
+    current = config.control_path.stat()
+    wal = config.control_path.with_name(config.control_path.name + "-wal")
+    if (current.st_size, current.st_mtime_ns) != (original.st_size, original.st_mtime_ns) or (
+        wal.exists() and wal.stat().st_size > 0
+    ):
+        raise IntegrityError("Source changed during the isolated trial")
     with cfg.control_path.open("r+b") as stream:
         os.fsync(stream.fileno())
     return {
