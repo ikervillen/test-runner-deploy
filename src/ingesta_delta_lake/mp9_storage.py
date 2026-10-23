@@ -10,6 +10,7 @@ from deltalake import write_deltalake
 from deltalake.transaction import CommitProperties
 
 from . import __version__, mp9
+from .commit_protocol import application_transaction
 from .common import IntegrityError, canonical
 from .delta import DeltaStore
 from .modelos import content_hash as model_hash
@@ -128,6 +129,7 @@ class Mp9Store(DeltaStore):
                 "ingesta_release": __version__,
                 "ingesta_timestamp_policy": "local_naive_test_v1",
             },
+            app_transactions=application_transaction(self.control_id, before_version),
             max_commit_retries=0,
         )
         if table is None:

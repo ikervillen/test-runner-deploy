@@ -14,6 +14,7 @@ from pathlib import Path
 from deltalake.transaction import CommitProperties
 
 from . import __version__
+from .commit_protocol import application_transaction
 from .common import IntegrityError, canonical, digest, now
 from .review_adapters import KEEP, REPLACE, adapter, offer
 
@@ -211,6 +212,9 @@ def _execute(config, control, command, plan):
                     "ingesta_timestamp_policy": config.timestamp_policy,
                     "ingesta_review_decision": command["decision_id"],
                 },
+                app_transactions=application_transaction(
+                    control.control_id, plan["before_version"]
+                ),
                 max_commit_retries=0,
             )
             metrics = (

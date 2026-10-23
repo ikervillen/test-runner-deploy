@@ -5,6 +5,7 @@ from deltalake import DeltaTable, write_deltalake
 from deltalake.transaction import CommitProperties
 
 from . import __version__
+from .commit_protocol import application_transaction
 from .common import IntegrityError
 from .config import Config
 from .contracts import MODEL_SCHEMA
@@ -80,6 +81,7 @@ class DeltaStore:
                     "ingesta_contract": self.contract.name,
                     "ingesta_release": __version__,
                 },
+                app_transactions=application_transaction(self.control_id, before_version),
                 max_commit_retries=0,
             ),
         )

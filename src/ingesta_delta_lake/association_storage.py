@@ -19,6 +19,7 @@ from . import __version__, topology
 from . import associations as a
 from .ar_storage import ArStore
 from .catalog_storage import CatalogStore
+from .commit_protocol import application_transaction
 from .common import IntegrityError, canonical, digest, now
 from .control import Control
 from .defects_storage import DefectsStore
@@ -395,6 +396,7 @@ class AssociationStore(DeltaStore):
                 "ingesta_contract": a.CONTRACT,
                 "ingesta_release": __version__,
             },
+            app_transactions=application_transaction(self.control_id, before_version),
             max_commit_retries=0,
         )
         if table is None:

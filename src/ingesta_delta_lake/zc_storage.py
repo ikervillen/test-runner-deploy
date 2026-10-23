@@ -10,6 +10,7 @@ from deltalake.transaction import CommitProperties
 
 from . import __version__
 from . import cont_zc as zc
+from .commit_protocol import application_transaction
 from .common import IntegrityError, canonical, now
 from .control import Control
 from .delta import DeltaStore
@@ -135,6 +136,7 @@ class ZcStore(DeltaStore):
                     "ingesta_release": __version__,
                     "ingesta_timestamp_policy": "local_naive_test_v1",
                 },
+                app_transactions=application_transaction(self.control_id, before_version),
                 max_commit_retries=0,
             ),
         )
