@@ -9,6 +9,7 @@ import logging
 import os
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from .common import canonical, digest, now
@@ -19,6 +20,47 @@ MAX_ISSUES = 20_000
 MAX_EVIDENCE = 20
 INTERVAL = 60
 TIMEOUT = 3
+
+
+@dataclass
+class _ObservationControl:
+    """Read-only adapter: observing a deferred family creates no ingestion attempt."""
+
+    db: object
+
+    def setting(self, key):
+        row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    @property
+    def control_id(self):
+        return self.setting("control_id")
+
+    @property
+    def compact(self):
+        return self.setting("control_format") == "3"
+
+
+def deferred(config):
+    result = {
+        "status": "DEFERRED_BACKLOG",
+        "complete": False,
+        "attempted": False,
+        "dependency_status": "MIA_BACKLOG",
+    }
+    if os.environ.get("INGESTA_SUPERVISION_EXPORT") == "1" and config.control_path.is_file():
+        try:
+            from .runtime import control_read
+
+            with control_read(config.control_path, allow_pending=True) as db:
+                export(_ObservationControl(db), config, result)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Deferred observation unavailable: family=%s error=%s",
+                config.family,
+                type(exc).__name__,
+            )
+    return result
 
 
 def _payload(text):
@@ -134,10 +176,15 @@ def export(control, config, result):
                 "observed_at": observed_at,
                 "issues": issues,
                 "stats": {
-                    "last_attempt": {
-                        "finished_at": retry["updated_at"] if retry else observed_at,
-                        "status": "FAILED" if retry else result["status"],
-                    },
+                    "last_attempt": (
+                        {
+                            "finished_at": retry["updated_at"] if retry else observed_at,
+                            "status": "FAILED" if retry else result["status"],
+                        }
+                        if retry or result.get("attempted", True)
+                        else None
+                    ),
+                    "dependency_status": result.get("dependency_status"),
                     **(
                         {
                             "pending_versions": control.db.execute(

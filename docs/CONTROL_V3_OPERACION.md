@@ -67,6 +67,8 @@ Una ejecución manual deliberada puede reintentar esa familia tras corregir la c
 
 Los fallos de archivo/limpieza se publican en `stats.control_storage.maintenance_error`. Deben revisarse aunque los commits industriales continúen correctamente. Los datos de cola se exportan en `stats.input_progress`; las aplicaciones consumidoras podrán presentarlos sin abrir SQLite activo.
 
+Si las asociaciones se aplazan mientras queda cola MIA, el escritor publica una observación de solo lectura con `dependency_status=MIA_BACKLOG` y `last_attempt=null`. Conserva la versión industrial confirmada y no crea un intento ficticio ni modifica asociaciones. La lectura de supervisión puede estar disponible mientras el cálculo derivado sigue pendiente; no interpretar esa disponibilidad como actualización de sus datos de negocio. El siguiente intento real limpia el estado de aplazamiento.
+
 ## Comprobaciones de aceptación
 
 - Mismas versiones y filas Delta antes y después de la migración, salvo escrituras posteriores ordinarias identificadas.
