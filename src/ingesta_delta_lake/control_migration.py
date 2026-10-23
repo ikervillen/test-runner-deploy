@@ -6,7 +6,7 @@ import os
 import shutil
 
 from .common import IntegrityError, canonical, now
-from .compact_control import WORK_KEY, initialize, publish, summary
+from .compact_control import WORK_KEY, initialize, inspection_payload, publish, summary
 from .control_archive import Archive, logical
 from .inspection_retention import InspectionArchive
 from .retention import payload
@@ -67,6 +67,10 @@ def migrate(source, target, config):
                     visited += 1
                     values = list(row)
                     fields = dict(zip(columns, row, strict=True))
+                    if name == "inspection_current":
+                        values[columns.index("payload_json")] = inspection_payload(
+                            json.loads(fields["payload_json"])
+                        )
                     if name == "receipts" and queue:
                         descriptor = json.loads(fields["descriptor_json"])
                         if source.execute(

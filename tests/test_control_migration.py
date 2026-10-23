@@ -67,7 +67,9 @@ def test_mia_migration_proves_historical_groups_and_keeps_current_index(config):
     report = replace_control(config, apply=True, reformulate=True)
     assert report["tables"]["audit"]["inspection_groups"]["archived_rows"] == 1
     with closing(RejectionsControl(config)) as control:
-        assert list(map(tuple, control.db.execute("SELECT * FROM inspection_current"))) == original
+        current = list(map(tuple, control.db.execute("SELECT * FROM inspection_current")))
+        assert [r[:2] + r[3:] for r in current] == [r[:2] + r[3:] for r in original]
+        assert json.loads(current[0][2]) == {"accepted_inspection_values": [96]}
         assert not control.db.execute("SELECT 1 FROM inspection_groups").fetchone()
     path.write_text(line() + line(date="14/10/2026 0:10:00"), encoding="utf-8")
     result = run(config)

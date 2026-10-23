@@ -12,7 +12,7 @@ import os
 import sqlite3
 import stat
 import uuid
-from contextlib import ExitStack, closing
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -121,11 +121,8 @@ def _copy(source, target, config=None):
     return evidence
 
 
-def replace_control(config, *, apply=False, remove_backup=False, reformulate=False):
-    config.validate()
-    path = config.control_path
-    if not path.is_file():
-        raise IntegrityError("Control does not exist; maintenance cannot create a generation")
+@contextmanager
+def control_locks(config):
     with ExitStack() as stack:
         for lock in (
             ".runtime.lock",
@@ -135,6 +132,15 @@ def replace_control(config, *, apply=False, remove_backup=False, reformulate=Fal
             stack.enter_context(
                 portalocker.Lock(str(config.silver_root / lock), mode="a", timeout=0)
             )
+        yield
+
+
+def replace_control(config, *, apply=False, remove_backup=False, reformulate=False):
+    config.validate()
+    path = config.control_path
+    if not path.is_file():
+        raise IntegrityError("Control does not exist; maintenance cannot create a generation")
+    with control_locks(config):
         with closing(sqlite3.connect(path)) as db:
             _tune(db)
             report = {

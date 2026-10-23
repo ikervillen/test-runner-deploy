@@ -182,7 +182,7 @@ class Docker:
         args = ["--init", "--no-healthcheck", *common_args(record)]
         name = (
             "fenix-control-" + uuid.uuid4().hex
-            if command[0] in {"compact-control", "trial-control"}
+            if command[0] in {"compact-control", "trial-control", "rebuild-index"}
             else None
         )
         if name:

@@ -22,6 +22,11 @@ RECEIPT_KEY = "$control_receipt"
 MAX_DOCUMENT = 256 * 1024 * 1024
 
 
+def inspection_payload(group):
+    """The current index needs only the accepted base to restore a released hold."""
+    return canonical({"accepted_inspection_values": group["accepted_inspection_values"]})
+
+
 def sync_directory(path):
     if os.name != "nt":
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)

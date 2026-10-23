@@ -312,6 +312,8 @@ class DefectsControl(Control):
             )
 
     def confirm(self, batch_id, version):
+        from .compact_control import inspection_payload
+
         with self.db:
             batch = self.batch(batch_id)
             prepared = self.prepared(batch)
@@ -349,7 +351,7 @@ class DefectsControl(Control):
                         (
                             g["group_id"],
                             g["group"][0],
-                            canonical(g),
+                            inspection_payload(g) if self.compact else canonical(g),
                             g["status"],
                             g["INSPECC"],
                             g.get("defect_rows", g.get("observation_rows")),
