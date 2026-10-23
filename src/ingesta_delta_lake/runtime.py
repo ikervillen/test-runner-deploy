@@ -289,7 +289,9 @@ def worker(interval=600):
                         if stop.is_set():
                             break
                         if phase == ("ASIGNACION_PRODUCCION_RAMAL",) and backlog:
-                            record(phase[0], {"status": "DEFERRED_BACKLOG", "complete": False}, 0)
+                            from .supervision_export import deferred
+
+                            record(phase[0], deferred(replace(base, family=phase[0])), 0)
                             continue
                         run_phase(base, phase, stop, stop_path, record, active)
                 else:
@@ -303,7 +305,9 @@ def worker(interval=600):
                             from .service import run
 
                             if family == "ASIGNACION_PRODUCCION_RAMAL" and backlog:
-                                result = {"status": "DEFERRED_BACKLOG", "complete": False}
+                                from .supervision_export import deferred
+
+                                result = deferred(replace(base, family=family))
                             else:
                                 result = run(
                                     replace(base, family=family),
