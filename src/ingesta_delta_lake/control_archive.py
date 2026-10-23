@@ -14,11 +14,17 @@ from .retention import unpack
 
 class Archive:
     def __init__(self, root, name):
+        # Audit JSON compresses well at level 1. The default gzip level 9 made
+        # multi-gigabyte legacy conversions CPU-bound for no recovery benefit.
+        # Identity and verification use uncompressed canonical content.
+        level = int(os.environ.get("INGESTA_CONTROL_ARCHIVE_COMPRESSION_LEVEL", "1"))
+        if not 1 <= level <= 9:
+            raise IntegrityError("Audit compression level must be between 1 and 9")
         root.mkdir(parents=True, exist_ok=True)
         fd, path = tempfile.mkstemp(prefix=".archive-", dir=root)
         self.temporary, self.root, self.name = Path(path), root, name
         self.raw = os.fdopen(fd, "wb")
-        self.stream = gzip.GzipFile(fileobj=self.raw, mode="wb", mtime=0)
+        self.stream = gzip.GzipFile(fileobj=self.raw, mode="wb", mtime=0, compresslevel=level)
         self.fingerprint, self.count = hashlib.sha256(), 0
 
     def append(self, value):

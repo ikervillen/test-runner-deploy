@@ -24,6 +24,7 @@ La imagen anuncia `control_payload_format=3`. La identidad del control y las ope
 | `INGESTA_CONTROL_RECEIPT_DAYS` | 90 | Detalle reciente de justificantes antes de archivarlo. |
 | `INGESTA_CONTROL_ATTEMPT_DAYS` | 30 | Detalle operativo reciente de intentos. |
 | `INGESTA_CONTROL_ARCHIVE_DAYS` | 365 | Retención de intentos archivados, salvo referencias necesarias para incidencias pendientes. |
+| `INGESTA_CONTROL_ARCHIVE_COMPRESSION_LEVEL` | 1 | Compresión gzip de auditoría, entre 1 y 9; prioriza la velocidad del mantenimiento. La identidad y verificación se calculan sobre el contenido canónico, independientemente del nivel. |
 | `INGESTA_CONTROL_RETRIES` | 5 | Reintentos tras el intento inicial; no se reinicia el contador al recrear el contenedor. |
 | `INGESTA_CONTROL_FREE_RESERVE_BYTES` | 1073741824 | Reserva mínima de disco durante la reconstrucción, revisada por bloques. |
 
