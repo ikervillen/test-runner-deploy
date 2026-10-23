@@ -244,9 +244,16 @@ class Control:
     ) -> None:
         with self.db:
             if create_batch:
+                from .compact_control import blocked_manifest
+
                 self.db.execute(
                     "INSERT OR IGNORE INTO batches VALUES(?, ?, 'BLOCKED', ?, ?, NULL, NULL)",
-                    (batch_id, digest([batch_id, "rejected"]), canonical(prepared), now()),
+                    (
+                        batch_id,
+                        digest([batch_id, "rejected"]),
+                        canonical(blocked_manifest(prepared) if self.compact else prepared),
+                        now(),
+                    ),
                 )
             for issue in issues:
                 semantic = {k: v for k, v in issue.items() if k != "evidence"}

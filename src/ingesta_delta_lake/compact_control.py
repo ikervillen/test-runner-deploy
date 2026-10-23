@@ -132,6 +132,13 @@ def initialize(db):
     """)
 
 
+def blocked_manifest(document):
+    result = summary(document)
+    result.pop(RECEIPT_KEY)
+    result["$control_blocked"] = FORMAT
+    return result
+
+
 def finalize(control, batch_id):
     """After queue acknowledgement, atomically retire confirmed recovery detail."""
     db = control.db
