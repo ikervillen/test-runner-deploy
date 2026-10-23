@@ -1,20 +1,20 @@
 # Plan de reformulación de la arquitectura de datos y del control de ingesta
 
 Fecha: 23 de octubre de 2026.  
-Estado: planificación; implementación, migración, GitHub y despliegue pendientes.  
+Estado: protocolo de control formato 3 implementado y validado en CI; despliegue y aceptación remota en curso.  
 Ámbito: ingesta Fenix, Raw/Bronze, Silver, controles, recuperación, auditoría y proyecciones de supervisión.
 
 ## 1. Objetivo y relación con los planes existentes
 
 Reducir la redundancia y el crecimiento de los controles conservando idempotencia, recuperación ante fallos, trazabilidad y resolución autorizada de contradicciones. Aplicar los principios de Auto Loader, Structured Streaming y Delta Lake mediante nuestra implementación Python/delta-rs, sin depender de la plataforma Databricks.
 
-Este documento complementa [el plan del Delta Lake](PLAN_DELTA_LAKE.md) y [el plan de supervisión](../../Supervision_Pruebas/docs/PLAN_SUPERVISION_INGESTA.md). La copia publicada de `PLAN_DELTA_LAKE.md` mantiene su fuente de edición indicada en su cabecera; este documento es un plan específico nuevo y no modifica aquella copia ni su fuente.
+Este documento complementa [el plan del Delta Lake](PLAN_DELTA_LAKE.md) y [el plan de supervisión](https://github.com/ikervillen/supervision_pruebas/blob/main/docs/PLAN_SUPERVISION_INGESTA.md). La copia publicada de `PLAN_DELTA_LAKE.md` mantiene su fuente de edición indicada en su cabecera; este documento es un plan específico nuevo y no modifica aquella copia ni su fuente.
 
 Los contratos de negocio vigentes siguen siendo aplicables: columnas, tipados, claves compuestas, estados y cierres permitidos, reglas de agregación MIA, rendimiento ZC, producciones, asociaciones temporales y decisiones de revisión. No resolver automáticamente asuntos de negocio pendientes como ZF_OK ni reinterpretar registros para facilitar la migración.
 
 Cuando este plan se implemente y valide, sustituirá la conservación indefinida de documentos completos y fotografías repetidas en los controles por el protocolo descrito aquí. La compresión y compactación existentes son antecedentes; no demuestran que este rediseño esté implementado o desplegado.
 
-Crear este documento no autoriza ejecutar la migración, detener procesos, borrar controles, publicar código o desplegar contenedores. La implementación comenzará cuando el usuario lo indique y se realizará por entregas y PR pequeños.
+La ejecución fue autorizada expresamente el 23 de octubre de 2026: entregas pequeñas, publicación en GitHub y despliegue posterior. La implementación se ha dividido en PR por responsabilidad. El procedimiento operativo está en [CONTROL_V3_OPERACION.md](CONTROL_V3_OPERACION.md); la actualización ordinaria de una imagen sigue sin autorizar migraciones implícitas ni borrados de datos.
 
 ## 2. Diagnóstico y principios
 
@@ -275,20 +275,28 @@ Cada entrega termina en un resultado revisable, pruebas pertinentes y actualizac
 
 ## 8. Seguimiento
 
-| Entrega | Estado inicial | Evidencia necesaria para cerrarla |
+| Entrega | Estado a 23/10/2026 | Evidencia y aceptación |
 | --- | --- | --- |
-| 0. Inventario | Pendiente | Diagnóstico, mapa de consumidores y línea base. |
-| 1. Contrato | Pendiente | Esquema/versionado/transiciones probados. |
-| 2. Capturas y referencias | Pendiente | Replay y recuperación de captura/preparación. |
-| 3. Escritura y recuperación | Pendiente | Matriz de fallos y commits sin duplicación. |
-| 4. LISTA_RECH | Pendiente | Equivalencia e índice reconstruible. |
-| 5. Retención | Pendiente | Archivo y limpieza interrumpibles sin pérdida. |
-| 6. Migración aislada | Pendiente | Conciliación real y mediciones de recursos. |
-| 7. Piloto | Pendiente de implementación y autorización | Informe remoto y retorno probado. |
-| 8. Resto de fuentes | Pendiente | Aceptación por contrato/consumidor. |
-| 9. Supervisión y cierre | Pendiente | Alertas y observación sostenida documentadas. |
+| 0. Inventario | Implementado; línea base remota obtenida | Actions `39932107210`; LISTA_RECH 13.542.998.016 bytes antes del cambio. |
+| 1. Contrato | Implementado y CI superada | Compatibilidad explícita 2/3, referencias verificadas, justificantes y protección frente a downgrade. |
+| 2. Capturas y referencias | Implementado y CI superada | Preparación comprimida por referencia, fragmentos CSV completos, confirmación durable padre/hijos y colas indexadas. |
+| 3. Escritura y recuperación | Implementado y CI superada | Transacciones de aplicación, identidad persistente, pruebas de respuesta perdida y replay. |
+| 4. LISTA_RECH | Implementado y CI superada; aceptación real en curso | Índice actual mínimo, reconstrucción desde Silver con lectura por bloques y conciliación de grupos. |
+| 5. Retención | Implementado y CI superada | Archivo verificado antes de retirar detalle, conservación de referencias y fallos de mantenimiento visibles. |
+| 6. Migración aislada | Código y prueba Docker en CI completados; ensayo real pendiente | Volumen operativo de solo lectura y destino separado; informes por familia. |
+| 7. Piloto | Release consolidada publicada en develop; ejecución remota en curso | Imagen exacta de `12daa0f2be43dd21da0aa0ea1d3da3210730c45a`; conservar backups hasta comprobar la continuidad. |
+| 8. Resto de fuentes | Implementado y CI superada; conciliación remota en curso | Adaptadores de origen y tablas derivadas conservan sus contratos de negocio y revisiones. |
+| 9. Supervisión y cierre | Exportaciones implementadas; integración de alertas validada en PR separado | PR 8 de supervisión; aceptación remota y observación sostenida pendientes. |
 
 Actualizar esta tabla con fechas, revisiones y resultados verificables; distinguir código escrito, CI superada, migración ensayada y despliegue aceptado.
+
+### 8.1. Alcance efectivo de esta release
+
+- El formato 3 reduce el control operativo; no promete que índices actuales, identidades únicas o evidencias no crezcan.
+- La auditoría previa se conserva comprimida y verificable; no se elimina para aparentar una reducción mayor. Las cifras finales deben separar control activo, auditoría y copias antiguas.
+- Las capturas Bronze existentes mantienen su formato compatible. La compresión general de Raw y la activación de limpieza Delta no forman parte de la migración del control; las ventanas de la sección 5.5 siguen siendo propuestas hasta su validación específica.
+- La caducidad de temporales solo retira los artefactos reconocidos por el protocolo y sin referencias. No se aplica una purga general a carpetas de trabajo desconocidas.
+- La observación sostenida, las alertas de recursos del host y la restauración ante pérdida física del disco requieren evidencia adicional. Superar CI y reducir un SQLite no las demuestra por sí solo.
 
 ## 9. Referencias técnicas
 
