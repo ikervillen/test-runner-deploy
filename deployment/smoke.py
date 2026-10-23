@@ -15,6 +15,7 @@ def exercise(image):
     identity = uuid.uuid4().hex
     volume = "fenix-ci-" + identity
     records = []
+    trial_volumes = []
     with tempfile.TemporaryDirectory(prefix="fenix-ci-input-") as folder:
         Path(folder).chmod(0o755)  # El UID no privilegiado del contenedor solo necesita lectura.
         incoming = Path(folder) / "AV32"
@@ -72,6 +73,16 @@ def exercise(image):
             start(0)
             source.write_text("1;3081/360;1;\n2;3082/360;1;\n", encoding="utf-8")
             start(1)
+            current = records[-1]  # Already drained: test the real read-only mount.
+            trial_volume = docker.create_control_trial(current)
+            trial_volumes.append(trial_volume)
+            trial = docker.helper(
+                current,
+                ["trial-control", "--family", "SIP_MODELO", "--trial-root", "/trial"],
+                trial_volume=trial_volume,
+            )
+            assert trial["status"] == "ALREADY_FORMAT_3"
+            assert docker.helper(current, ["check"])["versions"]["SIP_MODELO"] == 1
             return {
                 "status": "PASSED",
                 "checks": [
@@ -81,6 +92,7 @@ def exercise(image):
                     "activation",
                     "sigterm-drain",
                     "persistent-update",
+                    "isolated-read-only-control-trial",
                 ],
             }
         finally:
@@ -91,6 +103,14 @@ def exercise(image):
             metadata = docker.json("volume", "inspect", volume)[0]
             if metadata.get("Labels", {}).get("es.fenix.ingesta.ci") == identity:
                 docker.call("volume", "rm", volume)
+            for trial_volume in trial_volumes:
+                metadata = docker.json("volume", "inspect", trial_volume)[0]
+                labels = metadata.get("Labels", {})
+                if (
+                    labels.get("fenix.instance") == identity
+                    and labels.get("fenix.purpose") == "control-trial"
+                ):
+                    docker.call("volume", "rm", trial_volume)
 
 
 if __name__ == "__main__":
