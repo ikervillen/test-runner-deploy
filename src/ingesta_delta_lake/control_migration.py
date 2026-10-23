@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import os
+import shutil
 
 from .common import IntegrityError, canonical, now
 from .compact_control import WORK_KEY, initialize, publish, summary
@@ -33,6 +35,10 @@ def migrate(source, target, config):
         else None
     )
     expectations, evidence, archives, references = {}, {}, {}, []
+    reserve = int(os.environ.get("INGESTA_CONTROL_FREE_RESERVE_BYTES", str(1024**3)))
+    if reserve < 64 * 1024**2:
+        raise IntegrityError("Migration disk reserve is too small")
+    visited = 0
     try:
         with target:
             for kind, name, sql in objects:
@@ -42,6 +48,23 @@ def migrate(source, target, config):
                 columns = [r[1] for r in source.execute(f'PRAGMA table_info("{name}")')]
                 expected, count = hashlib.sha256(), 0
                 for row in source.execute(f'SELECT * FROM "{name}" ORDER BY rowid'):
+                    if visited % 50000 == 0:
+                        if shutil.disk_usage(config.control_root).free < reserve:
+                            raise OSError(
+                                "Insufficient free space for recoverable control migration"
+                            )
+                        print(
+                            canonical(
+                                {
+                                    "event": "CONTROL_MIGRATION_PROGRESS",
+                                    "table": name,
+                                    "visited_rows": visited,
+                                }
+                            ),
+                            file=__import__("sys").stderr,
+                            flush=True,
+                        )
+                    visited += 1
                     values = list(row)
                     fields = dict(zip(columns, row, strict=True))
                     if name == "receipts" and queue:

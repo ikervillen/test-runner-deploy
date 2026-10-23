@@ -145,8 +145,45 @@ def replace_control(config, *, apply=False, remove_backup=False, reformulate=Fal
                     "SELECT count(*) FROM batches WHERE state IN ('PREPARED','WRITING','UNKNOWN')"
                 ).fetchone()[0],
                 "reformulate": reformulate,
+                "control_id": db.execute(
+                    "SELECT value FROM settings WHERE key='control_id'"
+                ).fetchone()[0],
             }
             if not apply:
+                return report
+            if (
+                reformulate
+                and db.execute(
+                    "SELECT 1 FROM settings WHERE key='control_format' AND value='3'"
+                ).fetchone()
+            ):
+                backup = path.with_name(path.name + ".before-compaction")
+                report.update(
+                    status="ALREADY_FORMAT_3",
+                    bytes_after=path.stat().st_size,
+                    backup=str(backup),
+                    backup_removed=False,
+                )
+                if remove_backup and backup.exists():
+                    proof = json.loads(
+                        path.with_name(path.name + ".compaction-report.json").read_text()
+                    )
+                    if (
+                        proof.get("control_id") != report["control_id"]
+                        or proof.get("tables", {}).get("format") != 3
+                        or proof.get("bytes_before") != backup.stat().st_size
+                    ):
+                        raise IntegrityError("Rollback copy does not match the verified migration")
+                    with closing(sqlite3.connect(backup.as_uri() + "?mode=ro", uri=True)) as old:
+                        if (
+                            dict(old.execute("SELECT key,value FROM settings")).get("control_id")
+                            != report["control_id"]
+                        ):
+                            raise IntegrityError("Rollback copy belongs to another control")
+                    _check(db, full=False)
+                    backup.unlink()
+                    _sync_directory(path.parent)
+                    report["backup_removed"] = True
                 return report
             # A clean checkpoint is necessary before retaining the old inode.
             if db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] != 0:

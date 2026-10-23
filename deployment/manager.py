@@ -167,9 +167,24 @@ class Docker:
         c = self.container(name)
         return bool(c and c["State"]["Running"])
 
-    def helper(self, record, command, *, readonly=True, root=False, timeout=900):
+    def helper(self, record, command, *, readonly=True, root=False, timeout=900, trial_volume=None):
+        if trial_volume:
+            if (
+                command[0] != "trial-control"
+                or not readonly
+                or root
+                or not re.fullmatch(
+                    re.escape(record["volume"]) + r"-trial-[a-f0-9]{12}", trial_volume
+                )
+            ):
+                raise ValueError("Invalid isolated trial mount")
+            record = {k: v for k, v in record.items() if k != "review_volumes"}
         args = ["--init", "--no-healthcheck", *common_args(record)]
-        name = "fenix-control-" + uuid.uuid4().hex if command[0] == "compact-control" else None
+        name = (
+            "fenix-control-" + uuid.uuid4().hex
+            if command[0] in {"compact-control", "trial-control"}
+            else None
+        )
         if name:
             args += ["--name", name]
         if root:
@@ -177,6 +192,8 @@ class Docker:
         mount = "type=volume,src=" + record["volume"] + ",dst=/lake"
         if readonly:
             mount += ",readonly"
+        if trial_volume:
+            args += ["--mount", "type=volume,src=" + trial_volume + ",dst=/trial"]
         try:
             result = self.call(
                 "run", "--rm", *args, "--mount", mount, record["image"], *command, timeout=timeout
@@ -196,6 +213,39 @@ class Docker:
                     ) from exc
             raise
         return json.loads(result)
+
+    def create_control_trial(self, record):
+        volume = record["volume"] + "-trial-" + uuid.uuid4().hex[:12]
+        self.call(
+            "volume",
+            "create",
+            "--label",
+            "fenix.purpose=control-trial",
+            "--label",
+            "fenix.instance=" + record["instance"],
+            volume,
+        )
+        isolated = {k: v for k, v in record.items() if k != "review_volumes"}
+        self.call(
+            "run",
+            "--rm",
+            "--init",
+            "--no-healthcheck",
+            *common_args(isolated),
+            "--user",
+            "0:0",
+            "--cap-add",
+            "CHOWN",
+            "--entrypoint",
+            "python",
+            "--mount",
+            "type=volume,src=" + volume + ",dst=/trial",
+            record["image"],
+            "-c",
+            "import os;os.chown('/trial',10001,10001)",
+            timeout=60,
+        )
+        return volume
 
     def ready(self, record, timeout=120):
         deadline = time.monotonic() + timeout
