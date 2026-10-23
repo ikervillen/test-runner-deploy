@@ -281,12 +281,12 @@ Cada entrega termina en un resultado revisable, pruebas pertinentes y actualizac
 | 1. Contrato | Implementado y CI superada | Compatibilidad explícita 2/3, referencias verificadas, justificantes y protección frente a downgrade. |
 | 2. Capturas y referencias | Implementado y CI superada | Preparación comprimida por referencia, fragmentos CSV completos, confirmación durable padre/hijos y colas indexadas. |
 | 3. Escritura y recuperación | Implementado y CI superada | Transacciones de aplicación, identidad persistente, pruebas de respuesta perdida y replay. |
-| 4. LISTA_RECH | Implementado y CI superada; aceptación real en curso | Índice actual mínimo, reconstrucción desde Silver con lectura por bloques y conciliación de grupos. |
+| 4. LISTA_RECH | Implementado, CI y conversión real superadas | Control activo de 13.585.952.768 a 270.761.984 bytes; índice actual mínimo y conciliación de grupos. |
 | 5. Retención | Implementado y CI superada | Archivo verificado antes de retirar detalle, conservación de referencias y fallos de mantenimiento visibles. |
-| 6. Migración aislada | Código y prueba Docker en CI completados; ensayo real pendiente | Volumen operativo de solo lectura y destino separado; informes por familia. |
-| 7. Piloto | Release consolidada publicada en develop; ejecución remota en curso | Imagen exacta de `12daa0f2be43dd21da0aa0ea1d3da3210730c45a`; conservar backups hasta comprobar la continuidad. |
-| 8. Resto de fuentes | Implementado y CI superada; conciliación remota en curso | Adaptadores de origen y tablas derivadas conservan sus contratos de negocio y revisiones. |
-| 9. Supervisión y cierre | Exportaciones implementadas; integración de alertas validada en PR separado | PR 8 de supervisión; aceptación remota y observación sostenida pendientes. |
+| 6. Migración aislada | Ensayo real aprobado para las 13 familias | Actions `39943804363`, `TRIAL_VERIFIED`; origen de solo lectura, cero cambios SQL y cero diferencias de versión Delta en la ventana detenida. |
+| 7. Piloto | Conversión, despliegue y retirada verificada de copias completados | Actions `39959812916`, `39961708764` y `39968426775`; revisión `6b155cd496a1abafba267fb877d6169d7524bb3c`, 13 copias retiradas y escritor reanudado. |
+| 8. Resto de fuentes | Implementado, CI y conversión real superadas | 13 controles conciliados, cero operaciones pendientes en la comprobación final; contratos y revisiones conservados. |
+| 9. Supervisión y cierre | Supervisión desplegada y validada; aceptación global de almacenamiento abierta | Actions `39969668115` (`PASSED`). Pendiente incluir `association-artifacts` en inventario/retención: el usuario comunica más de 30 GB y el código conserva snapshots completos por publicación. Ver `RESULTADOS_CONTROL_V3.md`. |
 
 Actualizar esta tabla con fechas, revisiones y resultados verificables; distinguir código escrito, CI superada, migración ensayada y despliegue aceptado.
 
