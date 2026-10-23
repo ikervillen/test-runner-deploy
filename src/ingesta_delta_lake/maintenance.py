@@ -121,7 +121,7 @@ def _copy(source, target, config=None):
     return evidence
 
 
-def replace_control(config, *, apply=False, remove_backup=False):
+def replace_control(config, *, apply=False, remove_backup=False, reformulate=False):
     config.validate()
     path = config.control_path
     if not path.is_file():
@@ -144,6 +144,7 @@ def replace_control(config, *, apply=False, remove_backup=False):
                 "pending": db.execute(
                     "SELECT count(*) FROM batches WHERE state IN ('PREPARED','WRITING','UNKNOWN')"
                 ).fetchone()[0],
+                "reformulate": reformulate,
             }
             if not apply:
                 return report
@@ -166,7 +167,12 @@ def replace_control(config, *, apply=False, remove_backup=False):
                 with closing(sqlite3.connect(temporary)) as target:
                     _tune(target)
                     target.execute("PRAGMA synchronous=FULL")
-                    report["tables"] = _copy(source, target, config)
+                    if reformulate:
+                        from .control_migration import migrate
+
+                        report["tables"] = migrate(source, target, config)
+                    else:
+                        report["tables"] = _copy(source, target, config)
                 source.rollback()
             os.chmod(temporary, stat.S_IMODE(original_permissions.st_mode))
             if os.name != "nt":
@@ -212,6 +218,7 @@ def main(argv=None):
     parser.add_argument("--family", help="Required with --runtime; never autodiscover destinations")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--remove-backup", action="store_true")
+    parser.add_argument("--reformulate", action="store_true")
     args = parser.parse_args(argv)
     if args.runtime:
         from .runtime import marker, settings
@@ -224,7 +231,12 @@ def main(argv=None):
         config = load_config(args.config)
     print(
         json.dumps(
-            replace_control(config, apply=args.apply, remove_backup=args.remove_backup),
+            replace_control(
+                config,
+                apply=args.apply,
+                remove_backup=args.remove_backup,
+                reformulate=args.reformulate,
+            ),
             indent=2,
         )
     )
