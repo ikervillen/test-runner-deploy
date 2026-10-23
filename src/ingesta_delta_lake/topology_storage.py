@@ -41,6 +41,8 @@ class TopologyControl(Control):
         ]
 
     def prepare(self, batch_id, operation_id, prepared):
+        if self.prepare_compact(batch_id, operation_id, prepared):
+            return
         with self.db:
             self.db.execute(
                 "INSERT INTO batches VALUES(?,?,'PREPARED',?,?,NULL,NULL)",

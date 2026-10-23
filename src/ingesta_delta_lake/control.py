@@ -70,6 +70,15 @@ class Control:
             self.close()
             raise IntegrityError("El control pertenece a otra planta, rutas o contrato")
         self.control_id = self.setting("control_id")
+        self.compact = self.setting("control_format") == "3"
+        if self.setting("control_format") not in (None, "2", "3"):
+            self.close()
+            raise IntegrityError("Unsupported control format")
+        self.work_root = config.control_root / "work" / config.family / self.control_id
+        if self.compact:
+            from .compact_control import initialize as initialize_compact
+
+            initialize_compact(self.db)
         from .reviews import initialize
 
         initialize(self.db)
@@ -133,7 +142,17 @@ class Control:
         from .retention import compact_batch
         from .supervision_export import export
 
-        if result.get("batch_id"):
+        if self.compact and result["status"] != "FAILED":
+            from .compact_control import clean, finalize
+
+            for (batch_id,) in self.db.execute(
+                "SELECT b.batch_id FROM batches b LEFT JOIN compact_receipts r USING(batch_id) "
+                "WHERE r.batch_id IS NULL AND b.confirmed_at IS NOT NULL "
+                "AND b.state IN ('COMPLETED','PARTIAL') LIMIT 32"
+            ).fetchall():
+                finalize(self, batch_id)
+            clean(self)
+        elif result.get("batch_id"):
             try:
                 compact_batch(self.db, result["batch_id"])
             except Exception as exc:
@@ -181,6 +200,8 @@ class Control:
         ]
 
     def prepare(self, batch_id: str, operation_id: str, prepared: dict) -> None:
+        if self.prepare_compact(batch_id, operation_id, prepared):
+            return
         with self.db:
             self.db.execute(
                 "INSERT INTO batches VALUES(?, ?, 'PREPARED', ?, ?, NULL, NULL)",
@@ -265,4 +286,25 @@ class Control:
     def prepared(self, row: dict) -> dict:
         from .retention import payload
 
-        return payload(row["prepared_json"])
+        document = payload(row["prepared_json"])
+        from .compact_control import WORK_KEY, load
+
+        return load(self.work_root, document) if WORK_KEY in document else document
+
+    def prepare_compact(self, batch_id, operation_id, prepared):
+        """Shared pending protocol; subclasses retain their confirmation semantics."""
+        if not self.compact:
+            return False
+        from .compact_control import publish
+
+        reference = publish(self.work_root, prepared)
+        with self.db:
+            self.db.execute(
+                "INSERT INTO batches VALUES(?,?,'PREPARED',?,?,NULL,NULL)",
+                (batch_id, operation_id, canonical(reference), now()),
+            )
+            self.db.execute(
+                "INSERT INTO prepared_artifacts VALUES(?,?)",
+                (batch_id, reference["$control_work"]),
+            )
+        return True
