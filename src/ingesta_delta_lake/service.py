@@ -326,6 +326,15 @@ def run(config: Config, *, runtime_owner: bool = False, stop_requested=None) -> 
                 )
             )
             with closing(control_class(config)) as control:
+                from . import retry_control
+
+                if control.compact and runtime_owner:
+                    waiting = retry_control.ready(control)
+                    if waiting:
+                        from .supervision_export import export
+
+                        export(control, config, waiting)
+                        return waiting
                 attempt = control.start_attempt()
                 try:
                     from .reviews import process as process_reviews
@@ -342,8 +351,12 @@ def run(config: Config, *, runtime_owner: bool = False, stop_requested=None) -> 
                             else None
                         )
                 except Exception as exc:
+                    if control.compact:
+                        retry_control.failed(control, exc)
                     control.finish_attempt(attempt, {"status": "FAILED", "error": str(exc)})
                     raise
+                if control.compact:
+                    retry_control.succeeded(control)
                 control.finish_attempt(attempt, result)
                 return result
     except portalocker.exceptions.LockException as exc:

@@ -135,7 +135,8 @@ def export(control, config, result):
                 "stats": {
                     "last_attempt": {"finished_at": observed_at, "status": result["status"]},
                     "control_storage": {
-                        "payload_format": 2,
+                        "payload_format": 3 if control.compact else 2,
+                        "retry_state": json.loads(control.setting("retry_state") or "null"),
                         "bytes": config.control_path.stat().st_size,
                         "wal_bytes": (
                             config.control_path.with_name(config.control_path.name + "-wal")
