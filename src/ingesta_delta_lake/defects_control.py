@@ -265,10 +265,17 @@ class DefectsControl(Control):
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(version),),
             )
-            self.db.executemany(
-                "INSERT OR IGNORE INTO inspection_groups VALUES(?,?,?)",
-                [(batch_id, g["group_id"], canonical(g)) for g in prepared["inspection_groups"]],
-            )
+            if "read_scope" not in prepared:
+                # Legacy full snapshots are needed only for the initial migration.
+                # Scoped batches keep their audit in prepared_json and update the
+                # current index below; materializing it twice grows without limit.
+                self.db.executemany(
+                    "INSERT OR IGNORE INTO inspection_groups VALUES(?,?,?)",
+                    [
+                        (batch_id, g["group_id"], canonical(g))
+                        for g in prepared["inspection_groups"]
+                    ],
+                )
             if "read_scope" in prepared:
                 self.db.executemany(
                     "INSERT INTO inspection_current VALUES(?,?,?,?,?,?) "

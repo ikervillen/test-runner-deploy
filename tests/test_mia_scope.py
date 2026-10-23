@@ -32,7 +32,8 @@ def test_new_period_never_materializes_old_rows_and_totals_cover_both(mia):
     assert result["context_rows"] == 1
     assert result["published_rows"] == result["resolved_groups"] == 2
     assert result["resolved_inspection_total"] == 192
-    assert query(mia, "SELECT count(*) FROM inspection_groups") == [(2,)]
+    assert query(mia, "SELECT count(*) FROM inspection_groups") == [(0,)]
+    assert query(mia, "SELECT count(*) FROM inspection_current") == [(2,)]
     assert run(mia)["context_rows"] == 0
     assert DeltaTable(str(mia.table_path)).version() == 1
 
