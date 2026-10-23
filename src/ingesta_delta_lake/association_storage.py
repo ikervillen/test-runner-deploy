@@ -184,12 +184,18 @@ def verify_artifact(config, descriptor):
     path = Path(descriptor["path"]).resolve()
     if not path.is_relative_to(config.control_root):
         raise IntegrityError("Artefacto fuera de control")
-    with path.open("rb") as stream:
-        if hashlib.file_digest(stream, "sha256").hexdigest() != descriptor["sha256"]:
-            raise IntegrityError("Artefacto de asociación alterado")
-    with gzip.open(path, "rb") as stream:
-        if hashlib.file_digest(stream, "sha256").hexdigest() != descriptor["payload_hash"]:
-            raise IntegrityError("Payload de asociación alterado")
+    try:
+        with path.open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != descriptor["sha256"]:
+                raise IntegrityError("Artefacto de asociación alterado")
+        with gzip.open(path, "rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != descriptor["payload_hash"]:
+                raise IntegrityError("Payload de asociación alterado")
+    except FileNotFoundError:
+        replacement = resolve(config, descriptor)
+        if replacement == descriptor:
+            raise
+        return verify_artifact(config, replacement)
     return path
 
 
@@ -200,8 +206,17 @@ def read_artifact(config, descriptor):
     if descriptor.get("format") == FORMAT:
         return json.loads(b"".join(read_blocks(config, descriptor)))
     path = verify_artifact(config, descriptor)
-    with gzip.open(path, "rt", encoding="utf-8") as stream:
-        return json.load(stream)
+    replacement = resolve(config, descriptor)
+    if replacement.get("format") == FORMAT:
+        return read_artifact(config, replacement)
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as stream:
+            return json.load(stream)
+    except FileNotFoundError:
+        replacement = resolve(config, descriptor)
+        if replacement == descriptor:
+            raise
+        return read_artifact(config, replacement)
 
 
 def verify_artifacts(config, prepared):

@@ -7,7 +7,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [validate, diagnose, rollback, inspect, compact, trial, reformulate, rebuild-index]
+        options: [validate, diagnose, rollback, inspect, compact, trial, reformulate, rebuild-index, compact-associations]
         default: validate
         description: 'validate: CI/imagen; diagnose: Docker/montaje sin ingesta; rollback: release previa'
       remove_backup:
@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   control-maintenance:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop' && contains(fromJSON('["inspect","compact","trial","reformulate","rebuild-index"]'), inputs.operation)
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop' && contains(fromJSON('["inspect","compact","trial","reformulate","rebuild-index","compact-associations"]'), inputs.operation)
     uses: ./.github/workflows/maintenance.yml
     with:
       operation: ${{ inputs.operation }}

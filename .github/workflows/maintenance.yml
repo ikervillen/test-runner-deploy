@@ -12,7 +12,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, compact, trial, reformulate, rebuild-index]
+        options: [inspect, compact, trial, reformulate, rebuild-index, compact-associations]
         default: inspect
         required: true
       remove_backup:
@@ -25,7 +25,7 @@ jobs:
   maintenance:
     runs-on: [self-hosted, Windows, X64, fenix-ingesta]
     environment: develop
-    timeout-minutes: 90
+    timeout-minutes: ${{ inputs.operation == 'compact-associations' && 180 || 90 }}
     concurrency:
       group: ingesta-deploy-${{ github.repository }}-develop
       cancel-in-progress: false
