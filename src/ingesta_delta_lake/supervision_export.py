@@ -71,6 +71,7 @@ def export(control, config, result):
         try:
             control.db.execute("BEGIN")
             observed_at = now()
+            retry = json.loads(control.setting("retry_state") or "null")
             issues, size = [], 0
             for row in control.db.execute(
                 "SELECT issue_id,reason,status,first_seen,"
@@ -133,7 +134,19 @@ def export(control, config, result):
                 "observed_at": observed_at,
                 "issues": issues,
                 "stats": {
-                    "last_attempt": {"finished_at": observed_at, "status": result["status"]},
+                    "last_attempt": {
+                        "finished_at": retry["updated_at"] if retry else observed_at,
+                        "status": "FAILED" if retry else result["status"],
+                    },
+                    **(
+                        {
+                            "pending_versions": control.db.execute(
+                                "SELECT count(*) FROM pending_inputs"
+                            ).fetchone()[0]
+                        }
+                        if control.compact and config.family in {"LISTA_RECH", "LISTA_DEFECTOS"}
+                        else {}
+                    ),
                     "control_storage": {
                         "payload_format": 3 if control.compact else 2,
                         "retry_state": json.loads(control.setting("retry_state") or "null"),
