@@ -88,7 +88,12 @@ def process(
         if due:
             for origin, path, stamp in discover(config):
                 snapshot = capture(
-                    replace(config, max_file_bytes=min(config.max_file_bytes, MAX_FILE_BYTES)),
+                    replace(
+                        config,
+                        max_file_bytes=config.max_file_bytes
+                        if control.compact
+                        else min(config.max_file_bytes, MAX_FILE_BYTES),
+                    ),
                     origin,
                     path,
                     stamp,
@@ -102,7 +107,12 @@ def process(
                 control.receipts(attempt, [snapshot])
                 captured[(snapshot.origin, snapshot.sha256)] = snapshot
     consumed = control.consumed_inputs()
-    pending = [s for key, s in captured.items() if key not in consumed]
+    parents = set()
+    if control.compact:
+        from .input_fragments import expand
+
+        parents = expand(control, captured, max_file_bytes=MAX_FILE_BYTES)
+    pending = [s for key, s in captured.items() if key not in consumed and key not in parents]
     if any(s.size > MAX_FILE_BYTES for s in pending):
         raise IntegrityError("Captured MIA file exceeds 8 MiB; split-file support is required")
     # Export timestamps order versions, never determine production or sample time.

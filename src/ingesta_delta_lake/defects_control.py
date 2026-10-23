@@ -50,6 +50,14 @@ class DefectsControl(Control):
               status TEXT NOT NULL, inspected INTEGER, row_count INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS inspection_current_origin ON inspection_current(origin);
         """)
+        if self.compact:
+            self.db.executescript("""
+                CREATE TABLE IF NOT EXISTS input_fragments(
+                  origin TEXT NOT NULL,parent_sha TEXT NOT NULL,child_sha TEXT NOT NULL,
+                  PRIMARY KEY(origin,parent_sha,child_sha));
+                CREATE INDEX IF NOT EXISTS input_fragments_child
+                  ON input_fragments(origin,child_sha);
+            """)
         if self.setting("input_queue_migrated") is None:
             with self.db:
                 for (text,) in self.db.execute(
@@ -108,6 +116,24 @@ class DefectsControl(Control):
                 [(s.origin, s.sha256, batch_id) for s in snapshots],
             )
             if snapshots:
+                if self.compact:
+                    for snapshot in snapshots:
+                        parents = self.db.execute(
+                            "SELECT parent_sha FROM input_fragments WHERE origin=? AND child_sha=?",
+                            (snapshot.origin, snapshot.sha256),
+                        ).fetchall()
+                        for (parent,) in parents:
+                            remaining = self.db.execute(
+                                "SELECT 1 FROM input_fragments f WHERE origin=? AND parent_sha=? "
+                                "AND NOT EXISTS(SELECT 1 FROM consumed_inputs c "
+                                "WHERE c.origin=f.origin AND c.sha256=f.child_sha) LIMIT 1",
+                                (snapshot.origin, parent),
+                            ).fetchone()
+                            if not remaining:
+                                self.db.execute(
+                                    "INSERT OR IGNORE INTO consumed_inputs VALUES(?,?,?)",
+                                    (snapshot.origin, parent, batch_id),
+                                )
                 self.db.execute(
                     "INSERT INTO settings VALUES('last_mia_origin',?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
