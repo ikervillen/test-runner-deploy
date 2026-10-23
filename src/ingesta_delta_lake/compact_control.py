@@ -7,6 +7,7 @@ SQLite reference; a crash can leave an orphan, never a reference to partial data
 import gzip
 import hashlib
 import json
+import logging
 import os
 import re
 import tempfile
@@ -205,3 +206,31 @@ def clean_orphans(control, *, limit=32):
     if removed:
         sync_directory(control.work_root)
     return removed
+
+
+def settle(control, attempt, result):
+    """Maintenance failure is observable without undoing a verified business commit."""
+    try:
+        for (batch,) in control.db.execute(
+            "SELECT b.batch_id FROM batches b LEFT JOIN compact_receipts r USING(batch_id) "
+            "WHERE r.batch_id IS NULL AND b.confirmed_at IS NOT NULL "
+            "AND b.state IN ('COMPLETED','PARTIAL') LIMIT 32"
+        ).fetchall():
+            finalize(control, batch)
+        clean(control)
+        from .control_lifecycle import maintain
+
+        maintain(control, attempt, result)
+        with control.db:
+            control.db.execute("DELETE FROM settings WHERE key='control_maintenance_error'")
+    except Exception as exc:
+        control.db.rollback()
+        warning = {"at": now(), "error_type": type(exc).__name__}
+        with control.db:
+            control.db.execute(
+                "INSERT INTO settings VALUES('control_maintenance_error',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (canonical(warning),),
+            )
+        result["control_maintenance_warning"] = warning
+        logging.getLogger(__name__).warning("Control maintenance deferred: %s", type(exc).__name__)

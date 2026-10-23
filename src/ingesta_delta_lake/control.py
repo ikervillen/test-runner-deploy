@@ -15,6 +15,7 @@ class Control:
         self.config = config
         self.contract = config.contract
         self.intent_key = "id_modelo_fenix" if config.family == "SIP_MODELO" else "record_id"
+        new_control = not config.control_path.exists()
         self.db = sqlite3.connect(config.control_path, timeout=5)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -70,6 +71,9 @@ class Control:
             self.close()
             raise IntegrityError("El control pertenece a otra planta, rutas o contrato")
         self.control_id = self.setting("control_id")
+        if new_control and config.control_format == 3:
+            with self.db:
+                self.db.execute("INSERT INTO settings VALUES('control_format','3')")
         self.compact = self.setting("control_format") == "3"
         if self.setting("control_format") not in (None, "2", "3"):
             self.close()
@@ -143,18 +147,9 @@ class Control:
         from .supervision_export import export
 
         if self.compact and result["status"] != "FAILED":
-            from .compact_control import clean, finalize
+            from .compact_control import settle
 
-            for (batch_id,) in self.db.execute(
-                "SELECT b.batch_id FROM batches b LEFT JOIN compact_receipts r USING(batch_id) "
-                "WHERE r.batch_id IS NULL AND b.confirmed_at IS NOT NULL "
-                "AND b.state IN ('COMPLETED','PARTIAL') LIMIT 32"
-            ).fetchall():
-                finalize(self, batch_id)
-            clean(self)
-            from .control_lifecycle import maintain
-
-            maintain(self, attempt, result)
+            settle(self, attempt, result)
         elif result.get("batch_id"):
             try:
                 compact_batch(self.db, result["batch_id"])

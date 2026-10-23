@@ -32,6 +32,7 @@ class Config:
     line_code_by_origin: tuple[tuple[str, int], ...] = ()
     mia_batches_per_turn: int | None = None
     input_scan_interval_seconds: int = 0
+    control_format: int = 2
 
     @property
     def contract(self):
@@ -54,6 +55,8 @@ class Config:
         return self.control_root / filename
 
     def validate(self) -> None:
+        if type(self.control_format) is not int or self.control_format not in (2, 3):
+            raise ConfigurationError("control_format must be 2 or 3")
         _ = self.contract  # Rechazar familias no implementadas antes de crear destinos.
         if (
             type(self.input_scan_interval_seconds) is not int

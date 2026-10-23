@@ -137,6 +137,9 @@ def export(control, config, result):
                     "control_storage": {
                         "payload_format": 3 if control.compact else 2,
                         "retry_state": json.loads(control.setting("retry_state") or "null"),
+                        "maintenance_error": json.loads(
+                            control.setting("control_maintenance_error") or "null"
+                        ),
                         "bytes": config.control_path.stat().st_size,
                         "wal_bytes": (
                             config.control_path.with_name(config.control_path.name + "-wal")
@@ -149,6 +152,21 @@ def export(control, config, result):
                         ),
                         "page_count": control.db.execute("PRAGMA page_count").fetchone()[0],
                         "free_pages": control.db.execute("PRAGMA freelist_count").fetchone()[0],
+                    },
+                    "input_progress": {
+                        key: result[key]
+                        for key in (
+                            "remaining_versions",
+                            "pending_bytes",
+                            "pending_by_origin",
+                            "oldest_pending_received_at",
+                            "processed_versions",
+                            "input_scan_performed",
+                            "next_input_scan_at",
+                            "inserted_this_attempt",
+                            "published_rows",
+                        )
+                        if key in result
                     },
                 },
                 "publication": _publication(control, config),
