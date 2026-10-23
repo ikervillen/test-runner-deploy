@@ -3,9 +3,7 @@
 import gzip
 import hashlib
 import json
-import os
 import sqlite3
-import uuid
 from contextlib import closing
 from dataclasses import replace
 from datetime import datetime
@@ -170,51 +168,19 @@ def load_bundle(config):
 
 
 def artifact(config, payload):
-    root = config.control_root / "association-artifacts"
-    root.mkdir(parents=True, exist_ok=True)
-    temp = root / ("." + uuid.uuid4().hex + ".tmp")
-    payload_hash = hashlib.sha256()
-    encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    try:
-        with temp.open("xb") as f:
-            with gzip.GzipFile(filename="", fileobj=f, mode="wb", compresslevel=6, mtime=0) as out:
-                parts, size = [], 0
-                for text in encoder.iterencode(payload):
-                    parts.append(text)
-                    size += len(text)
-                    if size >= 65536:
-                        data = "".join(parts).encode("utf-8")
-                        payload_hash.update(data)
-                        out.write(data)
-                        parts, size = [], 0
-                if parts:
-                    data = "".join(parts).encode("utf-8")
-                    payload_hash.update(data)
-                    out.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        with temp.open("rb") as stream:
-            sha = hashlib.file_digest(stream, "sha256").hexdigest()
-        path = root / (sha + ".json.gz")
-        try:
-            os.link(temp, path)
-        except FileExistsError:
-            with path.open("rb") as stream:
-                if hashlib.file_digest(stream, "sha256").hexdigest() != sha:
-                    raise IntegrityError("Artefacto inmutable alterado") from None
-        if os.name != "nt":
-            for directory in (root, config.control_root):
-                handle = os.open(directory, os.O_RDONLY)
-                try:
-                    os.fsync(handle)
-                finally:
-                    os.close(handle)
-        return {"path": str(path), "sha256": sha, "payload_hash": payload_hash.hexdigest()}
-    finally:
-        temp.unlink(missing_ok=True)
+    from .association_cas import encoded, write
+
+    return write(config.control_root / "association-artifacts", encoded(payload))
 
 
 def verify_artifact(config, descriptor):
+    from .association_cas import FORMAT, read_blocks, resolve
+
+    descriptor = resolve(config, descriptor)
+    if descriptor.get("format") == FORMAT:
+        for _ in read_blocks(config, descriptor):
+            pass
+        return Path(descriptor["path"])
     path = Path(descriptor["path"]).resolve()
     if not path.is_relative_to(config.control_root):
         raise IntegrityError("Artefacto fuera de control")
@@ -228,6 +194,11 @@ def verify_artifact(config, descriptor):
 
 
 def read_artifact(config, descriptor):
+    from .association_cas import FORMAT, read_blocks, resolve
+
+    descriptor = resolve(config, descriptor)
+    if descriptor.get("format") == FORMAT:
+        return json.loads(b"".join(read_blocks(config, descriptor)))
     path = verify_artifact(config, descriptor)
     with gzip.open(path, "rt", encoding="utf-8") as stream:
         return json.load(stream)

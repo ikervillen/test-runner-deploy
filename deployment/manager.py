@@ -586,6 +586,10 @@ class Deployment:
             current_manifest = dict(manifest)
             prior_format = prior_manifest.pop("control_payload_format", 1)
             current_format = current_manifest.pop("control_payload_format", 1)
+            prior_artifacts = prior_manifest.pop("association_artifact_format", 1)
+            current_artifacts = current_manifest.pop("association_artifact_format", 1)
+            if current_artifacts < prior_artifacts:
+                raise RuntimeError("Association artifact downgrade is not supported")
             if old and (
                 prior_manifest != current_manifest
                 or (

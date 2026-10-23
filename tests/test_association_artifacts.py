@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from ingesta_delta_lake.association_cas import read_blocks
 from ingesta_delta_lake.association_storage import artifact, read_artifact, verify_artifacts
 from ingesta_delta_lake.common import IntegrityError, canonical, digest
 
@@ -14,7 +15,7 @@ def test_streamed_artifact_has_exact_canonical_payload_and_deterministic_identit
     value = {"texto": "Mañana · Σ", "rows": [{"b": None, "a": [2, 0.25, True]}] * 1200}
     descriptor = artifact(config, value)
     assert descriptor == artifact(config, value)
-    raw = gzip.decompress(Path(descriptor["path"]).read_bytes())
+    raw = b"".join(read_blocks(config, descriptor))
     assert raw == canonical(value).encode("utf-8")
     assert descriptor["payload_hash"] == digest(value)
     assert read_artifact(config, descriptor) == value
@@ -43,7 +44,15 @@ def test_verification_never_deserializes_or_reads_entire_file(config, monkeypatc
         raise AssertionError("Whole artifact materialized")
 
     monkeypatch.setattr(Path, "read_bytes", forbidden)
-    monkeypatch.setattr(json, "loads", forbidden)
+    original_loads = json.loads
+
+    def metadata_only(value, *args, **kwargs):
+        assert len(value) < 8192
+        document = original_loads(value, *args, **kwargs)
+        assert document["format"] == "association-cas-v1"
+        return document
+
+    monkeypatch.setattr(json, "loads", metadata_only)
     monkeypatch.setattr(json, "load", forbidden)
     verify_artifacts(config, {"artifacts": {"bundle": descriptor}})
 
@@ -62,7 +71,7 @@ def test_streamed_serialization_memory_is_independent_of_whole_payload(config):
 
 def test_existing_corruption_or_wrong_payload_hash_is_never_accepted(config):
     descriptor = artifact(config, {"a": 1})
-    with pytest.raises(IntegrityError, match="Payload"):
+    with pytest.raises(IntegrityError, match="identity|Payload"):
         verify_artifacts(
             config, {"artifacts": {"bundle": {**descriptor, "payload_hash": "0" * 64}}}
         )
@@ -80,4 +89,5 @@ def test_failure_before_publication_removes_partial_temp(config, monkeypatch):
     monkeypatch.setattr(os, "link", fail)
     with pytest.raises(OSError, match="disk failure"):
         artifact(config, {"rows": [1, 2]})
-    assert not list((config.control_root / "association-artifacts").iterdir())
+    assert not list((config.control_root / "association-artifacts").rglob("*.tmp"))
+    assert not list((config.control_root / "association-artifacts").rglob("*.gz"))
