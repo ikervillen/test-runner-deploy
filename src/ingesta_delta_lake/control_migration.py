@@ -1,6 +1,7 @@
 """Streaming format-3 shadow copy. Source remains untouched until verified swap."""
 
 import hashlib
+import json
 
 from .common import IntegrityError, canonical, now
 from .compact_control import WORK_KEY, initialize, publish, summary
@@ -23,6 +24,14 @@ def migrate(source, target, config):
         "AND name NOT LIKE 'sqlite_%' ORDER BY type='table' DESC,name"
     ).fetchall()
     groups = InspectionArchive(source, config)
+    table_names = {name for kind, name, _ in objects if kind == "table"}
+    queue = (
+        "input_versions"
+        if "input_versions" in table_names and settings.get("input_queue_migrated")
+        else "capture_cache"
+        if "capture_cache" in table_names and settings.get("capture_cache_seeded")
+        else None
+    )
     expectations, evidence, archives, references = {}, {}, {}, []
     try:
         with target:
@@ -35,6 +44,16 @@ def migrate(source, target, config):
                 for row in source.execute(f'SELECT * FROM "{name}" ORDER BY rowid'):
                     values = list(row)
                     fields = dict(zip(columns, row, strict=True))
+                    if name == "receipts" and queue:
+                        descriptor = json.loads(fields["descriptor_json"])
+                        if source.execute(
+                            f'SELECT 1 FROM "{queue}" WHERE origin=? AND sha256=?',
+                            (descriptor["origin"], descriptor["sha256"]),
+                        ).fetchone():
+                            if "capture_receipts" not in archives:
+                                archives["capture_receipts"] = Archive(root, "capture-receipts")
+                            archives["capture_receipts"].append(logical(row))
+                            continue
                     if name == "inspection_groups" and groups.omit(row):
                         # Exact hashes are checked against archived preparations.
                         continue

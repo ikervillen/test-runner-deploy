@@ -10,6 +10,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 
 from .common import IntegrityError, canonical, now
@@ -181,4 +182,26 @@ def clean(control, *, limit=32):
         with control.db:
             control.db.execute("DELETE FROM artifact_cleanup WHERE sha256=?", (sha,))
         removed += 1
+    return removed
+
+
+def clean_orphans(control, *, limit=32):
+    """Only owner-scoped, unreferenced artifacts after the recovery grace period."""
+    cutoff = time.time() - 24 * 3600
+    removed = 0
+    for path in control.work_root.glob("*.json.gz"):
+        if removed >= limit:
+            break
+        if path.is_symlink() or path.stat().st_mtime >= cutoff:
+            continue
+        sha = path.name.removesuffix(".json.gz")
+        if not re.fullmatch("[a-f0-9]{64}", sha):
+            continue
+        if control.db.execute("SELECT 1 FROM prepared_artifacts WHERE sha256=?", (sha,)).fetchone():
+            continue
+        load(control.work_root, {WORK_KEY: sha})  # Refuse unknown/corrupted material.
+        artifact(control.work_root, {WORK_KEY: sha}).unlink()
+        removed += 1
+    if removed:
+        sync_directory(control.work_root)
     return removed
