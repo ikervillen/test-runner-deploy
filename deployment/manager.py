@@ -538,7 +538,10 @@ class Deployment:
             current_format = current_manifest.pop("control_payload_format", 1)
             if old and (
                 prior_manifest != current_manifest
-                or (prior_format != current_format and (prior_format, current_format) != (1, 2))
+                or (
+                    prior_format != current_format
+                    and (prior_format, current_format) not in {(1, 2), (1, 3), (2, 3)}
+                )
             ):
                 raise RuntimeError(
                     "Contratos/protocolo incompatibles; exige migración independiente"

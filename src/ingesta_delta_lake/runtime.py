@@ -42,7 +42,7 @@ def describe():
 
     return {
         "deployment_protocol": PROTOCOL,
-        "control_payload_format": 2,
+        "control_payload_format": 3,
         "data_policy": POLICY,
         "contracts": {f: {"name": c.name, "schema": str(c.schema)} for f, c in CONTRACTS.items()},
         "assignment_rule": RULE,
@@ -353,6 +353,7 @@ def main(argv=None):
     parser.add_argument("--family", choices=ORDER)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--remove-backup", action="store_true")
+    parser.add_argument("--reformulate", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "describe":
@@ -373,6 +374,7 @@ def main(argv=None):
                 replace(settings()[2], family=args.family),
                 apply=args.apply,
                 remove_backup=args.remove_backup,
+                reformulate=args.reformulate,
             )
         elif args.command == "worker":
             result = worker(args.interval)

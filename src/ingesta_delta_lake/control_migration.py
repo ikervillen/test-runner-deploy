@@ -1,0 +1,103 @@
+"""Streaming format-3 shadow copy. Source remains untouched until verified swap."""
+
+import hashlib
+
+from .common import IntegrityError, canonical, now
+from .compact_control import WORK_KEY, initialize, publish, summary
+from .control_archive import Archive, logical
+from .inspection_retention import InspectionArchive
+from .retention import payload
+
+
+def migrate(source, target, config):
+    from .maintenance import _check, _hash_row, _row_hash
+
+    settings = dict(source.execute("SELECT key,value FROM settings"))
+    if settings.get("control_format") == "3":
+        raise IntegrityError("Control already uses format 3")
+    identity = settings["control_id"]
+    root = config.control_root / "audit" / config.family / identity
+    work = config.control_root / "work" / config.family / identity
+    objects = source.execute(
+        "SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL "
+        "AND name NOT LIKE 'sqlite_%' ORDER BY type='table' DESC,name"
+    ).fetchall()
+    groups = InspectionArchive(source, config)
+    expectations, evidence, archives, references = {}, {}, {}, []
+    try:
+        with target:
+            for kind, name, sql in objects:
+                if kind != "table":
+                    continue
+                target.execute(sql)
+                columns = [r[1] for r in source.execute(f'PRAGMA table_info("{name}")')]
+                expected, count = hashlib.sha256(), 0
+                for row in source.execute(f'SELECT * FROM "{name}" ORDER BY rowid'):
+                    values = list(row)
+                    fields = dict(zip(columns, row, strict=True))
+                    if name == "inspection_groups" and groups.omit(row):
+                        # Exact hashes are checked against archived preparations.
+                        continue
+                    if name.endswith("_intents") and fields.get("state") == "CONFIRMED":
+                        archive = archives.setdefault(name, None)
+                        if archive is None:
+                            archive = archives[name] = Archive(root, name)
+                        archive.append(logical(row))
+                        continue
+                    if name == "batches":
+                        document = payload(fields["prepared_json"])
+                        if fields["confirmed_at"] and fields["state"] in {"COMPLETED", "PARTIAL"}:
+                            archive = archives.get("legacy_preparations")
+                            if archive is None:
+                                archive = archives["legacy_preparations"] = Archive(root, "legacy")
+                            archive.append({"batch_id": fields["batch_id"], "prepared": document})
+                            document = summary(document)
+                            document["legacy_audit"] = True
+                        elif fields["state"] in {"PREPARED", "WRITING", "UNKNOWN"}:
+                            document = publish(work, document)
+                            references.append((fields["batch_id"], document[WORK_KEY]))
+                        values[columns.index("prepared_json")] = canonical(document)
+                    _hash_row(expected, values)
+                    count += 1
+                    target.execute(
+                        f'INSERT INTO "{name}" VALUES({",".join("?" for _ in columns)})', values
+                    )
+                expectations[name] = count, expected.hexdigest()
+            for kind, _, sql in objects:
+                if kind != "table":
+                    target.execute(sql)
+        evidence["inspection_groups"] = groups.verify()
+        for name, archive in archives.items():
+            evidence[name] = archive.finish()
+        for name, expected in expectations.items():
+            observed = _row_hash(target.execute(f'SELECT * FROM "{name}" ORDER BY rowid'))
+            if observed != expected:
+                raise IntegrityError("Migrated contents differ: " + name)
+        initialize(target)
+        with target:
+            target.executemany("INSERT INTO prepared_artifacts VALUES(?,?)", references)
+            target.execute(
+                "INSERT INTO compact_receipts SELECT batch_id,confirmed_at,prepared_json "
+                "FROM batches WHERE confirmed_at IS NOT NULL AND state IN ('COMPLETED','PARTIAL')"
+            )
+            for key, value in (
+                ("control_format", "3"),
+                ("control_migrated_at", now()),
+                ("legacy_audit", canonical(evidence)),
+            ):
+                target.execute(
+                    "INSERT INTO settings VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, value),
+                )
+        _check(target)
+        return {
+            "format": 3,
+            "tables": {k: {"rows": v[0], "sha256": v[1]} for k, v in expectations.items()},
+            "audit": evidence,
+            "pending_artifacts": len(references),
+        }
+    except BaseException:
+        for archive in archives.values():
+            archive.abort()
+        raise
