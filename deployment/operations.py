@@ -54,10 +54,19 @@ def execute(site, operation, report_path, *, remove_backup=False):
             return report
         if active["manifest"].get("control_payload_format", 1) < 2:
             raise RuntimeError("Deploy a tested format-2 image before compacting controls")
+        if (
+            operation in {"trial", "reformulate"}
+            and active["manifest"].get("control_payload_format", 1) < 3
+        ):
+            raise RuntimeError("Deploy a tested format-3 image before reformulating controls")
         safe_to_resume = True
         try:
             docker.drain(active, site["drain_seconds"])
             checked = docker.helper(active, ["check"])
+            trial_volume = docker.create_control_trial(active) if operation == "trial" else None
+            if trial_volume:
+                report["trial_volume"] = trial_volume
+                save(report_path, report)
             for family in checked["versions"]:
                 filename = (
                     "control.sqlite"
@@ -66,14 +75,28 @@ def execute(site, operation, report_path, *, remove_backup=False):
                 )
                 if filename not in {r["name"] for r in report["before"]["controls"]}:
                     continue
+                if operation == "trial":
+                    result = docker.helper(
+                        active,
+                        ["trial-control", "--family", family, "--trial-root", "/trial"],
+                        trial_volume=trial_volume,
+                        timeout=3600,
+                    )
+                    report["controls"].append({"family": family, **result})
+                    save(report_path, report)
+                    continue
                 command = ["compact-control", "--family", family, "--apply"]
+                if operation == "reformulate":
+                    command.append("--reformulate")
                 if remove_backup:
                     command.append("--remove-backup")
                 result = docker.helper(active, command, readonly=False, timeout=3600)
                 report["controls"].append({"family": family, **result})
                 save(report_path, report)
             report["verification"] = docker.helper(active, ["check"])
-            report["status"] = "COMPACTED"
+            report["status"] = {"trial": "TRIAL_VERIFIED", "reformulate": "REFORMULATED"}.get(
+                operation, "COMPACTED"
+            )
         except Exception as exc:
             safe_to_resume = not isinstance(exc, MaintenanceStillRunning)
             report.update(status="FAILED", error=str(exc))
@@ -93,7 +116,9 @@ def execute(site, operation, report_path, *, remove_backup=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--site", type=Path, required=True)
-    parser.add_argument("--operation", choices=["inspect", "compact"], required=True)
+    parser.add_argument(
+        "--operation", choices=["inspect", "compact", "trial", "reformulate"], required=True
+    )
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--remove-backup", action="store_true")
     args = parser.parse_args()

@@ -128,8 +128,16 @@ def maintain(control, attempt, result):
                 for batch in batch_ids
             ):
                 continue
-            list(read(root(control, "attempts"), receipt))
-            (root(control, "attempts") / filename).unlink(missing_ok=True)
+            path = root(control, "attempts") / filename
+            if (
+                path.name != filename
+                or path.resolve().parent != root(control, "attempts").resolve()
+                or path.is_symlink()
+            ):
+                raise IntegrityError("Expired archive escapes its control")
+            if path.exists():
+                list(read(root(control, "attempts"), receipt))
+                path.unlink()
             with db:
                 db.execute("DELETE FROM attempt_archives WHERE file=?", (filename,))
     with db:
