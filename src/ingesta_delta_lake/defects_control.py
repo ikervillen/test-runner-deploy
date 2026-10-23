@@ -65,10 +65,11 @@ class DefectsControl(Control):
     def receipts(self, attempt, snapshots):
         # Capture acknowledgement and enqueue are one durable SQLite transaction.
         with self.db:
-            self.db.executemany(
-                "INSERT INTO receipts VALUES(?,?,?)",
-                [(attempt, s.source_path, canonical(s.descriptor())) for s in snapshots],
-            )
+            if not self.compact:
+                self.db.executemany(
+                    "INSERT INTO receipts VALUES(?,?,?)",
+                    [(attempt, s.source_path, canonical(s.descriptor())) for s in snapshots],
+                )
             self.db.executemany(
                 "INSERT OR IGNORE INTO input_versions VALUES(?,?,?)",
                 [(s.origin, s.sha256, canonical(s.descriptor())) for s in snapshots],

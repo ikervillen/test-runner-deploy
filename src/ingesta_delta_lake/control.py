@@ -152,6 +152,9 @@ class Control:
             ).fetchall():
                 finalize(self, batch_id)
             clean(self)
+            from .control_lifecycle import maintain
+
+            maintain(self, attempt, result)
         elif result.get("batch_id"):
             try:
                 compact_batch(self.db, result["batch_id"])
@@ -168,10 +171,11 @@ class Control:
 
     def receipts(self, attempt: str, snapshots: list[Snapshot]) -> None:
         with self.db:
-            self.db.executemany(
-                "INSERT INTO receipts VALUES(?, ?, ?)",
-                [(attempt, s.source_path, canonical(s.descriptor())) for s in snapshots],
-            )
+            if not self.compact:
+                self.db.executemany(
+                    "INSERT INTO receipts VALUES(?, ?, ?)",
+                    [(attempt, s.source_path, canonical(s.descriptor())) for s in snapshots],
+                )
             if self.capture_cached:
                 self.db.executemany(
                     "INSERT OR IGNORE INTO capture_cache VALUES(?,?,?,0)",
@@ -288,8 +292,13 @@ class Control:
 
         document = payload(row["prepared_json"])
         from .compact_control import WORK_KEY, load
+        from .control_lifecycle import archived_receipt
 
-        return load(self.work_root, document) if WORK_KEY in document else document
+        if WORK_KEY in document:
+            return load(self.work_root, document)
+        if "$receipt_archive" in document:
+            return archived_receipt(self, row["batch_id"], document)
+        return document
 
     def prepare_compact(self, batch_id, operation_id, prepared):
         """Shared pending protocol; subclasses retain their confirmation semantics."""
