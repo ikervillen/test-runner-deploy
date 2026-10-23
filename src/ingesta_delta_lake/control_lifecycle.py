@@ -52,7 +52,8 @@ def maintain(control, attempt, result):
     clean_orphans(control)
     cutoff = (clock - timedelta(days=days("RECEIPT", 90))).isoformat()
     receipts = db.execute(
-        "SELECT batch_id,payload_json FROM compact_receipts WHERE verified_at<? "
+        "SELECT batch_id,payload_json FROM compact_receipts "
+        "WHERE julianday(verified_at)<julianday(?) "
         "AND json_extract(payload_json,'$.\"$receipt_archive\"') IS NULL LIMIT ?",
         (cutoff, LIMIT),
     ).fetchall()
@@ -76,7 +77,7 @@ def maintain(control, attempt, result):
             raise
     cutoff = (clock - timedelta(days=days("ATTEMPT", 30))).isoformat()
     attempts = db.execute(
-        "SELECT * FROM attempts a WHERE finished_at<? AND status!='RUNNING' "
+        "SELECT * FROM attempts a WHERE julianday(finished_at)<julianday(?) AND status!='RUNNING' "
         "AND NOT EXISTS(SELECT 1 FROM receipts r WHERE r.attempt_id=a.attempt_id) "
         "AND NOT EXISTS(SELECT 1 FROM batches b WHERE b.batch_id=a.batch_id "
         "AND b.state IN ('PREPARED','WRITING','UNKNOWN','BLOCKED')) LIMIT ?",

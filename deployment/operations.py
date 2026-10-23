@@ -55,7 +55,7 @@ def execute(site, operation, report_path, *, remove_backup=False):
         if active["manifest"].get("control_payload_format", 1) < 2:
             raise RuntimeError("Deploy a tested format-2 image before compacting controls")
         if (
-            operation in {"trial", "reformulate"}
+            operation in {"trial", "reformulate", "rebuild-index"}
             and active["manifest"].get("control_payload_format", 1) < 3
         ):
             raise RuntimeError("Deploy a tested format-3 image before reformulating controls")
@@ -68,6 +68,8 @@ def execute(site, operation, report_path, *, remove_backup=False):
                 report["trial_volume"] = trial_volume
                 save(report_path, report)
             for family in checked["versions"]:
+                if operation == "rebuild-index" and family not in {"LISTA_RECH", "LISTA_DEFECTOS"}:
+                    continue
                 filename = (
                     "control.sqlite"
                     if family == "SIP_MODELO"
@@ -85,6 +87,13 @@ def execute(site, operation, report_path, *, remove_backup=False):
                     report["controls"].append({"family": family, **result})
                     save(report_path, report)
                     continue
+                if operation == "rebuild-index":
+                    result = docker.helper(
+                        active, ["rebuild-index", "--family", family], readonly=False, timeout=3600
+                    )
+                    report["controls"].append({"family": family, **result})
+                    save(report_path, report)
+                    continue
                 command = ["compact-control", "--family", family, "--apply"]
                 if operation == "reformulate":
                     command.append("--reformulate")
@@ -94,9 +103,11 @@ def execute(site, operation, report_path, *, remove_backup=False):
                 report["controls"].append({"family": family, **result})
                 save(report_path, report)
             report["verification"] = docker.helper(active, ["check"])
-            report["status"] = {"trial": "TRIAL_VERIFIED", "reformulate": "REFORMULATED"}.get(
-                operation, "COMPACTED"
-            )
+            report["status"] = {
+                "trial": "TRIAL_VERIFIED",
+                "reformulate": "REFORMULATED",
+                "rebuild-index": "INDEX_REBUILT",
+            }.get(operation, "COMPACTED")
         except Exception as exc:
             safe_to_resume = not isinstance(exc, MaintenanceStillRunning)
             report.update(status="FAILED", error=str(exc))
@@ -117,7 +128,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--site", type=Path, required=True)
     parser.add_argument(
-        "--operation", choices=["inspect", "compact", "trial", "reformulate"], required=True
+        "--operation",
+        choices=["inspect", "compact", "trial", "reformulate", "rebuild-index"],
+        required=True,
     )
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--remove-backup", action="store_true")

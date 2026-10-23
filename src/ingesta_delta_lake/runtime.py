@@ -349,6 +349,7 @@ def main(argv=None):
             "compact-control",
             "trial-control",
             "inventory-control",
+            "rebuild-index",
         ],
     )
     parser.add_argument("--allow-pending", action="store_true")
@@ -380,12 +381,16 @@ def main(argv=None):
                 remove_backup=args.remove_backup,
                 reformulate=args.reformulate,
             )
-        elif args.command in {"trial-control", "inventory-control"}:
+        elif args.command in {"trial-control", "inventory-control", "rebuild-index"}:
             marker()
             if not args.family:
                 raise ConfigurationError("Control inspection requires --family")
             config = replace(settings()[2], family=args.family)
-            if args.command == "inventory-control":
+            if args.command == "rebuild-index":
+                from .inspection_index import execute
+
+                result = execute(config)
+            elif args.command == "inventory-control":
                 from .control_inventory import inventory
 
                 result = inventory(config.control_path)

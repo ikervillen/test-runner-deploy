@@ -12,7 +12,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, compact, trial, reformulate]
+        options: [inspect, compact, trial, reformulate, rebuild-index]
         default: inspect
         required: true
       remove_backup:
