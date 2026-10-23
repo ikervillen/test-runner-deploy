@@ -51,6 +51,7 @@ def self_test():
             control_root=root / "control",
             sources=(("AV32", incoming),),
             encoding="utf-8",
+            control_format=3,
             stable_wait_seconds=0.01,
             topology_enabled=True,
             timestamp_policy="local_naive_test_v1",

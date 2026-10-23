@@ -76,6 +76,7 @@ def settings():
         sources=tuple((o, (Path("/input") / p).resolve()) for o, p in value["sources"].items()),
         encoding=value["encoding"],
         environment="development",
+        control_format=3,
         topology_enabled=True,
         mia_batches_per_turn=1,
         input_scan_interval_seconds=600,
@@ -346,6 +347,8 @@ def main(argv=None):
             "activate",
             "self-test",
             "compact-control",
+            "trial-control",
+            "inventory-control",
         ],
     )
     parser.add_argument("--allow-pending", action="store_true")
@@ -354,6 +357,7 @@ def main(argv=None):
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--remove-backup", action="store_true")
     parser.add_argument("--reformulate", action="store_true")
+    parser.add_argument("--trial-root", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.command == "describe":
@@ -376,6 +380,21 @@ def main(argv=None):
                 remove_backup=args.remove_backup,
                 reformulate=args.reformulate,
             )
+        elif args.command in {"trial-control", "inventory-control"}:
+            marker()
+            if not args.family:
+                raise ConfigurationError("Control inspection requires --family")
+            config = replace(settings()[2], family=args.family)
+            if args.command == "inventory-control":
+                from .control_inventory import inventory
+
+                result = inventory(config.control_path)
+            else:
+                from .control_trial import trial
+
+                if not args.trial_root:
+                    raise ConfigurationError("trial-control requires --trial-root")
+                result = trial(config, args.trial_root)
         elif args.command == "worker":
             result = worker(args.interval)
         else:
