@@ -147,8 +147,8 @@ def test_catalog_exposes_physical_machine_and_open_state_without_live_query(conf
     assert list(catalog.SCHEMA.names)[-2:] == ["ID_MAQUINA", "ID_ST1_REL"]
 
 
-def test_zf_ok_ambiguity_stays_blocked_but_outgoing_sample_remains_attributable(config, foundation):
-    # Nuevo destino sintético: el conflicto se observa desde la primera carga MP9.
+def test_zf_confirmation_versions_do_not_block_physical_assignments(config, foundation):
+    # Multiple observations of a 0 -> 1 transition must retain every physical part.
     from pathlib import Path
 
     fresh_root = config.silver_root.parent / "uncertain"
@@ -176,8 +176,9 @@ def test_zf_ok_ambiguity_stays_blocked_but_outgoing_sample_remains_attributable(
     ):
         run(replace(cfg, family=f))
     result = run(cfg)
-    assert not result["complete"] and result["accepted_associations"] == 4
-    assert all(r["id_produccion"] != pid(cfg, 2007) for r in inspect(cfg)["associations"])
+    assert result["accepted_associations"] == 6
+    assert any(r["id_produccion"] == pid(cfg, 2007) for r in inspect(cfg)["associations"])
+    assert sql(replace(cfg, family="MP9_CAMBIO_MODELO"), "SELECT COUNT(*) FROM issues") == [(0,)]
     assert len([r for r in ledger(cfg) if r["status"] == "TRANSITION_TO_OUTGOING"]) == 5
     assert Path(config.silver_root).exists()
 

@@ -39,7 +39,7 @@ def process(config, control, attempt):
     input_variants = len(parsed.entries)
     descriptors = [s.descriptor() for s in snapshots]
     restored = 0
-    for pending in control.dependency_candidates():
+    for pending in control.retry_candidates():
         for ref in pending["evidence"]:
             path = Path(ref["bronze_path"]).resolve()
             if (
@@ -50,7 +50,8 @@ def process(config, control, attempt):
             descriptors.append(
                 {k: ref[k] for k in ("bronze_path", "sha256", "origin", "source_path")}
             )
-        parsed.add(pending["candidate"], pending["evidence"])
+        for candidate in control.case_rows(pending):
+            parsed.add(candidate, pending["evidence"])
         restored += 1
     from .review_adapters import filter_rejected
 
@@ -65,7 +66,8 @@ def process(config, control, attempt):
         "invalid_rows": parsed.invalid_rows,
         "restored_dependencies": restored,
         "new_entries": len(inserts),
-        "closures": len(updates),
+        "closures": sum(r["before"]["FECHA_OFF"] != r["FECHA_OFF"] for r in updates),
+        "zf_confirmations": sum(r["before"]["ZF_OK"] != r["ZF_OK"] for r in updates),
         "matched_entries": matches,
         "conflict_entries": sum(i["reason"] in CONFLICTS for i in issues),
         "pending_entries": sum(i["reason"] in DEPENDENCIES for i in issues),
@@ -78,6 +80,7 @@ def process(config, control, attempt):
     batch_id = digest(
         [
             mp9.CONTRACT,
+            mp9.LIFECYCLE_RULE,
             __version__,
             config.plant,
             config.encoding,

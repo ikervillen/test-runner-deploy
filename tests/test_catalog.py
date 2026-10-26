@@ -25,8 +25,8 @@ def config(config):
     )
 
 
-def line(identifier=1, model=754, on="01/10/2026 6:00:00", off="", zone=1, rel="", ok=1):
-    return f"{identifier};{model};{on};{off};7;1;{zone};{rel};1;{ok};\n"
+def line(identifier=1, model=754, on="01/10/2026 6:00:00", off="", zone=1, rel="", ok=1, machine=7):
+    return f"{identifier};{model};{on};{off};{machine};1;{zone};{rel};1;{ok};\n"
 
 
 @pytest.fixture
@@ -198,8 +198,8 @@ def test_maximum_over_distinct_zf_only_when_all_are_closed(config, source):
 def test_source_conflicts_remain_visible_and_unaccepted_root_is_not_published(config, source):
     source.write_text(
         source.read_text(encoding="utf-8")
-        + line(3, model=800, ok=0)
-        + line(3, model=800, ok=1)
+        + line(3, model=800, machine=7)
+        + line(3, model=800, machine=8)
         + line(4, model=800, zone=2, rel=3),
         encoding="utf-8",
     )
@@ -215,7 +215,7 @@ def test_source_conflicts_remain_visible_and_unaccepted_root_is_not_published(co
 def test_new_source_conflict_prevents_closing_accepted_production(config, source):
     run(config)
     close_source(config, source)
-    source.write_text(source.read_text(encoding="utf-8") + line(ok=0), encoding="utf-8")
+    source.write_text(source.read_text(encoding="utf-8") + line(machine=8), encoding="utf-8")
     run(replace(config, family="MP9_CAMBIO_MODELO"))
     result = run(config)
     assert not result["complete"] and result["updated_this_attempt"] == 0
@@ -387,7 +387,7 @@ def test_catalog_cli_build_and_search_require_correct_family(config, source, tmp
 def test_source_quality_change_without_delta_commit_invalidates_publication(config, source):
     run(config)
     before = files(config.table_path)
-    source.write_text(line(ok=0), encoding="utf-8")
+    source.write_text(line(machine=8), encoding="utf-8")
     mp9_result = run(replace(config, family="MP9_CAMBIO_MODELO"))
     assert mp9_result["delta_version"] == 0
     assert search(config, "3081/360")["status"] == "STALE"

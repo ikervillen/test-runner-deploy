@@ -1,4 +1,4 @@
-"""Snapshot y MERGE MP9 por origen/ID; solo FECHA_OFF puede actualizarse."""
+"""MP9 identity MERGE: validated closure and monotonic ZF confirmation only."""
 
 import sqlite3
 from contextlib import closing
@@ -105,10 +105,8 @@ class Mp9Store(DeltaStore):
                 identity in seen
                 or old != row["before"]
                 or old is None
-                or old["FECHA_OFF"] is not None
-                or row["FECHA_OFF"] is None
-                or row["FECHA_OFF"] < row["FECHA_ON"]
-                or any(row[f] != old[f] for f in mp9.FIELDS if f != "FECHA_OFF")
+                or old == {f: row[f] for f in mp9.SCHEMA.names}
+                or not mp9.advances(old, row)
             ):
                 raise IntegrityError("Actualización MP9 incompatible con un cierre validado")
             seen.add(identity)
@@ -128,6 +126,7 @@ class Mp9Store(DeltaStore):
                 "ingesta_contract": mp9.CONTRACT,
                 "ingesta_release": __version__,
                 "ingesta_timestamp_policy": "local_naive_test_v1",
+                "ingesta_lifecycle_rule": mp9.LIFECYCLE_RULE,
             },
             app_transactions=application_transaction(self.control_id, before_version),
             max_commit_retries=0,
@@ -144,8 +143,11 @@ class Mp9Store(DeltaStore):
                     commit_properties=props,
                 )
                 .when_matched_update(
-                    {"FECHA_OFF": "s.FECHA_OFF"},
-                    predicate="t.FECHA_OFF IS NULL AND s.FECHA_OFF IS NOT NULL",
+                    {"FECHA_OFF": "s.FECHA_OFF", "ZF_OK": "s.ZF_OK"},
+                    predicate=(
+                        "(t.FECHA_OFF IS NULL AND s.FECHA_OFF IS NOT NULL) "
+                        "OR (t.ZF_OK = 0 AND s.ZF_OK = 1)"
+                    ),
                 )
                 .when_not_matched_insert_all()
                 .execute()

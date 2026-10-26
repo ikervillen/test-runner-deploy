@@ -169,7 +169,6 @@ def test_ignored_columns_equivalent_dates_and_new_names_do_not_write(config, sou
         ({"on": "02/10/2026 6:00:00"}, "FECHA_ON"),
         ({"zone": 2}, "STATUS"),
         ({"rel": 99}, "ID_ST1_REL"),
-        ({"ok": 0}, "ZF_OK"),
         ({"machine": 99}, "ID_MAQUINA"),
     ],
 )
@@ -198,17 +197,18 @@ def test_two_distinct_closures_are_never_resolved_by_min_max_or_order(config, so
     assert not config.table_path.exists()
 
 
-def test_conflicting_ok_quarantines_new_id_and_its_dependent_zf(config, source):
+def test_ok_progression_accepts_new_id_and_its_dependent_zf(config, source):
     source.write_text(
         line(ok=0) + line(ok=1) + line(2, zone=2, rel=1) + line(9, model=800), encoding="utf-8"
     )
     result = run(config)
-    assert result["status"] == "PARTIAL" and result["published_records"] == 1
-    assert result["conflict_entries"] == 1 and result["open_dependencies"] == 1
-    assert ("AV21", 1) not in rows(config) and ("AV21", 2) not in rows(config)
+    assert result["status"] == "APPLIED" and result["published_records"] == 3
+    assert result["conflict_entries"] == 0 and result["open_dependencies"] == 0
+    assert rows(config)[("AV21", 1)]["ZF_OK"] == 1
+    assert ("AV21", 2) in rows(config)
     assert rows(config)[("AV21", 9)]["FECHA_OFF"] is None  # ZF_OK=1 no inventa cierre.
     source.write_text(line(ok=1), encoding="utf-8")
-    assert run(config)["complete"] is False and ("AV21", 1) not in rows(config)
+    assert run(config)["complete"] is True and ("AV21", 1) in rows(config)
 
 
 @pytest.mark.parametrize("zone,rel,model", [(2, 1, 754), (1, 1, 800), (1, 2, 754)])
@@ -378,7 +378,7 @@ def test_altered_dependency_bronze_blocks_retry(config, source):
 
 
 def test_cli_reports_partial_as_incomplete(config, source, tmp_path, capsys):
-    source.write_text(line(ok=0) + line(ok=1) + line(9, model=800), encoding="utf-8")
+    source.write_text(line(machine=7) + line(machine=8) + line(9, model=800), encoding="utf-8")
     fields = {
         "plant": config.plant,
         "family": config.family,

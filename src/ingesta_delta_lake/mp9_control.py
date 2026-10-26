@@ -43,7 +43,7 @@ class Mp9Control(Control):
                             operation_id,
                             row["origen_fenix"],
                             row["ID"],
-                            kind,
+                            "CONFIRM_ZF" if old and old["FECHA_OFF"] == row["FECHA_OFF"] else kind,
                             canonical(old) if old else None,
                             canonical(row),
                             mp9.business_hash(old) if old else None,
@@ -77,11 +77,39 @@ class Mp9Control(Control):
 
     def held(self):
         return {
-            (p["origen_fenix"], p["ID"]) for _, reason, _, p in self.cases() if reason in CONFLICTS
+            (p["origen_fenix"], p["ID"])
+            for _, reason, _, p in self.cases()
+            if reason in CONFLICTS and (reason == "RELATION_CONFLICT" or not self.lifecycle_case(p))
         }
+
+    @staticmethod
+    def case_rows(payload):
+        return [
+            r
+            for r in [
+                payload.get("accepted"),
+                payload.get("candidate"),
+                *payload.get("candidates", []),
+            ]
+            if r is not None
+        ]
+
+    @classmethod
+    def lifecycle_case(cls, payload):
+        rows = cls.case_rows(payload)
+        return bool(rows) and not mp9.consolidate(rows)[1]
 
     def dependency_candidates(self):
         return [p for _, reason, _, p in self.cases() if reason in DEPENDENCIES]
+
+    def retry_candidates(self):
+        """Revisit stored evidence too: a policy upgrade must not need a new CSV."""
+        return [
+            p
+            for _, reason, _, p in self.cases()
+            if reason in DEPENDENCIES
+            or (reason in {"CONFLICT", "REVIEW_REQUIRED"} and self.lifecycle_case(p))
+        ]
 
     def observe(self, batch_id, prepared, issues, plant):
         self.rejected(batch_id, prepared, issues, plant, create_batch=False)
@@ -106,21 +134,30 @@ class Mp9Control(Control):
                 )
 
     def resolve_dependencies(self, rows, batch_id):
+        held = self.held()
         with self.db:
             for identifier, reason, _, payload in self.cases():
-                if reason not in DEPENDENCIES:
+                if reason not in DEPENDENCIES | {"CONFLICT", "REVIEW_REQUIRED"}:
                     continue
-                candidate = payload["candidate"]
-                accepted = rows.get(mp9.key(candidate))
-                # La observación abierta también se resuelve si se publicó su cierre coherente.
-                if accepted is None or any(
-                    candidate[f] != accepted[f] for f in mp9.FIELDS if f != "FECHA_OFF"
-                ):
+                candidates = self.case_rows(payload)
+                if not candidates or mp9.key(candidates[0]) in held:
                     continue
-                if candidate["FECHA_OFF"] not in (None, accepted["FECHA_OFF"]):
+                accepted = rows.get(mp9.key(candidates[0]))
+                if accepted is None or not all(mp9.advances(r, accepted) for r in candidates):
                     continue
+                payload = {
+                    **payload,
+                    "resolution": {
+                        "type": "AUTOMATIC_LIFECYCLE",
+                        "rule": mp9.LIFECYCLE_RULE,
+                        "batch_id": batch_id,
+                        "delta_version": self.setting("last_version"),
+                        "at": now(),
+                    },
+                }
                 self.db.execute(
-                    "UPDATE issues SET status='RESOLVED' WHERE issue_id=?", (identifier,)
+                    "UPDATE issues SET status='RESOLVED',payload_json=? WHERE issue_id=?",
+                    (canonical(payload), identifier),
                 )
                 self.db.execute(
                     "INSERT OR IGNORE INTO dependency_events VALUES(?,?,'RESOLVED',?)",

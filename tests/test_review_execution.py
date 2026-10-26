@@ -57,7 +57,7 @@ def conflict(config, request):
         model = path.with_name("SIP_MODELO.csv")
         model.write_text("754;3081/360;1;\n", encoding="utf-8")
         run(replace(config, family="SIP_MODELO"))
-        first, second, control_type = mp9_line(), mp9_line(ok=0), Mp9Control
+        first, second, control_type = mp9_line(), mp9_line(machine=8), Mp9Control
     elif family in {"SIP_DEFECTO", "SIP_DEFECTO_STATUS", "SIP_DEFECTO_AR"}:
         first = {
             "SIP_DEFECTO": "501;129;129: Pliegue cuello;Pliegue;0;\n",

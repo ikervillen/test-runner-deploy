@@ -16,6 +16,8 @@ from .sources import Snapshot
 
 CONTRACT = "mp9_cambio_modelo_v2"
 FIELDS = ("ID", "ID_MODELO", "FECHA_ON", "FECHA_OFF", "ID_MAQUINA", "STATUS", "ID_ST1_REL", "ZF_OK")
+LIFECYCLE_RULE = "mp9_monotonic_lifecycle_v1"
+IMMUTABLE_FIELDS = tuple(f for f in FIELDS if f not in {"FECHA_OFF", "ZF_OK"})
 SCHEMA = pa.schema(
     [
         pa.field("ID", pa.int64(), False),
@@ -42,6 +44,31 @@ def business_hash(row: dict) -> str:
 
 def content_hash(rows: dict[Key, dict]) -> str:
     return digest([(k, business_hash(r)) for k, r in sorted(rows.items())])
+
+
+def consolidate(rows: list[dict]) -> tuple[dict, list[str]]:
+    """An open/zero observation is older state, never a competing business record."""
+    changed = [f for f in IMMUTABLE_FIELDS if len({r[f] for r in rows}) > 1]
+    closures = {r["FECHA_OFF"] for r in rows if r["FECHA_OFF"] is not None}
+    if len(closures) > 1:
+        changed.append("FECHA_OFF")
+    return {
+        **{f: rows[0][f] for f in SCHEMA.names},
+        "FECHA_OFF": next(iter(closures), None),
+        "ZF_OK": max(r["ZF_OK"] for r in rows),
+    }, changed
+
+
+def advances(before: dict, after: dict) -> bool:
+    """Prove the same identity can only close once and advance ZF_OK from 0 to 1."""
+    return (
+        key(before) == key(after)
+        and all(before[f] == after[f] for f in IMMUTABLE_FIELDS)
+        and before["FECHA_OFF"] in (None, after["FECHA_OFF"])
+        and after["ZF_OK"] in (0, 1)
+        and before["ZF_OK"] <= after["ZF_OK"]
+        and (after["FECHA_OFF"] is None or after["FECHA_OFF"] >= after["FECHA_ON"])
+    )
 
 
 def timestamp(token: str) -> str:
@@ -170,10 +197,7 @@ def decide(parsed: Parsed, existing: dict[Key, dict], models: set[int], held: se
         refs = [ref for _, items in variants for ref in items]
         old = existing.get(identity)
         compared = [*rows, *([old] if old else [])]
-        changed = [f for f in FIELDS if f != "FECHA_OFF" and len({r[f] for r in compared}) > 1]
-        closures = {r["FECHA_OFF"] for r in compared if r["FECHA_OFF"] is not None}
-        if len(closures) > 1:
-            changed.append("FECHA_OFF")
+        candidate, changed = consolidate(compared)
         if changed or identity in held:
             issues.append(
                 {
@@ -187,12 +211,16 @@ def decide(parsed: Parsed, existing: dict[Key, dict], models: set[int], held: se
                 }
             )
             continue
-        # El cierre único prevalece sobre la ausencia de cierre, nunca sobre otro cierre.
-        resolved[identity] = {**rows[0], "FECHA_OFF": next(iter(closures), None)}
+        resolved[identity] = candidate
         evidence[identity] = refs
 
     valid = {}
     for identity, candidate in resolved.items():
+        if identity in existing:
+            # A lifecycle-only update does not introduce or alter a relationship.
+            # An unrelated pending parent must not prevent closing an accepted row.
+            valid[identity] = candidate
+            continue
         reason = None
         relation = candidate["ID_ST1_REL"]
         if candidate["ID_MODELO"] not in models:
@@ -225,7 +253,7 @@ def decide(parsed: Parsed, existing: dict[Key, dict], models: set[int], held: se
             valid[identity] = candidate
     # Una ZF no puede depender de una ZC candidata rechazada o pendiente de revisión.
     for identity, candidate in list(valid.items()):
-        if candidate["STATUS"] != 2:
+        if candidate["STATUS"] != 2 or identity in existing:
             continue
         target = (identity[0], candidate["ID_ST1_REL"])
         if target not in existing and target not in valid:

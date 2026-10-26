@@ -1,5 +1,10 @@
 # Entrega 05 — MP9_CAMBIO_MODELO
 
+**Actualización del 26/10/2026:** la política vigente de cierres y confirmaciones automáticas,
+incluida la recuperación de los falsos conflictos antiguos, está en
+[Entrega 18 — Ciclo de vida MP9](18_ciclo_vida_mp9.md). Las observaciones de ZF_OK en el
+ensayo histórico al final de esta ficha documentan el comportamiento anterior.
+
 Estado: implementación local de ensayo completada; la conciliación real conserva una
 publicación parcial v1 por el conflicto conocido de AV32. Contrato actual: `mp9_cambio_modelo_v2`,
 sección 4.5 del plan. Depende del diccionario de modelos aceptado, sin ejecutar su ingesta
