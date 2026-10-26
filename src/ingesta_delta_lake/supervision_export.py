@@ -98,7 +98,44 @@ def _publication(control, config):
     return {"delta_version": version, "operation_id": operation, "confirmed_at": row[0]}
 
 
-def export(control, config, result):
+def _derived_publications(control, config):
+    if config.family not in {"CATALOGO_PRODUCCIONES", "ASIGNACION_PRODUCCION_RAMAL"}:
+        return {}
+    if config.family == "CATALOGO_PRODUCCIONES":
+        row = control.db.execute(
+            "SELECT source_manifest_json,diagnostics_json FROM publications "
+            "ORDER BY publication_no DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return {}
+        return {
+            "catalog": {
+                "source_versions": {f: d["version"] for f, d in json.loads(row[0]).items()},
+                "pending_candidates": len(json.loads(row[1]).get("pending_candidates", [])),
+            }
+        }
+    reports = {}
+    for scope in ("physical", "full"):
+        row = control.db.execute(
+            "SELECT confirmed_at,delta_version,payload_json FROM publications WHERE "
+            "coalesce(json_extract(payload_json,'$.scope'),'full')=? ORDER BY no DESC LIMIT 1",
+            (scope,),
+        ).fetchone()
+        if row:
+            pub = json.loads(row[2])
+            reports[scope] = {
+                "confirmed_at": row[0],
+                "delta_version": row[1],
+                "complete": pub["complete"],
+                "pending_rows": pub["pending_rows"],
+                "open_reviews": pub["open_reviews"],
+                "source_versions": {f: d["version"] for f, d in pub["manifest"].items()},
+                "observation_status": pub.get("observation_status", "EVALUATED"),
+            }
+    return reports
+
+
+def export(control, config, result, *, force=False):
     """Best effort operational output; failure cannot change an ingestion outcome."""
     if os.environ.get("INGESTA_SUPERVISION_EXPORT") != "1":
         return
@@ -106,14 +143,23 @@ def export(control, config, result):
     path = directory / (config.control_path.name + ".json")
     temporary = directory / ("." + uuid.uuid4().hex + ".tmp")
     try:
-        if path.exists() and time.time() - path.stat().st_mtime < INTERVAL:
+        derived = config.family in {"CATALOGO_PRODUCCIONES", "ASIGNACION_PRODUCCION_RAMAL"}
+        if (
+            not force
+            and not (derived and result.get("attempted", True))
+            and path.exists()
+            and time.time() - path.stat().st_mtime < INTERVAL
+        ):
             return
         deadline = time.monotonic() + TIMEOUT
         control.db.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
         try:
             control.db.execute("BEGIN")
             observed_at = now()
-            retry = json.loads(control.setting("retry_state") or "null")
+            last_attempt = control.db.execute(
+                "SELECT finished_at,status FROM attempts WHERE finished_at IS NOT NULL "
+                "ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
             issues, size = [], 0
             for row in control.db.execute(
                 "SELECT issue_id,reason,status,first_seen,"
@@ -177,13 +223,12 @@ def export(control, config, result):
                 "issues": issues,
                 "stats": {
                     "last_attempt": (
-                        {
-                            "finished_at": retry["updated_at"] if retry else observed_at,
-                            "status": "FAILED" if retry else result["status"],
-                        }
-                        if retry or result.get("attempted", True)
+                        {"finished_at": last_attempt[0], "status": last_attempt[1]}
+                        if last_attempt
                         else None
                     ),
+                    "attempted_this_observation": result.get("attempted", True),
+                    "derived_publications": _derived_publications(control, config),
                     "dependency_status": result.get("dependency_status"),
                     **(
                         {
