@@ -41,12 +41,12 @@ class _ObservationControl:
         return self.setting("control_format") == "3"
 
 
-def deferred(config):
+def deferred(config, *, reason="MIA_BACKLOG"):
     result = {
-        "status": "DEFERRED_BACKLOG",
+        "status": "DEFERRED_CADENCE" if reason == "CADENCE" else "DEFERRED_BACKLOG",
         "complete": False,
         "attempted": False,
-        "dependency_status": "MIA_BACKLOG",
+        "dependency_status": reason,
     }
     if os.environ.get("INGESTA_SUPERVISION_EXPORT") == "1" and config.control_path.is_file():
         try:
