@@ -228,6 +228,7 @@ def worker(interval=600):
     token, status_path, activation = token_paths()
     stop_path = status_path.with_suffix(".stop")
     stop = threading.Event()
+    next_derived = 0.0
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     status = {"token": token, "phase": "READY", "time": now()}
@@ -257,9 +258,13 @@ def worker(interval=600):
                 next_scans = []
 
                 def record(family, result, seconds, *, scan_deadlines=next_scans):
-                    nonlocal backlog, failed
+                    nonlocal backlog, failed, next_derived
                     backlog = backlog or bool(result.get("remaining_versions", 0))
                     failed = failed or result["status"] == "FAILED"
+                    if family == "ASIGNACION_PRODUCCION_RAMAL" and result.get("attempted", True):
+                        next_derived = time.monotonic() + (
+                            30 if result["status"] == "FAILED" else interval
+                        )
                     if result.get("next_input_scan_at") is not None:
                         scan_deadlines.append(result["next_input_scan_at"])
                     event = {
@@ -289,10 +294,17 @@ def worker(interval=600):
                     for phase in PHASES:
                         if stop.is_set():
                             break
-                        if phase == ("ASIGNACION_PRODUCCION_RAMAL",) and backlog:
+                        if (
+                            phase == ("ASIGNACION_PRODUCCION_RAMAL",)
+                            and time.monotonic() < next_derived
+                        ):
                             from .supervision_export import deferred
 
-                            record(phase[0], deferred(replace(base, family=phase[0])), 0)
+                            record(
+                                phase[0],
+                                deferred(replace(base, family=phase[0]), reason="CADENCE"),
+                                0,
+                            )
                             continue
                         run_phase(base, phase, stop, stop_path, record, active)
                 else:
@@ -305,10 +317,13 @@ def worker(interval=600):
                         try:
                             from .service import run
 
-                            if family == "ASIGNACION_PRODUCCION_RAMAL" and backlog:
+                            if (
+                                family == "ASIGNACION_PRODUCCION_RAMAL"
+                                and time.monotonic() < next_derived
+                            ):
                                 from .supervision_export import deferred
 
-                                result = deferred(replace(base, family=family))
+                                result = deferred(replace(base, family=family), reason="CADENCE")
                             else:
                                 result = run(
                                     replace(base, family=family),

@@ -221,7 +221,7 @@ def test_runtime_settings_reject_invalid_or_unknown_input(mounted, monkeypatch, 
         runtime.settings()
 
 
-def test_backlog_rotates_sources_without_idle_interval_and_defers_derived(mounted, monkeypatch):
+def test_continuous_backlog_cannot_starve_derived(mounted, monkeypatch):
     from ingesta_delta_lake import service
 
     runtime.bootstrap()
@@ -248,14 +248,14 @@ def test_backlog_rotates_sources_without_idle_interval_and_defers_derived(mounte
 
     monkeypatch.setattr(service, "run", unit)
     runtime.worker(600)
-    assert calls.count("LISTA_AR") == calls.count("CONT_ZC") == 2
+    assert calls.count("LISTA_AR") == calls.count("CONT_ZC") == 1
     assert calls.count("ASIGNACION_PRODUCCION_RAMAL") == 1
-    assert 1 in waits and 600 not in waits
+    assert 600 not in waits
     events = [
         json.loads(line)
         for line in next((mounted / "lake/logs").glob("*.jsonl")).read_text().splitlines()
     ]
-    assert any(e["result"]["status"] == "DEFERRED_BACKLOG" for e in events)
+    assert not any(e["result"]["status"] == "DEFERRED_BACKLOG" for e in events)
 
 
 def test_idle_after_catchup_uses_next_scan_deadline_not_another_full_interval(mounted, monkeypatch):
@@ -285,3 +285,35 @@ def test_idle_after_catchup_uses_next_scan_deadline_not_another_full_interval(mo
     assert calls.count("SIP_MODELO") == 2
     assert any(1 <= delay <= 2 for delay in waits)
     assert not any(500 < delay <= 600 for delay in waits)
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_derived_cadence_is_bounded_with_permanent_backlog(mounted, monkeypatch, count):
+    from ingesta_delta_lake import service, workers
+
+    monkeypatch.setenv("INGESTA_WORKERS", str(count))
+    runtime.bootstrap()
+    _, _, activation = runtime.token_paths()
+    runtime.atomic_json(activation, {"token": "a" * 32})
+    callbacks, derived, clock = {}, [], [0]
+    monkeypatch.setattr(signal, "signal", lambda n, f: callbacks.update({n: f}))
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(runtime.threading.Event, "wait", lambda *_: False)
+
+    def unit(cfg, **_):
+        if cfg.family == "SIP_MODELO":
+            clock[0] += 200
+        if cfg.family == "ASIGNACION_PRODUCCION_RAMAL":
+            derived.append(clock[0])
+            if len(derived) == 2:
+                callbacks[signal.SIGTERM]()
+        return {"status": "NO_CHANGE", "remaining_versions": 1}
+
+    def phase(base, families, stop, stop_path, record, active):
+        for family in families:
+            record(family, unit(__import__("dataclasses").replace(base, family=family)), 0)
+
+    monkeypatch.setattr(service, "run", unit)
+    monkeypatch.setattr(workers, "run_phase", phase)
+    assert runtime.worker(600)["status"] == "STOPPED"
+    assert derived == [200, 800]

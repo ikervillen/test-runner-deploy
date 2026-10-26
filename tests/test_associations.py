@@ -100,6 +100,37 @@ def query(config, sql):
         return db.execute(sql).fetchall()
 
 
+def test_confirmed_snapshot_remains_readable_after_new_source_commit(config, foundation):
+    from ingesta_delta_lake.association_storage import source_snapshot
+
+    before, _, descriptor, _ = source_snapshot(config, "LISTA_RECH")
+    path = foundation / "LISTA_RECH.csv"
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write("14/10/2026 8:20:00;35;1;13;91;1;0;3F;;\n")
+    run(replace(config, family="LISTA_RECH"))
+    fixed, _, actual, _ = source_snapshot(config, "LISTA_RECH", expected=descriptor)
+    assert fixed == before and actual == descriptor
+    assert len(source_snapshot(config, "LISTA_RECH")[0]) == len(before) + 1
+    with pytest.raises(IntegrityError, match="control"):
+        source_snapshot(config, "LISTA_RECH", expected={**descriptor, "control_id": "another"})
+
+
+def test_catalog_publication_and_composition_are_pinned(config, foundation):
+    from ingesta_delta_lake.association_storage import source_snapshot
+
+    _, _, descriptor, composition = source_snapshot(config, "CATALOGO_PRODUCCIONES")
+    fixed = load_bundle(
+        config,
+        manifest={
+            family: source_snapshot(config, family, read=False)[2]
+            for family in a.SOURCE_KEYS
+            if family not in {"SIP_MAQUINA_MOLDEO", "SIP_LINEA_ZF"}
+        },
+    )
+    assert fixed["manifest"]["CATALOGO_PRODUCCIONES"] == descriptor
+    assert fixed["catalog_composition"] == composition["composition"]
+
+
 def files(path):
     return {str(p.relative_to(path)): p.read_bytes() for p in path.rglob("*") if p.is_file()}
 

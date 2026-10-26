@@ -83,8 +83,28 @@ def source_id(family, row):
     return digest([family, SOURCE_KEYS[family](row)])
 
 
-def blocked(bundle, family, row):
+def review_index(bundle):
+    """Hash each pending key once; the index lives only for this immutable bundle."""
+    result = {}
+    for family, cases in bundle["cases"].items():
+        keys, origins = set(), set()
+        for case in cases:
+            payload = case["payload"]
+            if "key" in payload:
+                keys.add(digest(payload["key"]))
+            else:
+                refs = payload.get("evidence", [])
+                refs = refs if isinstance(refs, list) else [refs]
+                origins.update(ref.get("origin") for ref in refs)
+        result[family] = keys, origins
+    return result
+
+
+def blocked(bundle, family, row, index=None):
     identity = SOURCE_KEYS[family](row)
+    if index is not None:
+        keys, origins = index.get(family, ((), ()))
+        return row.get("origen_fenix") in origins or (bool(keys) and digest(identity) in keys)
     for case in bundle["cases"].get(family, []):
         p = case["payload"]
         if "key" in p:
@@ -98,8 +118,8 @@ def blocked(bundle, family, row):
     return False
 
 
-def ar_blocked(bundle, row):
-    return blocked(bundle, "LISTA_AR", row) or any(
+def ar_blocked(bundle, row, index=None):
+    return blocked(bundle, "LISTA_AR", row, index) or any(
         bundle["cases"].get(f) for f in ("SIP_DEFECTO", "SIP_DEFECTO_STATUS", "SIP_DEFECTO_AR")
     )
 
@@ -399,11 +419,17 @@ def interval_decision(items, start, end):
     return "PENDING_TRANSITION", [], ids
 
 
+class ObservationContext(defaultdict):
+    def __init__(self, bundle):
+        super().__init__(list)
+        self.reviews = review_index(bundle)
+
+
 def prepare_context(bundle):
-    ar_index = defaultdict(list)
+    ar_index = ObservationContext(bundle)
     for row in bundle["sources"]["LISTA_AR"]:
         if (
-            not ar_blocked(bundle, row)
+            not ar_blocked(bundle, row, ar_index.reviews)
             and zone_for_ar(bundle, row) == "ZF"
             and row["MOLDE"] > 0
             and row["CAVIDAD"] not in (None, "99Z")
@@ -416,9 +442,14 @@ def prepare_context(bundle):
 
 def candidates(bundle, ar_index):
     groups = {}
+    reviews = getattr(ar_index, "reviews", None)
     for family in ("LISTA_RECH", "LISTA_DEFECTOS"):
         for row in bundle["sources"][family]:
-            if row["MOLDE"] <= 0 or row["CAVIDAD"] in (None, "99Z") or blocked(bundle, family, row):
+            if (
+                row["MOLDE"] <= 0
+                or row["CAVIDAD"] in (None, "99Z")
+                or blocked(bundle, family, row, reviews)
+            ):
                 continue
             end = row["FECHA"]
             start = (datetime.fromisoformat(end) - timedelta(minutes=10)).isoformat(
@@ -459,6 +490,7 @@ def candidates(bundle, ar_index):
 
 
 def assign(bundle, registry, ar_index, review_scopes=()):
+    reviews = getattr(ar_index, "reviews", None)
     zf = defaultdict(list)
     zc = defaultdict(list)
     for d in registry.values():
@@ -471,7 +503,9 @@ def assign(bundle, registry, ar_index, review_scopes=()):
             episode_ids = []
             reason = ""
             status = "PENDING_ASSOCIATION"
-            if blocked(bundle, family, row) or (family == "LISTA_AR" and ar_blocked(bundle, row)):
+            if blocked(bundle, family, row, reviews) or (
+                family == "LISTA_AR" and ar_blocked(bundle, row, reviews)
+            ):
                 status = "SOURCE_REVIEW"
             elif family == "LISTA_AR":
                 targets = ar_productions(bundle, row)

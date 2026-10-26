@@ -25,7 +25,8 @@ def test_deferred_observation_is_fresh_without_creating_an_attempt(
     observation = json.loads(path.read_text())
     assert observation["complete"]
     assert observation["stats"]["dependency_status"] == "MIA_BACKLOG"
-    assert observation["stats"]["last_attempt"] is None
+    assert observation["stats"]["last_attempt"]["status"] == "APPLIED"
+    assert observation["stats"]["attempted_this_observation"] is False
     assert observation["publication"]["delta_version"] == 0
     with closing(sqlite3.connect(config.control_path)) as db:
         assert list(db.iterdump()) == before

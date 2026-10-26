@@ -10,6 +10,7 @@ from .manager import Deployment, Docker, MaintenanceStillRunning, load_site, loc
 INVENTORY = """
 from pathlib import Path
 import json,shutil,os
+from collections import Counter
 from deltalake import DeltaTable
 import pyarrow as pa
 root=Path('/lake'); controls=root/'control'
@@ -27,10 +28,14 @@ for p in sorted((root/'silver').glob('*/*')):
  if (p/'_delta_log').is_dir():
   t=DeltaTable(str(p)); adds=pa.table(t.get_add_actions())
   data['tables'].append({'name':str(p.relative_to(root)), 'version':t.version(),
-   'rows':sum(adds['num_records'].to_pylist()),'files':adds.num_rows})
+   'rows':sum(adds['num_records'].to_pylist()),'files':adds.num_rows,
+   'last_commit':t.history(limit=1)[0]})
 for p in sorted((controls/'supervision').glob('*.json')):
  v=json.loads(p.read_text());data['feeds'].append({'name':p.name,'observed_at':v['observed_at'],
-  'control_id':v['control_id'],'issues':len(v['issues']),'stats':v.get('stats')})
+  'control_id':v['control_id'],'issues':len(v['issues']),'stats':v.get('stats'),
+  'publication':v.get('publication'),
+  'issue_reasons':dict(Counter(i['reason'] for i in v['issues'])),
+  'reviews':v['issues'] if v['family']=='MP9_CAMBIO_MODELO' else []})
 print(json.dumps(data))
 """
 
