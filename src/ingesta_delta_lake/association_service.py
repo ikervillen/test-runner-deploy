@@ -116,6 +116,8 @@ def _process(config, control, attempt, *, physical=False):
     scope = "physical" if physical else "full"
     latest = control.latest(scope) or control.latest()
     prior_pub = json.loads(latest["payload_json"]) if latest else None
+    current_publication = control.latest()
+    current_pub = json.loads(current_publication["payload_json"]) if current_publication else None
     doc = decisions(config)
     lines = dict(config.line_by_origin)
     fingerprint = {
@@ -140,9 +142,9 @@ def _process(config, control, attempt, *, physical=False):
         "line_codes": dict(config.line_code_by_origin),
     }
     old_registry = None
-    if prior_pub and "registry" in prior_pub:
-        old_registry = prior_pub["registry"]
-        if digest(old_registry) != prior_pub["registry_hash"]:
+    if current_pub and "registry" in current_pub:
+        old_registry = current_pub["registry"]
+        if digest(old_registry) != current_pub["registry_hash"]:
             raise IntegrityError("Registro de decisiones de la publicación alterado")
     if (
         prior_pub
@@ -171,7 +173,9 @@ def _process(config, control, attempt, *, physical=False):
         }
     if old_registry is None:
         old_registry = (
-            read_artifact(config, prior_pub["artifacts"]["bundle"])["registry"] if prior_pub else {}
+            read_artifact(config, current_pub["artifacts"]["bundle"])["registry"]
+            if current_pub
+            else {}
         )
     bundle = load_bundle(config, physical=physical, manifest=fingerprint["manifest"])
     if fingerprint["manifest"] != bundle["manifest"]:

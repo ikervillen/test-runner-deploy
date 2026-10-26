@@ -198,7 +198,10 @@ def test_future_tandem_names_and_branch_numbers_are_not_hardcoded(config, founda
     assert {r["production"] for r in automatic if r["branch"] in (43, 44)} == {pid(config, 2005)}
 
 
-def test_explicit_correction_of_auto_episode_is_not_reverted_by_next_derivation(config, foundation):
+@pytest.mark.parametrize("evidence_family", [None, "LISTA_RECH"])
+def test_explicit_correction_of_auto_episode_is_not_reverted_by_next_derivation(
+    config, foundation, evidence_family
+):
     from ingesta_delta_lake.common import digest
 
     run(config)
@@ -219,6 +222,15 @@ def test_explicit_correction_of_auto_episode_is_not_reverted_by_next_derivation(
         "actor": "reviewer",
         "reason": "Verified effective entry",
     }
+    if evidence_family:
+        from ingesta_delta_lake.associations import source_id
+
+        revised["evidence"] = [
+            {
+                "family": evidence_family,
+                "source_id": source_id(evidence_family, bundle["sources"][evidence_family][0]),
+            }
+        ]
     path = config.control_root / "manual.json"
     path.write_text(json.dumps({"version": 1, "decisions": [revised]}), encoding="utf-8")
     cfg = replace(config, association_decisions=path)
