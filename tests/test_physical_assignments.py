@@ -93,6 +93,34 @@ def test_topology_generates_all_parts_and_assigns_five_transition_rows_to_outgoi
     assert len(transition) == 5
     assert all(r["productions"] == [pid(config, 2003)] for r in transition)
     assert len({r["source_id"] for r in rows}) == len(rows)
+
+
+def test_physical_episodes_commit_even_if_observation_stage_fails(config, foundation, monkeypatch):
+    from ingesta_delta_lake import associations
+    from ingesta_delta_lake.association_storage import AssociationStore
+
+    original = associations.assign
+
+    def fail_large_stage(bundle, *args):
+        if bundle["sources"]["LISTA_RECH"]:
+            raise RuntimeError("Observation computation interrupted")
+        return original(bundle, *args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(associations, "assign", fail_large_stage)
+        with pytest.raises(RuntimeError, match="interrupted"):
+            run(config)
+    assert sql(config, "SELECT count(*) FROM publications")[0][0] == 1
+    pub = json.loads(sql(config, "SELECT payload_json FROM publications")[0][0])
+    assert pub["scope"] == "physical"
+    assert pub["observation_status"] == "NOT_EVALUATED"
+    cid = sql(config, "SELECT value FROM settings WHERE key='control_id'")[0][0]
+    version, rows = AssociationStore(config, cid).read()
+    assert version == 0 and len(rows) == 6
+    result = run(config)
+    assert result["accepted_associations"] == 6
+    assert result["counts"]["LISTA_RECH"]["source_rows"] == 3
+    assert AssociationStore(config, cid).read()[0] == version
     current = inspect(config)
     assert current["counts"]["LISTA_RECH"]["assigned_rows"] == 3
     assert current["counts"]["LISTA_DEFECTOS"]["assigned_rows"] == 5

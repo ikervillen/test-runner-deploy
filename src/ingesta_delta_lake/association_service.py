@@ -9,6 +9,7 @@ from deltalake import DeltaTable
 from . import __version__, cont_zc, physical_assignments
 from . import associations as a
 from .association_storage import (
+    PHYSICAL_SOURCES,
     AssociationStore,
     artifact,
     load_bundle,
@@ -78,6 +79,26 @@ def _review_hash(control, omit=()):
 
 
 def process(config, control, attempt):
+    # Commit small, independent topology changes before computing the observation
+    # ledger. A failure of that heavier stage cannot undo an accepted episode.
+    physical = None
+    if config.topology_enabled:
+        physical = _process(config, control, attempt, physical=True)
+        from .supervision_export import export
+
+        export(control, config, physical, force=True)
+    result = _process(config, control, attempt)
+    if physical:
+        for key in ("inserted_this_attempt", "updated_this_attempt"):
+            result[key] += physical.get(key, 0)
+        result["physical_publication"] = {
+            key: physical[key]
+            for key in ("status", "delta_version", "accepted_associations", "complete")
+        }
+    return result
+
+
+def _process(config, control, attempt, *, physical=False):
     store = AssociationStore(config, control.control_id)
     recovered = []
     for pending in control.pending():
@@ -92,12 +113,14 @@ def process(config, control, attempt):
     version, previous = store.read()
     if control.setting("last_version") not in (None, str(version)):
         raise IntegrityError("Asociación y control no coinciden")
-    latest = control.latest()
+    scope = "physical" if physical else "full"
+    latest = control.latest(scope) or control.latest()
     prior_pub = json.loads(latest["payload_json"]) if latest else None
     doc = decisions(config)
     lines = dict(config.line_by_origin)
     fingerprint = {
         "contract": a.CONTRACT,
+        "scope": scope,
         "rule": a.RULE,
         "policy": PUBLICATION_POLICY,
         "transformer_version": __version__,
@@ -108,6 +131,7 @@ def process(config, control, attempt):
                 f
                 for f in a.SOURCE_KEYS
                 if config.topology_enabled or f not in {"SIP_MAQUINA_MOLDEO", "SIP_LINEA_ZF"}
+                if not physical or f in PHYSICAL_SOURCES
             )
         },
         "decision_hash": digest(doc),
@@ -149,10 +173,19 @@ def process(config, control, attempt):
         old_registry = (
             read_artifact(config, prior_pub["artifacts"]["bundle"])["registry"] if prior_pub else {}
         )
-    bundle = load_bundle(config)
+    bundle = load_bundle(config, physical=physical, manifest=fingerprint["manifest"])
     if fingerprint["manifest"] != bundle["manifest"]:
         raise IntegrityError("Las fuentes cambiaron durante la preparación de asociaciones")
     effective = list(doc["decisions"])
+    if physical:
+        effective = [
+            d
+            for d in effective
+            if all(
+                e.get("family") in PHYSICAL_SOURCES or "external" in e
+                for e in d.get("evidence", [])
+            )
+        ]
     if config.topology_enabled:
         automatic = physical_assignments.decisions(
             bundle, old_registry, dict(config.line_code_by_origin)
@@ -234,6 +267,8 @@ def process(config, control, attempt):
         for r in [*inserts, *updates]
     ]
     publication = {
+        "scope": scope,
+        "observation_status": "NOT_EVALUATED" if physical else "EVALUATED",
         "artifacts": artifacts,
         "manifest": bundle["manifest"],
         "decision_hash": digest(doc),
@@ -288,6 +323,9 @@ def process(config, control, attempt):
         "recovered_operations": recovered,
         "artifacts": artifacts,
         "open_reviews": len(remaining),
+        "publication_scope": scope,
+        "observation_status": publication["observation_status"],
+        "source_manifest": bundle["manifest"],
     }
 
 

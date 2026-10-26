@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pyarrow as pa
-from deltalake import write_deltalake
+from deltalake import DeltaTable, write_deltalake
 from deltalake.transaction import CommitProperties
 
 from . import __version__, topology
@@ -42,8 +42,14 @@ STORES = {
     "CONT_ZC": ZcStore,
 }
 
+# These accepted sources suffice to publish declared production/branch episodes.
+# Inspection observations enrich attribution, but cannot postpone this publication.
+PHYSICAL_SOURCES = frozenset(
+    {"SIP_MODELO", "MP9_CAMBIO_MODELO", "CATALOGO_PRODUCCIONES", *topology.FAMILIES}
+)
 
-def source_snapshot(config, family, read=True):
+
+def source_snapshot(config, family, read=True, *, expected=None):
     cfg = replace(config, family=family)
     if not cfg.control_path.exists():
         raise IntegrityError(f"Falta fuente aceptada {family}")
@@ -76,6 +82,23 @@ def source_snapshot(config, family, read=True):
                 "WHERE status!='RESOLVED' ORDER BY issue_id"
             )
         ]
+        if expected is not None:
+            if expected["control_id"] != settings["control_id"] or expected[
+                "quality_hash"
+            ] != digest(cases):
+                raise IntegrityError("Cambió el control o la revisión del snapshot fijado")
+            fixed = expected["version"]
+            if fixed != version:
+                if fixed is None or version is None or fixed > version:
+                    raise IntegrityError("Versión fijada no confirmada")
+                if not db.execute(
+                    "SELECT 1 FROM batches WHERE delta_version=? "
+                    "AND confirmed_at IS NOT NULL LIMIT 1",
+                    (fixed,),
+                ).fetchone():
+                    raise IntegrityError("Versión fijada sin justificante")
+                table = DeltaTable(str(cfg.table_path), version=fixed)
+                version = fixed
         rows = []
         if read:
             _, data = store.read(table)
@@ -101,12 +124,15 @@ def source_snapshot(config, family, read=True):
         }
         extra = {}
         if family == "CATALOGO_PRODUCCIONES":
+            query = "SELECT batch_id,source_manifest_json,diagnostics_json FROM publications "
+            pinned = expected.get("publication_id") if expected else None
             publication = db.execute(
-                "SELECT batch_id,source_manifest_json,diagnostics_json FROM publications "
-                "ORDER BY publication_no DESC LIMIT 1"
+                query + ("WHERE batch_id=?" if pinned else "ORDER BY publication_no DESC LIMIT 1"),
+                (pinned,) if pinned else (),
             ).fetchone()
             if publication is None:
                 raise IntegrityError("Construir el catálogo antes de asociar")
+            meta["publication_id"] = publication[0]
             extra = {
                 "manifest": json.loads(publication[1]),
                 "diagnostics": json.loads(publication[2]),
@@ -121,13 +147,19 @@ def source_snapshot(config, family, read=True):
     return rows, cases, meta, extra
 
 
-def load_bundle(config):
+def load_bundle(config, *, physical=False, manifest=None):
+    fixed_manifest = manifest
     sources, cases, manifest = {}, {}, {}
     extra = {}
     for family in STORES:
         if family in topology.FAMILIES and not config.topology_enabled:
             continue
-        rows, issues, meta, more = source_snapshot(config, family)
+        if physical and family not in PHYSICAL_SOURCES:
+            sources[family], cases[family] = [], []
+            continue
+        rows, issues, meta, more = source_snapshot(
+            config, family, expected=fixed_manifest[family] if fixed_manifest else None
+        )
         sources[family] = sorted(rows, key=lambda r: canonical(a.SOURCE_KEYS[family](r)))
         cases[family] = issues
         manifest[family] = meta
@@ -240,8 +272,15 @@ class AssociationControl(Control):
             PRIMARY KEY(issue_id,batch_id,event));
         """)
 
-    def latest(self):
-        row = self.db.execute("SELECT * FROM publications ORDER BY no DESC LIMIT 1").fetchone()
+    def latest(self, scope=None):
+        if scope is None:
+            row = self.db.execute("SELECT * FROM publications ORDER BY no DESC LIMIT 1").fetchone()
+        else:
+            row = self.db.execute(
+                "SELECT * FROM publications WHERE "
+                "coalesce(json_extract(payload_json,'$.scope'),'full')=? ORDER BY no DESC LIMIT 1",
+                (scope,),
+            ).fetchone()
         return dict(row) if row else None
 
     def prepare(self, batch_id, operation_id, prepared):
