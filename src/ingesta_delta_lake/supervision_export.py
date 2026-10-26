@@ -115,6 +115,11 @@ def _derived_publications(control, config):
                 "delta_version": row[3],
                 "complete": bool(row[4]),
                 "source_versions": {f: d["version"] for f, d in json.loads(row[0]).items()},
+                "source_quality_hashes": {
+                    f: d["quality_hash"]
+                    for f, d in json.loads(row[0]).items()
+                    if "quality_hash" in d
+                },
                 "pending_candidates": len(json.loads(row[1]).get("pending_candidates", [])),
             }
         }
@@ -134,6 +139,9 @@ def _derived_publications(control, config):
                 "pending_rows": pub["pending_rows"],
                 "open_reviews": pub["open_reviews"],
                 "source_versions": {f: d["version"] for f, d in pub["manifest"].items()},
+                "source_quality_hashes": {
+                    f: d["quality_hash"] for f, d in pub["manifest"].items() if "quality_hash" in d
+                },
                 "observation_status": pub.get("observation_status", "EVALUATED"),
             }
     return reports
@@ -217,6 +225,22 @@ def export(control, config, result, *, force=False):
                         "evidence_truncated": count > len(evidence),
                     }
                 )
+            from .review_adapters import contextual_offers
+
+            context_payloads = [
+                {k: v for k, v in item["payload"].items() if k != "resolution"}
+                for item in issues
+                if item["source_status"] != "RESOLVED"
+            ]
+            choices = contextual_offers(config, context_payloads)
+            for item in issues:
+                source_payload = {k: v for k, v in item["payload"].items() if k != "resolution"}
+                choice = choices.get(digest(source_payload))
+                if choice:
+                    enabled = item["payload"]["resolution"]["writer_enabled"]
+                    item["payload"]["resolution"] = {**choice, "writer_enabled": enabled}
+                    if len(canonical(item["payload"]).encode()) > MAX_PAYLOAD:
+                        raise ValueError("Expanded resolution evidence exceeds export budget")
             value = {
                 "schema_version": 1,
                 "complete": True,
@@ -285,6 +309,27 @@ def export(control, config, result, *, force=False):
                 },
                 "publication": _publication(control, config),
             }
+            if value["publication"] is not None:
+                value["publication"]["quality_hash"] = digest(
+                    [
+                        {
+                            "issue_id": item["source_id"],
+                            "reason": item["reason"],
+                            "status": item["source_status"],
+                            "payload": {
+                                k: v for k, v in item["payload"].items() if k != "resolution"
+                            },
+                        }
+                        for item in issues
+                        if item["source_status"] != "RESOLVED"
+                    ]
+                )
+                review = control.db.execute(
+                    "SELECT finished_at FROM review_operations WHERE state='VERIFIED' "
+                    "ORDER BY finished_at DESC LIMIT 1"
+                ).fetchone()
+                if review:
+                    value["publication"]["review_confirmed_at"] = review[0]
         finally:
             control.db.rollback()  # Only the read transaction; business commit already finished.
             control.db.set_progress_handler(None, 0)

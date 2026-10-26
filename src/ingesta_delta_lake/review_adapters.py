@@ -12,7 +12,9 @@ from .contracts import DictionaryContract
 
 KEEP = "MANTENER_PRIMER_DATO"
 REPLACE = "SOBRESCRIBIR_CON_SEGUNDO"
+ADMIT = "ACEPTAR_CANDIDATO"
 VERSION = "1.0.0"
+ADMISSION_VERSION = "1.1.0"
 REASONS = {
     "ASSOCIATION_CONFLICT",
     "CONFLICT",
@@ -21,6 +23,7 @@ REASONS = {
     "CLOSURE_CONFLICT",
     "COUNTER_REVISION",
     "INSPECTION_GROUP_CONFLICT",
+    "RELATION_CONFLICT",
 }
 
 
@@ -154,13 +157,31 @@ def adapter(config, control_id):
 
 
 def offer(config, payload):
-    """A decision requires one existing homologous row and explicit alternatives."""
+    """Describe a concrete choice, never infer a winner from evidence order."""
+    reason = payload.get("reason", "UNKNOWN")
+    dependency = reason.endswith("_PENDING") or reason.endswith("_DEPENDENCY")
+    code = "DEPENDENCY_PENDING" if dependency else "ACTION_NOT_IMPLEMENTED"
     unavailable = {
         "version": VERSION,
         "fields": config.contract.schema.names,
         "actions": [],
-        "message": "Este caso requiere información o resolver una dependencia; no tiene un par "
-        "único de registros homólogos que pueda corregirse con estas acciones.",
+        "category": "DEPENDENCY" if dependency else "CONTRACT_REVIEW",
+        "blockers": [
+            {
+                "code": code,
+                "requirement": reason,
+                "owner": "responsable de datos" if dependency else "equipo técnico",
+                "next_step": "Incorporar la dependencia y reevaluar la incidencia."
+                if dependency
+                else "Corregir el origen o implementar el contrato indicado.",
+            }
+        ],
+        "message": f"{reason}: "
+        + (
+            "falta una dependencia de origen; no se puede forzar su aceptación."
+            if dependency
+            else "este motivo requiere validación de su contrato de resolución."
+        ),
     }
     if payload.get("reason") not in REASONS:
         return unavailable
@@ -173,31 +194,87 @@ def offer(config, payload):
                 "codigo_modelo_botella": payload["accepted_code"],
             }
         if isinstance(accepted, list):
-            accepted = accepted[0] if len(accepted) == 1 else None
-        if not isinstance(accepted, dict):
-            return unavailable
-        old = a.project(accepted)
+            if len(accepted) > 1:
+                return {
+                    **unavailable,
+                    "message": "Existen varios registros aceptados; "
+                    "debe resolverse la ambigüedad de identidad.",
+                    "blockers": [
+                        {
+                            "code": "IDENTITY_AMBIGUOUS",
+                            "next_step": "Revisar la integridad de las identidades aceptadas.",
+                            "owner": "equipo técnico",
+                        }
+                    ],
+                }
+            accepted = accepted[0] if accepted else None
+        old = a.project(accepted) if isinstance(accepted, dict) else None
         candidates = payload.get("candidates", [payload.get("candidate", payload)])
         variants = {a.signature(r): a.project(r) for r in candidates}
         if not variants:
             return unavailable
-        variants.pop(a.signature(old), None)
+        if old is not None:
+            variants.pop(a.signature(old), None)
         if not variants:
             return unavailable
-        actions = [KEEP]
-        if all(a.key(r) == a.key(old) for r in variants.values()):
+        target = old if old is not None else next(iter(variants.values()))
+        same_key = all(a.key(r) == a.key(target) for r in variants.values())
+        if old is None and not same_key:
+            return {
+                **unavailable,
+                "message": "Los candidatos pertenecen a identidades distintas; "
+                "no se puede admitir uno como homólogo.",
+                "blockers": [
+                    {
+                        "code": "IDENTITY_AMBIGUOUS",
+                        "next_step": "Separar las identidades antes de decidir.",
+                        "owner": "responsable de datos",
+                    }
+                ],
+            }
+        actions = [KEEP] if old is not None else [ADMIT]
+        if old is not None and same_key:
             actions.append(REPLACE)
         return {
-            "version": VERSION,
+            "version": VERSION if old is not None else ADMISSION_VERSION,
             "fields": config.contract.schema.names,
             "actions": actions,
+            "category": "ACCEPTED_CONFLICT" if old is not None else "CANDIDATE_SELECTION",
+            "identity": digest(a.key(target)),
+            "blockers": [],
+            "action_blockers": (
+                {
+                    REPLACE: [
+                        {
+                            "code": "IDENTITY_CHANGE",
+                            "message": "La alternativa cambia la clave; "
+                            "no es una sustitución del mismo registro.",
+                            "next_step": "Mantener el dato aceptado o corregir "
+                            "la identidad en el origen.",
+                            "owner": "responsable de datos",
+                        }
+                    ]
+                }
+                if old is not None and not same_key
+                else {}
+            ),
             "issue_hash": digest(payload),
             "accepted": old,
-            "accepted_hash": a.signature(old),
+            "accepted_hash": a.signature(old) if old is not None else None,
             "candidates": [{"hash": h, "row": variants[h]} for h in sorted(variants)],
         }
-    except (KeyError, TypeError, IntegrityError):
-        return unavailable
+    except (KeyError, TypeError, IntegrityError, ValueError):
+        return {
+            **unavailable,
+            "message": "La evidencia no contiene una fila completa compatible con el contrato.",
+            "blockers": [
+                {
+                    "code": "EVIDENCE_INCOMPLETE",
+                    "next_step": "Obtener la evidencia íntegra desde el productor.",
+                    "owner": "equipo técnico",
+                }
+            ],
+        }
 
 
 def filter_rejected(control, parsed):
@@ -227,3 +304,30 @@ def filter_rejected(control, parsed):
             )
             not in rejected
         }
+
+
+def contextual_offers(config, payloads):
+    """Union complete candidate rows for the same object and expected accepted state.
+
+    Some detectors emit one issue per candidate. A choice must see all related
+    alternatives before it can reject them, and bind that coverage into its hash.
+    This index is built once per bounded export or writer decision, not per row.
+    """
+    offers, buckets = {}, {}
+    for payload in payloads:
+        identity = digest(payload)
+        choice = offer(config, payload)
+        offers[identity] = choice
+        if choice["actions"]:
+            bucket = (choice["identity"], choice["accepted_hash"])
+            target = buckets.setdefault(bucket, {})
+            target.update({r["hash"]: r["row"] for r in choice["candidates"]})
+    for choice in offers.values():
+        if not choice["actions"]:
+            continue
+        variants = buckets[(choice["identity"], choice["accepted_hash"])]
+        if set(variants) != {r["hash"] for r in choice["candidates"]}:
+            choice["candidates"] = [{"hash": h, "row": variants[h]} for h in sorted(variants)]
+            choice["issue_hash"] = digest([choice["issue_hash"], sorted(variants)])
+        choice["coverage_complete"] = True
+    return offers

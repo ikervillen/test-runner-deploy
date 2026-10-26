@@ -11,12 +11,13 @@ import os
 import uuid
 from pathlib import Path
 
+from deltalake import write_deltalake
 from deltalake.transaction import CommitProperties
 
 from . import __version__
 from .commit_protocol import application_transaction
 from .common import IntegrityError, canonical, digest, now
-from .review_adapters import KEEP, REPLACE, adapter, offer
+from .review_adapters import ADMISSION_VERSION, ADMIT, KEEP, REPLACE, adapter, contextual_offers
 
 LIMIT = 1_000_000
 PER_TURN = 5
@@ -89,7 +90,7 @@ def _plan(config, control, command):
                 "plant": config.plant,
                 "family": config.family,
                 "control_id": control.control_id,
-                "action_version": "1.0.0",
+                "action_version": ADMISSION_VERSION if command["action_id"] == ADMIT else "1.0.0",
             }.items()
         )
         or not command["proposed_by"]
@@ -102,7 +103,11 @@ def _plan(config, control, command):
     if not issue or issue["status"] == "RESOLVED":
         raise IntegrityError("Review issue is absent or already resolved")
     payload = json.loads(issue["payload_json"])
-    choice = offer(config, payload)
+    open_cases = control.db.execute(
+        "SELECT issue_id,payload_json FROM issues WHERE status!='RESOLVED'"
+    ).fetchall()
+    choices = contextual_offers(config, [json.loads(row[1]) for row in open_cases])
+    choice = choices[digest(payload)]
     if command["action_id"] not in choice["actions"] or command["issue_hash"] != choice.get(
         "issue_hash"
     ):
@@ -110,28 +115,29 @@ def _plan(config, control, command):
     a = adapter(config, control.control_id)
     old = choice["accepted"]
     candidate = old
-    if command["action_id"] == REPLACE:
+    if command["action_id"] in {REPLACE, ADMIT}:
         variants = {r["hash"]: r["row"] for r in choice["candidates"]}
         if command["candidate_hash"] not in variants:
             raise IntegrityError("Select an explicit candidate from the observed evidence")
         candidate = variants[command["candidate_hash"]]
     elif command["action_id"] != KEEP or command["candidate_hash"] is not None:
         raise IntegrityError("Invalid keep-first decision")
-    scope = _scope(a, old)
+    target = old if old is not None else candidate
+    scope = _scope(a, target)
     if scope:
         a.store.set_scope(scope)
     version, existing = a.store.read()
-    if control.setting("last_version") != str(version):
+    if (control.setting("last_version") or "None") != str(version):
         raise IntegrityError("Review destination is not confirmed")
-    if scope:
+    if scope and version is not None:
         from .mia_scope import files
 
         control.ensure_inspection_index(version, sum(row[2] for row in files(a.store.table())))
     rows = a.rows(existing)
-    if rows.get(a.key(old)) != old:
+    if rows.get(a.key(target)) != old:
         raise IntegrityError("Accepted value changed since the evidence was captured")
-    after = {**rows, a.key(old): candidate}
-    if command["action_id"] == REPLACE:
+    after = {**rows, a.key(target): candidate}
+    if command["action_id"] in {REPLACE, ADMIT}:
         a.validate(after)
         if config.family == "SIP_MAQUINA_MOLDEO":
             codes = dict(config.line_code_by_origin)
@@ -143,18 +149,23 @@ def _plan(config, control, command):
                 for ref in refs
             ):
                 raise IntegrityError("Correction changes the configured physical line")
-    known = {choice["accepted_hash"], *(r["hash"] for r in choice["candidates"])}
+    known = {r["hash"] for r in choice["candidates"]}
+    if choice["accepted_hash"] is not None:
+        known.add(choice["accepted_hash"])
     close = [command["source_issue_id"]]
     # Release related holds only if every known alternative is covered by this
     # exact decision. An unfamiliar third candidate remains pending.
-    for row in control.db.execute(
-        "SELECT issue_id,payload_json FROM issues WHERE status!='RESOLVED'"
-    ):
-        other = offer(config, json.loads(row[1]))
+    for row in open_cases:
+        other = choices[digest(json.loads(row[1]))]
         if (
             other["actions"]
-            and a.key(other["accepted"]) == a.key(old)
-            and {other["accepted_hash"], *(r["hash"] for r in other["candidates"])} <= known
+            and a.key(other["accepted"] or other["candidates"][0]["row"]) == a.key(target)
+            and {
+                h
+                for h in [other["accepted_hash"], *(r["hash"] for r in other["candidates"])]
+                if h is not None
+            }
+            <= known
         ):
             close.append(row[0])
     return {
@@ -177,12 +188,16 @@ def _execute(config, control, command, plan):
     table = a.store.table()
     version, raw = a.store.read(table)
     rows = a.rows(raw)
-    history = [h for h in table.history() if h.get("ingesta_operation_id") == operation]
+    history = (
+        [h for h in table.history() if h.get("ingesta_operation_id") == operation] if table else []
+    )
     replacing = command["action_id"] == REPLACE
+    writing = command["action_id"] in {REPLACE, ADMIT}
+    expected_version = (plan["before_version"] if plan["before_version"] is not None else -1) + 1
     if history:
         if (
             len(history) != 1
-            or history[0]["version"] != plan["before_version"] + 1
+            or history[0]["version"] != expected_version
             or version != history[0]["version"]
             or state_hash(rows) != plan["after_hash"]
         ):
@@ -190,7 +205,7 @@ def _execute(config, control, command, plan):
     else:
         if version != plan["before_version"] or state_hash(rows) != plan["before_hash"]:
             raise IntegrityError("Review destination changed; decision must be reassessed")
-        if replacing:
+        if writing:
             # Match all original business columns, including nullable values.
             # This is a checked compare-and-swap, never an unrestricted overwrite.
             fields = a.config.contract.schema.names
@@ -199,9 +214,10 @@ def _execute(config, control, command, plan):
                 for f in fields
             )
             arrow = a.arrow([plan["candidate"]])
-            before = a.arrow([plan["old"]])
-            for f in fields:
-                arrow = arrow.append_column("before_" + f, before[f])
+            if replacing:
+                before = a.arrow([plan["old"]])
+                for f in fields:
+                    arrow = arrow.append_column("before_" + f, before[f])
             props = CommitProperties(
                 custom_metadata={
                     "ingesta_operation_id": operation,
@@ -217,24 +233,36 @@ def _execute(config, control, command, plan):
                 ),
                 max_commit_retries=0,
             )
-            metrics = (
-                table.merge(
-                    arrow, predicate, source_alias="s", target_alias="t", commit_properties=props
+            if replacing:
+                metrics = (
+                    table.merge(
+                        arrow,
+                        predicate,
+                        source_alias="s",
+                        target_alias="t",
+                        commit_properties=props,
+                    )
+                    .when_matched_update({f: f"s.`{f}`" for f in fields})
+                    .execute()
                 )
-                .when_matched_update({f: f"s.`{f}`" for f in fields})
-                .execute()
-            )
-            if (
-                metrics["num_target_rows_updated"] != 1
-                or metrics["num_target_rows_inserted"]
-                or metrics["num_target_rows_deleted"]
-            ):
-                raise IntegrityError("Review did not update exactly one homologous row")
+                if (
+                    metrics["num_target_rows_updated"] != 1
+                    or metrics["num_target_rows_inserted"]
+                    or metrics["num_target_rows_deleted"]
+                ):
+                    raise IntegrityError("Review did not update exactly one homologous row")
+            else:
+                write_deltalake(
+                    table if table else str(a.store.path),
+                    arrow,
+                    mode="append" if table else "error",
+                    commit_properties=props,
+                )
             table = a.store.table()
             version, raw = a.store.read(table)
             rows = a.rows(raw)
             if (
-                version != plan["before_version"] + 1
+                version != expected_version
                 or state_hash(rows) != plan["after_hash"]
                 or not any(h.get("ingesta_operation_id") == operation for h in table.history())
             ):
@@ -253,7 +281,7 @@ def _execute(config, control, command, plan):
         "status": "VERIFIED",
         "verified_at": now(),
         "delta_version": version,
-        "operation_id": operation if replacing else None,
+        "operation_id": operation if writing else None,
         "before": plan["old"],
         "after": plan["candidate"],
         "action_id": command["action_id"],
@@ -266,7 +294,7 @@ def _execute(config, control, command, plan):
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (command["decision_id"],),
         )
-        if replacing:
+        if writing:
             control.db.execute(
                 "INSERT OR IGNORE INTO batches VALUES(?,?,'COMPLETED',?,?,?,?)",
                 (
@@ -279,7 +307,9 @@ def _execute(config, control, command, plan):
                 ),
             )
             control.db.execute(
-                "UPDATE settings SET value=? WHERE key='last_version'", (str(version),)
+                "INSERT INTO settings VALUES('last_version',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(version),),
             )
         control.db.executemany(
             "INSERT OR IGNORE INTO review_rejections VALUES(?,?)",
@@ -389,6 +419,15 @@ def process(config, control):
             command = json.loads(content)
             if not isinstance(command, dict) or command.get("decision_id") != identifier:
                 raise IntegrityError("Review filename and decision identity differ")
+            atomic(
+                result_path.with_suffix(".progress.json"),
+                {
+                    "decision_id": identifier,
+                    "command_hash": digest(command),
+                    "status": "RECEIVED_BY_WRITER",
+                    "at": now(),
+                },
+            )
             result = apply_command(config, control, command)
         except (IntegrityError, ValueError, KeyError) as exc:
             prior = control.db.execute(
@@ -426,4 +465,5 @@ def process(config, control):
                     )
         if result is not None:
             atomic(result_path, result)
+            result_path.with_suffix(".progress.json").unlink(missing_ok=True)
         processed += 1
