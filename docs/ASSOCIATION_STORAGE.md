@@ -40,3 +40,19 @@ El inventario de mantenimiento incluye ahora todos los subdirectorios de control
 incluido `association-artifacts`; el informe distingue SQLite, objetos compartidos,
 manifiestos, redirecciones y archivos antiguos restantes. La reducción definitiva
 debe medirse en el servidor, sin extrapolar el resultado de las pruebas locales.
+
+## Aceptación real
+
+- Revisión desplegada: `cab87a14e3747cbb3a6ac236e763272930cb02b1`.
+- Conversión: Actions `39988402731`, `ASSOCIATIONS_COMPACTED`, 35 lotes,
+  1.092 archivos heredados retirados y cero pendientes. La ingesta no se pausó.
+- Carpeta completa antes/después: 36.478.344.584 / 431.796.670 bytes; reducción
+  del 98,8 %. La cifra incluye los objetos, manifiestos, redirecciones y el log.
+- Verificación independiente: Actions `39989757472`, `VERIFIED`, 553 publicaciones,
+  1.106 referencias históricas, 22.448 bloques compartidos y los dos documentos
+  vigentes comprobados. Cero referencias resueltas ausentes o datos huérfanos.
+- Los antiguos nombres siguen registrados en la auditoría: se resuelven mediante
+  las redirecciones. El contenido JSON original se conserva íntegro.
+- Comprobación posterior de continuidad: Actions `40282901156`, carpeta en
+  441.315.109 bytes, ingesta activa y avance de las tablas MIA. La cifra de
+  asociaciones no incluye los SQLite ni la auditoría histórica independiente.

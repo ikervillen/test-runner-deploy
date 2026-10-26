@@ -59,15 +59,25 @@ El volumen aislado del ensayo `fenix-aiala-develop-trial-8111fae1698c` se retir�
 - Una asociación aplazada por cola MIA publica una observación reciente con su dependencia explícita; no simula un intento ni una nueva publicación de datos derivados.
 - Los avisos por correo siguen pendientes de configurar SMTP, por decisión del usuario. La existencia de reglas en Grafana no implica envío de correo.
 
-## Hallazgo abierto: snapshots de asociaciones
+## Hallazgo resuelto: snapshots de asociaciones
 
-Tras el despliegue el usuario informó de más de 30 GB en `control/association-artifacts`. Esta cifra procede de su inspección del servidor; el inventario remoto anterior no midió ese directorio. Por tanto, la aceptación del almacenamiento total sigue abierta.
+Tras el despliegue el usuario informó de más de 30 GB en `control/association-artifacts`. El inventario anterior había omitido esta carpeta. La comprobación específica encontró 1.086 archivos y 36.150.705.596 bytes, todos referenciados por 543 publicaciones; no eran archivos huérfanos que pudieran eliminarse sin sustituirlos.
 
-El código vigente (`association_service.process` y `association_storage.artifact`) conserva, por publicación, un bundle con todas las filas aceptadas de las fuentes y un ledger completo de atribuciones. Cambiar las versiones de entrada puede generar otra copia completa aunque solo hayan cambiado unas pocas filas. Los archivos idénticos se deduplican por hash; los casi idénticos no. La retención actual conserva todas las publicaciones y no recoge sus artefactos históricos. Esta carpeta no es la auditoría nueva de la conversión SQLite.
+El código anterior conservaba, por publicación, un bundle completo de fuentes y un ledger completo de atribuciones. Cambiar unas pocas filas generaba otras copias casi iguales. La corrección comparte bloques inmutables entre publicaciones y conserva manifiestos y redirecciones verificadas; mantiene el contenido JSON exacto y las referencias originales de auditoría. Esta carpeta es distinta de la auditoría de la conversión SQLite.
 
-No borrar el directorio ni aplicar una regla únicamente por antigüedad: la publicación vigente, la recuperación y la inspección de asociaciones consultan referencias a estos archivos. Falta un inventario de archivos/tamaños y referencias desde publicaciones, operaciones pendientes y evidencias; debe distinguir activos, historia referenciada, huérfanos y temporales.
+Las entregas se integraron en los PR [33](https://github.com/ikervillen/test-runner-deploy/pull/33) y [34](https://github.com/ikervillen/test-runner-deploy/pull/34), con CI Windows/Linux e imagen Docker aprobadas. El [despliegue final](https://github.com/ikervillen/test-runner-deploy/actions/runs/39977636817) activó la revisión `cab87a14e3747cbb3a6ac236e763272930cb02b1`. El contrato de despliegue impide regresar a un lector incompatible.
 
-La siguiente corrección debe evitar snapshots acumulativos de todo el histórico, usar referencias a fuentes/versiones y evidencia mínima reproducible, y establecer retención y retirada verificadas. Toda sustitución debe preservar las decisiones y la explicación histórica necesaria, coordinarse con la retención de versiones Delta y comprobar la recuperación. La migración SQLite y el despliegue están completados; este hallazgo impide dar por cerrada la optimización global de almacenamiento.
+La [conversión remota](https://github.com/ikervillen/test-runner-deploy/actions/runs/39988402731) terminó con `ASSOCIATIONS_COMPACTED`: 1.092 archivos heredados convertidos en 35 lotes, cero heredados restantes y `writer_paused=false`. Entre el primer inventario y el inicio aparecieron seis snapshots heredados adicionales; también quedaron convertidos. Al comenzar la operación, toda la carpeta ocupaba 36.478.344.584 bytes; al terminar ocupaba **431.796.670 bytes** (aproximadamente **432 MB**, reducción del **98,8 %**). La conversión no trasladó las copias a otra carpeta.
+
+La [verificación independiente](https://github.com/ikervillen/supervision_pruebas/actions/runs/39989757472) terminó con `VERIFIED`: **1.106 referencias históricas** de **553 publicaciones**, **22.448 bloques compartidos** y los dos documentos de la publicación vigente verificados; cero referencias resueltas ausentes y cero archivos de datos huérfanos detectados. Los nombres originales retirados se resuelven por redirecciones; su ausencia física no implica evidencia perdida.
+
+Desglose al finalizar: objetos compartidos 153.111.438 bytes, manifiestos 277.232.326 bytes, redirecciones 679.224 bytes y justificantes de conversión. La auditoría SQLite permaneció separada en 1.425.459.529 bytes; no se eliminó ni se ocultó en la cifra de asociaciones.
+
+La ingesta continuó durante la operación: LISTA_RECH pasó de 1.172.867 a 1.180.766 filas y de la versión Delta 1218 a la 1248. Es avance normal del escritor activo; el conversor de artefactos no escribe en Delta. Consultar [ASSOCIATION_STORAGE.md](ASSOCIATION_STORAGE.md) para el protocolo y la recuperación. No borrar objetos compartidos por antigüedad: requieren conciliación de las referencias de todos los manifiestos.
+
+La [inspección posterior de continuidad](https://github.com/ikervillen/test-runner-deploy/actions/runs/40282901156) confirmó la misma revisión desplegada y `association-artifacts` en **441.315.109 bytes**: aproximadamente 9,5 MB adicionales desde la aceptación, con ingesta activa. LISTA_RECH alcanzó 1.383.585 filas (versión 1653) y LISTA_DEFECTOS 263.231 (versión 1639). Los resúmenes no registraban errores de mantenimiento ni estados de reintento pendientes; algunas fuentes conservaban estados parciales/cola de negocio que esta corrección no resuelve.
+
+Inventario de control en esa comprobación: SQLite activos 820.371.456 bytes, asociaciones 441.315.109, auditoría histórica comprimida 1.425.459.529, exportaciones de supervisión 9.234.469 y trabajo temporal 0. Son componentes diferentes; los 441 MB no representan todo el directorio de control. La auditoría histórica sigue conservada y el crecimiento de índices/datos nuevos requiere observación continuada.
 
 ## Alcance de la aceptación
 

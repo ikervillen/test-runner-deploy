@@ -286,7 +286,7 @@ Cada entrega termina en un resultado revisable, pruebas pertinentes y actualizac
 | 6. Migración aislada | Ensayo real aprobado para las 13 familias | Actions `39943804363`, `TRIAL_VERIFIED`; origen de solo lectura, cero cambios SQL y cero diferencias de versión Delta en la ventana detenida. |
 | 7. Piloto | Conversión, despliegue y retirada verificada de copias completados | Actions `39959812916`, `39961708764` y `39968426775`; revisión `6b155cd496a1abafba267fb877d6169d7524bb3c`, 13 copias retiradas y escritor reanudado. |
 | 8. Resto de fuentes | Implementado, CI y conversión real superadas | 13 controles conciliados, cero operaciones pendientes en la comprobación final; contratos y revisiones conservados. |
-| 9. Supervisión y cierre | Supervisión desplegada y validada; aceptación global de almacenamiento abierta | Actions `39969668115` (`PASSED`). Pendiente incluir `association-artifacts` en inventario/retención: el usuario comunica más de 30 GB y el código conserva snapshots completos por publicación. Ver `RESULTADOS_CONTROL_V3.md`. |
+| 9. Supervisión y cierre | Supervisión y correcciones de almacenamiento desplegadas y verificadas; observación continua | Actions `39969668115` (`PASSED`), `39988402731` (`ASSOCIATIONS_COMPACTED`) y `39989757472` (`VERIFIED`). `association-artifacts` de 36,48 GB a 432 MB, 1.106 referencias históricas verificadas. Inventario ampliado a todos los subdirectorios de control. Ver `RESULTADOS_CONTROL_V3.md`. |
 
 Actualizar esta tabla con fechas, revisiones y resultados verificables; distinguir código escrito, CI superada, migración ensayada y despliegue aceptado.
 
