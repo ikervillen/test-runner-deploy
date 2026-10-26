@@ -18,7 +18,14 @@ from ingesta_delta_lake.control import Control
 from ingesta_delta_lake.defects_control import DefectsControl
 from ingesta_delta_lake.mp9_control import Mp9Control
 from ingesta_delta_lake.rejections_storage import RejectionsControl
-from ingesta_delta_lake.review_adapters import KEEP, REPLACE, adapter, offer
+from ingesta_delta_lake.review_adapters import (
+    ADMISSION_VERSION,
+    ADMIT,
+    KEEP,
+    REPLACE,
+    adapter,
+    offer,
+)
 from ingesta_delta_lake.reviews import apply_command, atomic
 from ingesta_delta_lake.service import run
 from ingesta_delta_lake.topology_storage import TopologyControl
@@ -270,3 +277,88 @@ def test_rejected_generation_command_is_audited_and_receipt_can_be_reissued(
     run(config)
     assert json.loads(path.read_text()) == result
     assert DeltaTable(str(config.table_path)).version() == before
+
+
+@pytest.mark.parametrize("crash_after_commit", [False, True])
+def test_admission_of_conflicting_candidates_without_an_accepted_row(
+    conflict, tmp_path, monkeypatch, crash_after_commit
+):
+    original, control_type, path, first, second = conflict
+    config = replace(
+        original,
+        silver_root=tmp_path / "admission-silver",
+        control_root=tmp_path / "admission-control",
+        bronze_root=tmp_path / "admission-bronze",
+    )
+    for family in (
+        "SIP_MODELO",
+        "SIP_DEFECTO",
+        "SIP_DEFECTO_STATUS",
+        "SIP_DEFECTO_AR",
+        "SIP_MAQUINA_MOLDEO",
+    ):
+        if family != config.family and path.with_name(family + ".csv").exists():
+            run(replace(config, family=family))
+    path.write_text(first + second, encoding="utf-8")
+    run(config)
+    with closing(control_type(config)) as control:
+        row = control.db.execute("SELECT * FROM issues WHERE status!='RESOLVED' LIMIT 1").fetchone()
+        from ingesta_delta_lake.review_adapters import contextual_offers
+
+        choices = contextual_offers(
+            config,
+            [
+                json.loads(r[0])
+                for r in control.db.execute(
+                    "SELECT payload_json FROM issues WHERE status!='RESOLVED'"
+                )
+            ],
+        )
+        choice = choices[digest(json.loads(row["payload_json"]))]
+        assert choice["accepted"] is None
+        assert choice["actions"] == [ADMIT]
+        decision = {
+            "schema_version": 1,
+            "decision_id": str(uuid.uuid4()),
+            "projection_issue_id": "c" * 64,
+            "source_issue_id": row["issue_id"],
+            "environment": config.environment,
+            "plant": config.plant,
+            "family": config.family,
+            "control_id": control.control_id,
+            "issue_hash": choice["issue_hash"],
+            "action_id": ADMIT,
+            "action_version": ADMISSION_VERSION,
+            "candidate_hash": choice["candidates"][0]["hash"],
+            "proposed_by": "responsable",
+            "authorized_by": "iker",
+            "authorized_at": now(),
+        }
+        if crash_after_commit:
+            from ingesta_delta_lake import reviews
+
+            original_write = reviews.write_deltalake
+
+            def commit_then_crash(*args, **kwargs):
+                original_write(*args, **kwargs)
+                raise RuntimeError("Process lost after admitting candidate")
+
+            monkeypatch.setattr(reviews, "write_deltalake", commit_then_crash)
+            with pytest.raises(RuntimeError, match="lost after"):
+                apply_command(config, control, decision)
+            monkeypatch.setattr(reviews, "write_deltalake", original_write)
+        result = apply_command(config, control, decision)
+        assert result["before"] is None and result["after"] == choice["candidates"][0]["row"]
+        assert result["status"] == "VERIFIED" and result["operation_id"]
+        assert apply_command(config, control, decision) == result
+        assert DeltaTable(str(config.table_path)).to_pyarrow_table().num_rows == 1
+        assert (
+            control.db.execute("SELECT count(*) FROM issues WHERE status!='RESOLVED'").fetchone()[0]
+            == 0
+        ), [
+            dict(r)
+            for r in control.db.execute(
+                "SELECT reason,payload_json FROM issues WHERE status!='RESOLVED'"
+            )
+        ]
+    assert run(config)["status"] in {"NO_CHANGE", "NO_INPUTS"}

@@ -29,7 +29,11 @@ def test_optional_export_is_committed_and_replay_safe(config, source, monkeypatc
     monkeypatch.setattr(module, "INTERVAL", 0)
     run(config)
     conflict = json.loads(path.read_text(encoding="utf-8"))
-    assert conflict["issues"] and conflict["publication"] == value["publication"]
+    assert conflict["issues"]
+    assert {
+        k: conflict["publication"][k] for k in ("delta_version", "operation_id", "confirmed_at")
+    } == {k: value["publication"][k] for k in ("delta_version", "operation_id", "confirmed_at")}
+    assert conflict["publication"]["quality_hash"] != value["publication"]["quality_hash"]
     assert len(list((config.table_path / "_delta_log").glob("*.json"))) == 1
 
 
