@@ -164,6 +164,7 @@ def export(control, config, result, *, force=False):
                 "SELECT finished_at,status FROM attempts WHERE finished_at IS NOT NULL "
                 "ORDER BY rowid DESC LIMIT 1"
             ).fetchone()
+            retry = json.loads(control.setting("retry_state") or "null")
             issues, size = [], 0
             for row in control.db.execute(
                 "SELECT issue_id,reason,status,first_seen,"
@@ -227,9 +228,13 @@ def export(control, config, result, *, force=False):
                 "issues": issues,
                 "stats": {
                     "last_attempt": (
-                        {"finished_at": last_attempt[0], "status": last_attempt[1]}
-                        if last_attempt
-                        else None
+                        {"finished_at": retry["updated_at"], "status": "FAILED"}
+                        if retry
+                        else (
+                            {"finished_at": last_attempt[0], "status": last_attempt[1]}
+                            if last_attempt
+                            else None
+                        )
                     ),
                     "attempted_this_observation": result.get("attempted", True),
                     "derived_publications": _derived_publications(control, config),
