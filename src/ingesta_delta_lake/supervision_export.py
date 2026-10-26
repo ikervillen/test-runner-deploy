@@ -103,13 +103,17 @@ def _derived_publications(control, config):
         return {}
     if config.family == "CATALOGO_PRODUCCIONES":
         row = control.db.execute(
-            "SELECT source_manifest_json,diagnostics_json FROM publications "
+            "SELECT source_manifest_json,diagnostics_json,confirmed_at,delta_version,complete "
+            "FROM publications "
             "ORDER BY publication_no DESC LIMIT 1"
         ).fetchone()
         if not row:
             return {}
         return {
             "catalog": {
+                "confirmed_at": row[2],
+                "delta_version": row[3],
+                "complete": bool(row[4]),
                 "source_versions": {f: d["version"] for f, d in json.loads(row[0]).items()},
                 "pending_candidates": len(json.loads(row[1]).get("pending_candidates", [])),
             }
