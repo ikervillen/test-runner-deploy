@@ -270,7 +270,9 @@ def _process(config: Config, control: Control, attempt: str, stop_requested=None
     }
 
 
-def run(config: Config, *, runtime_owner: bool = False, stop_requested=None) -> dict:
+def run(
+    config: Config, *, runtime_owner: bool = False, stop_requested=None, reviews_only=False
+) -> dict:
     config.validate()
     for path in (config.bronze_root, config.silver_root, config.control_root):
         path.mkdir(parents=True, exist_ok=True)
@@ -328,6 +330,17 @@ def run(config: Config, *, runtime_owner: bool = False, stop_requested=None) -> 
             with closing(control_class(config)) as control:
                 from . import retry_control
 
+                if reviews_only:
+                    from .reviews import process as process_reviews
+                    from .supervision_export import export
+
+                    if control.pending():
+                        result = {"status": "REVIEW_WAITING_RECOVERY", "attempted": False}
+                    else:
+                        process_reviews(config, control)
+                        result = {"status": "REVIEWS_CHECKED", "attempted": False}
+                    export(control, config, result, force=True)
+                    return result
                 if control.compact and runtime_owner:
                     waiting = retry_control.ready(control)
                     if waiting:
