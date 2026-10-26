@@ -218,6 +218,35 @@ def activate():
     return {"status": "ACTIVATED", "token": token}
 
 
+def service_reviews(base, stop, on_result):
+    """Short decision turns between ingestion phases; same family locks, no scanner."""
+    configured = os.environ.get("INGESTA_REVIEW_ROOT")
+    if not configured:
+        return
+    root = Path(configured)
+    for family in ORDER:
+        if stop.is_set():
+            break
+        config = replace(base, family=family)
+        if not config.control_path.exists():
+            continue
+        pending = any(
+            not (root / "results" / family / path.name).exists()
+            for path in (root / "commands" / family).glob("*.json")
+            if not path.name.endswith(".progress.json")
+        )
+        if not pending:
+            continue
+        from .service import run
+
+        started = time.monotonic()
+        try:
+            result = run(config, runtime_owner=True, reviews_only=True)
+        except Exception as exc:
+            result = {"status": "FAILED", "error": str(exc), "attempted": False}
+        on_result(family, result, round(time.monotonic() - started, 3))
+
+
 def worker(interval=600):
     if not 10 <= interval <= 86400:
         raise ConfigurationError("Intervalo fuera de rango")
@@ -307,6 +336,7 @@ def worker(interval=600):
                             )
                             continue
                         run_phase(base, phase, stop, stop_path, record, active)
+                        service_reviews(base, stop, record)
                 else:
                     for family in ORDER:
                         if stop.is_set():
@@ -333,6 +363,7 @@ def worker(interval=600):
                         except Exception as exc:
                             result = {"status": "FAILED", "error": str(exc)}
                         record(family, result, round(time.monotonic() - started, 3))
+                        service_reviews(base, stop, record)
                 with guard:
                     status.update(phase="IDLE", family=None)
                 # Rotate immediately while a durable backlog exists. When caught

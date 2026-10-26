@@ -221,6 +221,11 @@ def process_batch(
 ):
     store = store_class(config, control.control_id)
     recovered, recovery_count = reconcile_pending(config, control, store_class)
+    # Already under this family's writer lock. Give decisions a turn between
+    # bounded MIA batches, before reading the next snapshot or parsing new rows.
+    from .reviews import process as process_reviews
+
+    process_reviews(config, control)
     parsed = model.parse(snapshots, config.encoding)
     from .review_adapters import filter_rejected
 
