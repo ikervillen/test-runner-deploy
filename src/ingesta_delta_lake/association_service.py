@@ -386,7 +386,9 @@ def inspect(config, source_id=None, productions=()):
     result = {
         "status": "STALE" if not fresh else "OK" if pub["complete"] else "PARTIAL",
         "fresh": fresh,
-        "complete": fresh and pub["complete"],
+        "complete": fresh and pub["complete"] and pub.get("scope", "full") == "full",
+        "publication_scope": pub.get("scope", "full"),
+        "observation_status": pub.get("observation_status", "EVALUATED"),
         "delta_version": version,
         "stale_sources": stale,
         "associations": list(accepted.values()),
