@@ -250,8 +250,11 @@ class DefectsControl(Control):
         old_groups, old_origins = json.loads(self.setting("inspection_index_holds") or "[[],[]]")
         groups, origins = holds
         reset = (
-            "UPDATE inspection_current SET status='RESOLVED',inspected="
-            "json_extract(payload_json,'$.accepted_inspection_values[0]') "
+            "UPDATE inspection_current SET status=CASE WHEN "
+            "json_array_length(payload_json,'$.accepted_inspection_values')=1 "
+            "THEN 'RESOLVED' ELSE 'REVIEW' END,inspected=CASE WHEN "
+            "json_array_length(payload_json,'$.accepted_inspection_values')=1 "
+            "THEN json_extract(payload_json,'$.accepted_inspection_values[0]') ELSE NULL END "
         )
         self.db.executemany(
             reset + "WHERE group_id=?", [(g,) for g in set(old_groups) - set(groups)]
