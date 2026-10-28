@@ -663,6 +663,10 @@ def assign(bundle, registry, ar_index, review_scopes=()):
                     "rule": RULE,
                 }
             )
+    if bundle.get("topology_enabled"):
+        from .ar_attribution import resolve
+
+        resolve(bundle, ledger, lambda row: ar_productions(bundle, row))
     return ledger
 
 
