@@ -137,6 +137,7 @@ def _derived_publications(control, config):
                 "delta_version": row[1],
                 "complete": pub["complete"],
                 "pending_rows": pub["pending_rows"],
+                "counts": pub.get("counts", {}),
                 "open_reviews": pub["open_reviews"],
                 "source_versions": {f: d["version"] for f, d in pub["manifest"].items()},
                 "source_quality_hashes": {

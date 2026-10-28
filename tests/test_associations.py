@@ -571,6 +571,54 @@ def test_closed_zero_length_ar_at_boundary_belongs_to_new_zone_not_old(bundle):
     assert a.ar_productions(bundle, row) == [pid(20)]
 
 
+def test_model_boundary_whitespace_does_not_block_ar_or_modify_dictionary(bundle):
+    row = dict(bundle["sources"]["LISTA_AR"][0])
+    model = next(r for r in bundle["sources"]["SIP_MODELO"] if r["id_modelo_fenix"] == 1)
+    model["codigo_modelo_botella"] = "1000/001 "
+    assert a.ar_productions(bundle, row) == [pid(10)]
+    assert model["codigo_modelo_botella"] == "1000/001 "
+    model["codigo_modelo_botella"] = "1000/01"
+    assert a.ar_productions(bundle, row) == []
+
+
+def test_pending_diagnostics_reconcile_by_family_origin_and_status():
+    ledger = [
+        {"family": "LISTA_RECH", "origin": "AV21", "status": "ASSIGNED", "productions": ["p"]},
+        {"family": "LISTA_RECH", "origin": "AV21", "status": "PENDING_TOPOLOGY", "productions": []},
+        {"family": "LISTA_RECH", "origin": "AV23", "status": "PREPARATION", "productions": []},
+    ]
+    stats = a.diagnostics(ledger)["LISTA_RECH"]
+    assert stats["source_rows"] == 3 and stats["pending_rows"] == 1
+    assert stats["assigned_rows"] == 1 and stats["unassigned_rows"] == 2
+    assert stats["by_origin"] == {
+        "AV21": {"ASSIGNED": 1, "PENDING_TOPOLOGY": 1},
+        "AV23": {"PREPARATION": 1},
+    }
+    assert sum(sum(counts.values()) for counts in stats["by_origin"].values()) == 3
+
+
+@pytest.mark.parametrize(
+    "description,expected",
+    [
+        ("Rechazo Trampilla", "ZF"),
+        ("Rechazo Trampilla ZC", "ZC"),
+        ("Rechazo Trampilla ZF", "ZF"),
+        ("Unknown changed meaning", None),
+    ],
+)
+def test_confirmed_trapdoor_default_yields_to_explicit_source_zone(bundle, description, expected):
+    bundle["sources"]["SIP_DEFECTO_AR"].append(
+        {
+            "id_tipo_ar_fenix": 6,
+            "codigo_tipo_ar": 6,
+            "descripcion": description,
+            "codigo_agrupacion": 2,
+        }
+    )
+    row = {**bundle["sources"]["LISTA_AR"][0], "TIPO": 6}
+    assert a.zone_for_ar(bundle, row) == expected
+
+
 def test_conflicting_model_evidence_blocks_even_approved_branch(bundle):
     row = bundle["sources"]["LISTA_RECH"][0]
     ar = dict(bundle["sources"]["LISTA_AR"][1])

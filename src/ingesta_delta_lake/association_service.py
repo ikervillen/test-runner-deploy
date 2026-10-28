@@ -20,7 +20,7 @@ from .association_storage import (
 from .common import ConfigurationError, IntegrityError, canonical, digest
 from .service import _apply
 
-PUBLICATION_POLICY = "streamed-publication-v1"
+PUBLICATION_POLICY = "streamed-publication-v2"
 
 
 def decisions(config):
@@ -238,18 +238,7 @@ def _process(config, control, attempt, *, physical=False):
     ]
     resolved = [i for i, p in cases if _can_resolve(p, registry, current_ids)]
     remaining = [i for i, _ in cases if i not in resolved]
-    pending = sum(
-        r["status"]
-        not in {
-            "ASSIGNED",
-            "OLD_PLUS_PREPARATION",
-            "NEW_PLUS_PREPARATION",
-            "SHARED_MACHINE",
-            "PREPARATION",
-            "TRANSITION_TO_OUTGOING",
-        }
-        for r in ledger
-    )
+    pending = sum(r["status"] not in a.ACCEPTED_STATUSES for r in ledger)
     complete = not (
         remaining
         or pending
