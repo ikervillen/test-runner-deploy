@@ -305,7 +305,10 @@ def test_concurrent_same_model_keeps_physical_productions_separate(config, found
     assert inspect(config)["counts"]["LISTA_RECH"]["assigned_rows"] == 3
     rows = ledger(config)
     assert all(len(r["productions"]) <= 1 for r in rows if r["family"] == "LISTA_RECH")
-    assert any(r["family"] == "LISTA_AR" and r["status"] == "AMBIGUOUS_PRODUCTION" for r in rows)
+    ar_rows = [r for r in rows if r["family"] == "LISTA_AR"]
+    assert len(ar_rows) == 2 and all(r["status"] == "ASSIGNED" for r in ar_rows)
+    resolved = next(r for r in ar_rows if r.get("evidence_source_ids"))
+    assert resolved["productions"] == [pid(config, 2007)]
 
 
 def test_late_closure_versions_auto_episodes_without_changing_identity(config, foundation):
