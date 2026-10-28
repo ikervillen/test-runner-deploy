@@ -79,7 +79,9 @@ def settings():
         environment="development",
         control_format=3,
         topology_enabled=True,
-        mia_batches_per_turn=1,
+        # Amortize the expensive Windows input scan across three bounded batches.
+        # Batches remain sequential and each retains its own durable receipt.
+        mia_batches_per_turn=int(os.environ.get("INGESTA_MIA_BATCHES_PER_TURN", "3")),
         input_scan_interval_seconds=600,
         timestamp_policy="local_naive_test_v1",
         line_by_origin=tuple(value["line_by_origin"].items()),

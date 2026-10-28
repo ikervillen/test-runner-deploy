@@ -40,3 +40,24 @@ No borrar observaciones ni controles para poner el indicador a cero. La suma de
 estados por origen debe conciliar con las filas fuente, y los pendientes del
 resumen deben coincidir con el ledger. No hace falta una intervención por fila:
 se corrigen causas comunes o se aprueba una regla para el grupo afectado.
+
+## Presupuesto de cola tras la primera validación
+
+La publicación del 28/10 a las 16:20:26 contiene 1.923.312 observaciones y solo
+53 pendientes, conciliados con el ledger. Defectos y rechazos tienen cero
+observaciones publicadas sin producción; quedan 24 AR sin zona, 21 ambiguos,
+2 cierres que exceden la producción y 6 transiciones de rueda.
+
+La cola de archivos es distinta de esos pendientes de asociación. Se midieron
+397 segundos para un turno de rechazos y 340 para defectos, mientras que sus
+lotes de ocho archivos consumían 28 y 46 segundos respectivamente. El coste de
+explorar/verificar los archivos históricos domina el turno. El runtime usará
+tres lotes acotados por turno para amortizar ese coste y atender más orígenes.
+`INGESTA_MIA_BATCHES_PER_TURN` permite configurar el presupuesto; se mantiene la
+validación de Config y la rotación por origen existente.
+
+Los lotes se ejecutan secuencialmente: cada uno conserva sus límites de ocho
+archivos y 4 MiB, lectura contextual, intención y confirmación propias. No se
+triplica la memoria del lote ni se aumenta el número de escritores por tabla.
+La parada sigue atendiendo el límite entre lotes y el trabajo confirmado se
+recupera sin reinicializar el lago ni los controles.
