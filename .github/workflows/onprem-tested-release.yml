@@ -1,0 +1,94 @@
+name: Release tested ingestion on existing on-prem runner
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        type: string
+        required: true
+      validated_run:
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+  packages: write
+jobs:
+  release:
+    runs-on: ${{ fromJSON(vars.INGESTA_RUNNER_LABELS || '["self-hosted","Windows","X64"]') }}
+    environment: develop
+    timeout-minutes: 60
+    concurrency:
+      group: ingesta-deploy-${{ github.repository }}-develop
+      cancel-in-progress: false
+    env:
+      REVISION: ${{ inputs.revision }}
+      VALIDATED_RUN: ${{ inputs.validated_run }}
+      INGESTA_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      INGESTA_REGISTRY_USER: ${{ github.actor }}
+    steps:
+      - name: Require successful Linux and Windows tests for current develop HEAD
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:REVISION -notmatch '^[a-f0-9]{40}$' -or $env:VALIDATED_RUN -notmatch '^\d+$') { throw 'Invalid release identity' }
+          $headers = @{ Authorization = "Bearer $env:INGESTA_GITHUB_TOKEN"; Accept = 'application/vnd.github+json' }
+          $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
+          $head = Invoke-RestMethod "$api/git/ref/heads/develop" -Headers $headers
+          $run = Invoke-RestMethod "$api/actions/runs/$env:VALIDATED_RUN" -Headers $headers
+          if ($head.object.sha -ne $env:REVISION -or $run.head_sha -ne $env:REVISION -or $run.head_branch -ne 'develop' -or $run.event -ne 'push') { throw 'Release is not the tested develop HEAD' }
+          $jobs = Invoke-RestMethod "$api/actions/runs/$env:VALIDATED_RUN/jobs?filter=latest" -Headers $headers
+          foreach ($os in @('ubuntu-latest', 'windows-latest')) {
+            $matches = @($jobs.jobs | Where-Object { $_.name -eq "contracts-and-delta ($os)" -and $_.conclusion -eq 'success' })
+            if ($matches.Count -ne 1) { throw "Missing successful tests for $os" }
+          }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.revision }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Build and exercise the exact tested source without operational mounts
+        id: image
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $image = "ghcr.io/$($env:GITHUB_REPOSITORY.ToLower()):sha-$env:REVISION"
+          docker build --build-arg "REVISION=$env:REVISION" --build-arg "SOURCE=https://github.com/$env:GITHUB_REPOSITORY" --build-arg 'BRANCH=develop' -t $image .
+          if ($LASTEXITCODE -ne 0) { throw 'Image build failed' }
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,size=512m $image self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Final image self-test failed' }
+          $originalConfig = $env:DOCKER_CONFIG
+          $sourceConfig = if ($originalConfig) { $originalConfig } else { Join-Path $env:USERPROFILE '.docker' }
+          $temporaryParent = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+          $temporaryConfig = Join-Path $temporaryParent ('fenix-release-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $temporaryConfig | Out-Null
+          try {
+            $contexts = Join-Path $sourceConfig 'contexts'
+            if (Test-Path -LiteralPath $contexts) { Copy-Item -LiteralPath $contexts -Destination $temporaryConfig -Recurse }
+            $env:DOCKER_CONFIG = $temporaryConfig
+            python deployment/registry.py
+            if ($LASTEXITCODE -ne 0) { throw 'Registry authentication failed' }
+            docker push $image
+            if ($LASTEXITCODE -ne 0) { throw 'Image publication failed' }
+            $digest = docker image inspect --format '{{index .RepoDigests 0}}' $image
+            if ($LASTEXITCODE -ne 0 -or $digest -notmatch '@sha256:[a-f0-9]{64}$') { throw 'Missing immutable image digest' }
+            [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "image=$digest`n", [Text.UTF8Encoding]::new($false))
+          }
+          finally {
+            $env:DOCKER_CONFIG = $originalConfig
+            $target = [IO.Path]::GetFullPath($temporaryConfig)
+            if (-not $target.StartsWith($temporaryParent + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe temporary cleanup path' }
+            Remove-Item -LiteralPath $target -Recurse -Force
+          }
+      - name: Activate the image using the existing graceful deployment protocol
+        shell: powershell
+        env:
+          DEPLOY_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
+          INPUT_BIND: ${{ vars.INGESTA_INPUT_BIND }}
+          DOCKER_CONTEXT_NAME: ${{ vars.INGESTA_DOCKER_CONTEXT }}
+          RELEASE_IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $site = ./scripts/prepare_site.ps1 -Repository $env:GITHUB_REPOSITORY -Branch develop -SitePath $env:DEPLOY_SITE -InputBind $env:INPUT_BIND -DockerContext $env:DOCKER_CONTEXT_NAME
+          ./scripts/deploy.ps1 -Site $site -Branch develop -Image $env:RELEASE_IMAGE -Commit $env:REVISION -RunUrl "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
