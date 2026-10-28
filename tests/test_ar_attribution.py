@@ -1,5 +1,7 @@
 from copy import deepcopy
 
+import pytest
+
 from ingesta_delta_lake.ar_attribution import resolve
 from ingesta_delta_lake.associations import source_id
 
@@ -60,6 +62,28 @@ def test_contiguous_ar_segments_share_physical_witness_without_merging_rows():
     assert all(e["status"] == "ASSIGNED" for e in ledger[1:])
     assert all(e["productions"] == ["part-a"] for e in ledger[1:])
     assert all(e["evidence_source_ids"] == ["independent-mia"] for e in ledger[1:])
+
+
+@pytest.mark.parametrize(
+    "stamp,expected",
+    [
+        ("22:20:00", "ASSIGNED"),
+        ("22:25:00", "ASSIGNED"),
+        ("22:29:59", "ASSIGNED"),
+        ("22:30:00", "AMBIGUOUS_PRODUCTION"),
+    ],
+)
+def test_instantaneous_ar_uses_containing_physical_window_without_expanding_dates(stamp, expected):
+    bundle, ledger = fixture()
+    row = bundle["sources"]["LISTA_AR"][0]
+    row.update(FECHA_ON="2026-10-16T" + stamp, FECHA_OFF="2026-10-16T" + stamp)
+    bundle["sources"]["LISTA_AR"] = [row]
+    ledger = ledger[:2]
+    ledger[1]["source_id"] = source_id("LISTA_AR", row)
+    original = deepcopy(row)
+    resolve(bundle, ledger, lambda _: ["part-a", "part-b"])
+    assert ledger[1]["status"] == expected
+    assert row == original and row["FECHA_ON"] == row["FECHA_OFF"]
 
 
 def test_reused_group_number_does_not_bridge_a_gap_or_different_mold():

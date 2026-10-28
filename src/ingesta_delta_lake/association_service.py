@@ -20,7 +20,7 @@ from .association_storage import (
 from .common import ConfigurationError, IntegrityError, canonical, digest
 from .service import _apply
 
-PUBLICATION_POLICY = "streamed-publication-v3"
+PUBLICATION_POLICY = "streamed-publication-v4"
 
 
 def decisions(config):

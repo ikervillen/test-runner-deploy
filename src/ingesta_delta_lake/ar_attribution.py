@@ -65,7 +65,8 @@ def resolve(bundle, ledger, candidates):
             evidence = [
                 e
                 for start, end, e in witnesses[context]
-                if first["FECHA_ON"] <= start and end <= last["FECHA_OFF"]
+                if (first["FECHA_ON"] <= start and end <= last["FECHA_OFF"])
+                or (first["FECHA_ON"] == last["FECHA_OFF"] and start <= first["FECHA_ON"] < end)
             ]
             if any(
                 e["status"] not in {"ASSIGNED", "TRANSITION_TO_OUTGOING"}
