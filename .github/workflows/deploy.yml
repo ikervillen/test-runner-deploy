@@ -266,10 +266,10 @@ jobs:
           $run = Invoke-RestMethod "$api/actions/runs/$env:VALIDATED_RUN" -Headers $headers
           if ($head.object.sha -ne $env:REVISION -or $run.head_branch -ne 'develop' -or $run.event -ne 'push') { throw 'Release is not current develop HEAD' }
           if ($run.head_sha -ne $env:REVISION) {
-            # Reuse tests only for a direct child that changes this workflow alone.
+            # Reuse tests only while this workflow is the sole changed file.
             # Application, dependencies, Dockerfile and deployment code must be identical.
-            $commit = Invoke-RestMethod "$api/commits/$env:REVISION" -Headers $headers
-            if (@($commit.parents).Count -ne 1 -or $commit.parents[0].sha -ne $run.head_sha -or @($commit.files).Count -ne 1 -or $commit.files[0].filename -ne '.github/workflows/deploy.yml') { throw 'Application source differs from tested revision' }
+            $comparison = Invoke-RestMethod "$api/compare/$($run.head_sha)...$env:REVISION" -Headers $headers
+            if ($comparison.status -ne 'ahead' -or $comparison.total_commits -gt 10 -or @($comparison.files).Count -ne 1 -or $comparison.files[0].filename -ne '.github/workflows/deploy.yml') { throw 'Application source differs from tested revision' }
           }
           $jobs = Invoke-RestMethod "$api/actions/runs/$env:VALIDATED_RUN/jobs?filter=latest" -Headers $headers
           foreach ($os in @('ubuntu-latest', 'windows-latest')) {
@@ -289,7 +289,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $image = "ghcr.io/$($env:GITHUB_REPOSITORY.ToLower()):sha-$env:REVISION"
-          docker build --build-arg "REVISION=$env:REVISION" --build-arg "SOURCE=https://github.com/$env:GITHUB_REPOSITORY" --build-arg 'BRANCH=develop' -t $image .
+          docker build --platform linux/amd64 --provenance=false --build-arg "REVISION=$env:REVISION" --build-arg "SOURCE=https://github.com/$env:GITHUB_REPOSITORY" --build-arg 'BRANCH=develop' -t $image .
           if ($LASTEXITCODE -ne 0) { throw 'Image build failed' }
           docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,size=512m $image self-test
           if ($LASTEXITCODE -ne 0) { throw 'Final image self-test failed' }
@@ -306,7 +306,7 @@ jobs:
             $env:DOCKER_CONFIG = $temporaryConfig
             python deployment/registry.py
             if ($LASTEXITCODE -ne 0) { throw 'Registry authentication failed' }
-            docker --context $buildContext push $image
+            docker --context $buildContext push --platform linux/amd64 $image
             if ($LASTEXITCODE -ne 0) { throw 'Image publication failed' }
             $digest = docker --context $buildContext image inspect --format '{{index .RepoDigests 0}}' $image
             if ($LASTEXITCODE -ne 0 -or $digest -notmatch '@sha256:[a-f0-9]{64}$') { throw 'Missing immutable image digest' }
