@@ -124,7 +124,10 @@ def test_physical_episodes_commit_even_if_observation_stage_fails(config, founda
     current = inspect(config)
     assert current["counts"]["LISTA_RECH"]["assigned_rows"] == 3
     assert current["counts"]["LISTA_DEFECTOS"]["assigned_rows"] == 5
-    assert current["counts"]["CONT_ZC"]["assigned_rows"] == 0
+    assert current["counts"]["CONT_ZC"]["assigned_rows"] == 1
+    shared = next(r for r in ledger(config) if r["family"] == "CONT_ZC")
+    assert shared["status"] == "SHARED_MACHINE"
+    assert shared["productions"] == sorted([pid(config, 2005), pid(config, 2007)])
     assert {r["id_produccion"] for r in current["associations"] if r["ramal"] in (3, 4)} == {
         pid(config, 2005)
     }
@@ -195,8 +198,35 @@ def test_future_tandem_names_and_branch_numbers_are_not_hardcoded(config, founda
     for r in bundle["sources"]["SIP_LINEA_ZF"]:
         r["codigo_ramal"] += 40
     automatic = decisions(bundle, {}, dict(config.line_code_by_origin))
-    assert {r["branch"] for r in automatic} == {41, 42, 43, 44}
-    assert {r["production"] for r in automatic if r["branch"] in (43, 44)} == {pid(config, 2005)}
+    cold = [r for r in automatic if r["kind"] == "ZF_ASSOCIATION"]
+    assert {r["branch"] for r in cold} == {41, 42, 43, 44}
+    assert {r["production"] for r in cold if r["branch"] in (43, 44)} == {pid(config, 2005)}
+
+
+def test_zc_presence_uses_root_closure_and_shared_line_code(config, foundation):
+    from ingesta_delta_lake.association_storage import load_bundle
+    from ingesta_delta_lake.physical_assignments import decisions
+
+    bundle = load_bundle(config)
+    automatic = decisions(bundle, {}, dict(config.line_code_by_origin))
+    hot = [r for r in automatic if r["kind"] == "ZC_PRESENCE"]
+    assert len(hot) == 3 and {r["machine"] for r in hot} == {32}
+    old = next(r for r in hot if r["production"] == pid(config, 2003))
+    assert old["end"] == "2026-10-14T06:23:00"
+    assert old["end"] != bundle["sources"]["CATALOGO_PRODUCCIONES"][0]["fecha_fin_zf"]
+    registry = {r["id"]: r for r in automatic}
+    assert decisions(bundle, registry, dict(config.line_code_by_origin)) == automatic
+    bundle["catalog_composition"][pid(config, 2007)]["root"]["FECHA_OFF"] = "2026-10-19T06:00:00"
+    revised = next(
+        r
+        for r in decisions(bundle, registry, dict(config.line_code_by_origin))
+        if r["kind"] == "ZC_PRESENCE" and r["production"] == pid(config, 2007)
+    )
+    assert revised["revision"] == 2 and revised["end"] == "2026-10-19T06:00:00"
+    registry[revised["id"]] = {**revised, "actor": "human-reviewer"}
+    assert revised["id"] not in {
+        r["id"] for r in decisions(bundle, registry, dict(config.line_code_by_origin))
+    }
 
 
 @pytest.mark.parametrize("evidence_family", [None, "LISTA_RECH"])
