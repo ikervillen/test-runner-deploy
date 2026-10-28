@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "defaults": {
+    "6": {
+      "description": "Rechazo Trampilla",
+      "zone": "ZF",
+      "authority": "Confirmed by plant owner on 2026-10-28; explicit source zone takes precedence"
+    }
+  }
+}

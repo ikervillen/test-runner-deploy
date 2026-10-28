@@ -157,7 +157,7 @@ def production_context(bundle):
 def ar_zone_defaults():
     """Versioned operational interpretation; raw Fenix catalogs remain untouched."""
     document = json.loads(
-        files("ingesta_delta_lake").joinpath("data/ar_zone_defaults.json").read_text()
+        files("ingesta_delta_lake").joinpath("rules/ar_zone_defaults.json").read_text()
     )
     if document["version"] != 1:
         raise IntegrityError("Unsupported AR zone interpretation version")
