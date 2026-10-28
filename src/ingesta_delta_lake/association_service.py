@@ -20,7 +20,7 @@ from .association_storage import (
 from .common import ConfigurationError, IntegrityError, canonical, digest
 from .service import _apply
 
-PUBLICATION_POLICY = "streamed-publication-v4"
+PUBLICATION_POLICY = "streamed-publication-v5"
 
 
 def decisions(config):
@@ -125,6 +125,7 @@ def _process(config, control, attempt, *, physical=False):
         "scope": scope,
         "rule": a.RULE,
         "policy": PUBLICATION_POLICY,
+        "ar_interpretation_rules": a.ar_interpretation_rules(),
         "transformer_version": __version__,
         "timestamp_policy": config.timestamp_policy,
         "manifest": {

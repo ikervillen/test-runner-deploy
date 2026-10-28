@@ -1,6 +1,16 @@
 {
   "version": 1,
+  "revision": 2,
+  "zf_transition": {
+    "sample_window_minutes": 10,
+    "authority": "Plant owner approved outgoing AR continuity during model change on 2026-10-28; source timestamps remain unchanged and contradictory physical evidence takes precedence"
+  },
   "defaults": {
+    "5": {
+      "description": "Rechazo molde NP",
+      "zone": "ZF",
+      "authority": "Confirmed by plant owner on 2026-10-28; preserve original label and prefer explicit source zone"
+    },
     "6": {
       "description": "Rechazo Trampilla",
       "zone": "ZF",

@@ -122,3 +122,23 @@ def test_conflicting_or_empty_flow_evidence_never_selects_a_production():
         assert all(
             e["status"] == "AMBIGUOUS_PRODUCTION" for e in ledger if e["family"] == "LISTA_AR"
         )
+
+
+@pytest.mark.parametrize("machine,expected", [(1, "EVIDENCE_CONFLICT"), (2, "ASSIGNED")])
+def test_real_incoming_mia_on_same_half_overrides_outgoing_continuity(machine, expected):
+    bundle, ledger = fixture()
+    bundle["sources"]["LISTA_AR"] = bundle["sources"]["LISTA_AR"][:1]
+    bundle["sources"]["CATALOGO_PRODUCCIONES"] = [
+        {"id_produccion": "part-a", "ID_MAQUINA": 1},
+        {"id_produccion": "part-b", "ID_MAQUINA": machine},
+    ]
+    ledger = ledger[:2]
+    ledger[0]["productions"] = ["part-b"]
+    ledger[1].update(
+        status="ASSIGNED",
+        productions=["part-a"],
+        temporal_exception={"production_end": "2026-10-16T22:25:00"},
+    )
+    resolve(bundle, ledger, lambda _: ["part-a"])
+    assert ledger[1]["status"] == expected
+    assert ledger[1]["productions"] == ([] if machine == 1 else ["part-a"])

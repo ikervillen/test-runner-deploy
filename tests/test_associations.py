@@ -631,6 +631,98 @@ def test_conflicting_model_evidence_blocks_even_approved_branch(bundle):
     assert selected["status"] == "EVIDENCE_CONFLICT" and not selected["productions"]
 
 
+@pytest.mark.parametrize(
+    "description,zone",
+    [("Rechazo molde NP", "ZF"), ("Rechazo molde NP ZC", "ZC"), ("Unknown", None)],
+)
+def test_approved_type_five_preserves_source_label(bundle, description, zone):
+    original = {
+        "id_tipo_ar_fenix": 5,
+        "codigo_tipo_ar": 5,
+        "descripcion": description,
+        "codigo_agrupacion": 2,
+    }
+    bundle["sources"]["SIP_DEFECTO_AR"].append(original.copy())
+    row = {**bundle["sources"]["LISTA_AR"][0], "TIPO": 5}
+    assert a.zone_for_ar(bundle, row) == zone
+    assert bundle["sources"]["SIP_DEFECTO_AR"][-1] == original
+
+
+@pytest.mark.parametrize(
+    "end,expected",
+    [("07:23:01", True), ("07:23:02", True), ("07:28:00", True), ("07:33:01", False)],
+)
+def test_outgoing_ar_continuity_uses_transition_window_and_preserves_dates(bundle, end, expected):
+    row = bundle["sources"]["LISTA_AR"][0]
+    row["FECHA_OFF"] = "2026-10-14T" + end
+    before = dict(row)
+    entry = next(
+        r for r in a.assign(bundle, {}, {}) if r["source_id"] == a.source_id("LISTA_AR", row)
+    )
+    assert entry["productions"] == ([pid(10)] if expected else [])
+    assert ("temporal_exception" in entry) == expected
+    if expected:
+        assert entry["temporal_exception"]["overrun_seconds"] > 0
+        assert entry["temporal_exception"]["production_end"] == "2026-10-14T07:23:00"
+        assert entry["temporal_exception"]["source_ar_end"] == row["FECHA_OFF"]
+    assert row == before
+
+
+def test_ar_overrun_does_not_move_a_new_event_backwards(bundle):
+    row = bundle["sources"]["LISTA_AR"][0]
+    row.update(FECHA_ON="2026-10-14T07:23:00", FECHA_OFF="2026-10-14T07:23:02")
+    assert a.ar_productions(bundle, row) == []
+
+
+def test_outgoing_continuity_never_hides_same_model_on_other_tandem_half(bundle):
+    other = next(
+        p for p in bundle["sources"]["CATALOGO_PRODUCCIONES"] if p["id_produccion"] == pid(30)
+    )
+    other["id_modelo_fenix"] = 1
+    row = bundle["sources"]["LISTA_AR"][0]
+    row["FECHA_OFF"] = "2026-10-14T07:28:00"
+    assert a.ar_productions(bundle, row) == sorted([pid(10), pid(30)])
+
+
+def test_zc_transition_keeps_outgoing_and_unchanged_tandem_half():
+    start, change, end = "2026-10-14T06:20:00", "2026-10-14T06:23:00", "2026-10-14T06:30:00"
+    prods = {"old": {"ID_MAQUINA": 10}, "new": {"ID_MAQUINA": 10}, "other": {"ID_MAQUINA": 9}}
+    items = [
+        {"id": "old", "production": "old", "start": "2026-10-01T06:00:00", "end": change},
+        {"id": "new", "production": "new", "start": change, "end": None},
+        {"id": "other", "production": "other", "start": "2026-10-01T06:00:00", "end": None},
+    ]
+    assert a.zc_outgoing_decision(items, start, end, prods) == (
+        "SHARED_MACHINE",
+        ["old", "other"],
+        ["new", "old", "other"],
+    )
+    # Overlapping productions on one half remain a real ambiguity.
+    items[1]["start"] = start
+    assert a.zc_outgoing_decision(items, start, end, prods) is None
+
+
+def test_counter_transition_retains_one_physical_row(bundle):
+    row = bundle["sources"]["CONT_ZC"][0]
+    row["FECHA"] = "2026-10-14T07:30:00"
+    bundle["sources"].update(LISTA_DEFECTOS=[], LISTA_RECH=[], LISTA_AR=[], CONT_ZC=[row])
+    bundle["topology_enabled"] = True
+    registry = {
+        "old": decision(kind="ZC_PRESENCE"),
+        "new": decision(
+            "new", kind="ZC_PRESENCE", production=pid(20), start="2026-10-14T07:23:00", end=None
+        ),
+        "other": decision("other", kind="ZC_PRESENCE", production=pid(30), end=None),
+    }
+    before = dict(row)
+    ledger = a.assign(bundle, registry, {})
+    assert len(ledger) == 1
+    assert ledger[0]["status"] == "SHARED_MACHINE"
+    assert ledger[0]["productions"] == sorted([pid(10), pid(30)])
+    assert ledger[0]["reason"].startswith("approved_zc_change_to_outgoing;")
+    assert row == before
+
+
 def test_recovery_uses_frozen_artifacts_when_live_csv_changes(config, foundation, monkeypatch):
     cfg = write_decisions(config, [decision()])
     with monkeypatch.context() as patch:
