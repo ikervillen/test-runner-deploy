@@ -239,6 +239,10 @@ jobs:
 
   release-tested-onprem:
     if: github.event_name == 'workflow_dispatch' && inputs.operation == 'release-tested-onprem' && github.ref == 'refs/heads/develop'
+    permissions:
+      contents: read
+      actions: read
+      packages: write
     runs-on: ${{ fromJSON(vars.INGESTA_RUNNER_LABELS || '["self-hosted","Windows","X64"]') }}
     environment: develop
     timeout-minutes: 60
@@ -290,6 +294,8 @@ jobs:
           docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,size=512m $image self-test
           if ($LASTEXITCODE -ne 0) { throw 'Final image self-test failed' }
           $originalConfig = $env:DOCKER_CONFIG
+          $buildContext = docker context show
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot determine Docker context' }
           $sourceConfig = if ($originalConfig) { $originalConfig } else { Join-Path $env:USERPROFILE '.docker' }
           $temporaryParent = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
           $temporaryConfig = Join-Path $temporaryParent ('fenix-release-' + [guid]::NewGuid().ToString('N'))
@@ -300,9 +306,9 @@ jobs:
             $env:DOCKER_CONFIG = $temporaryConfig
             python deployment/registry.py
             if ($LASTEXITCODE -ne 0) { throw 'Registry authentication failed' }
-            docker push $image
+            docker --context $buildContext push $image
             if ($LASTEXITCODE -ne 0) { throw 'Image publication failed' }
-            $digest = docker image inspect --format '{{index .RepoDigests 0}}' $image
+            $digest = docker --context $buildContext image inspect --format '{{index .RepoDigests 0}}' $image
             if ($LASTEXITCODE -ne 0 -or $digest -notmatch '@sha256:[a-f0-9]{64}$') { throw 'Missing immutable image digest' }
             [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "image=$digest`n", [Text.UTF8Encoding]::new($false))
           }
