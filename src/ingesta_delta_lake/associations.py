@@ -154,14 +154,46 @@ def production_context(bundle):
 
 
 @lru_cache(maxsize=1)
-def ar_zone_defaults():
+def ar_interpretation_rules():
     """Versioned operational interpretation; raw Fenix catalogs remain untouched."""
     document = json.loads(
         files("ingesta_delta_lake").joinpath("rules/ar_zone_defaults.json").read_text()
     )
     if document["version"] != 1:
         raise IntegrityError("Unsupported AR zone interpretation version")
-    return document["defaults"]
+    return document
+
+
+def ar_zone_defaults():
+    return ar_interpretation_rules()["defaults"]
+
+
+def ar_end_overrun(bundle, row, production):
+    """An existing outgoing AR continues into the model-change sample window."""
+    if zone_for_ar(bundle, row) != "ZF" or row["FECHA_OFF"] is None:
+        return None
+    rule = ar_interpretation_rules()["zf_transition"]
+    sample_end = datetime.fromisoformat(row["FECHA_OFF"])
+    sample_start = sample_end - timedelta(minutes=rule["sample_window_minutes"])
+    composition = bundle["catalog_composition"].get(production, {})
+    for zone in composition.get("zf", []):
+        end = zone["FECHA_OFF"]
+        if end is None or not zone["FECHA_ON"] <= row["FECHA_ON"] < end < row["FECHA_OFF"]:
+            continue
+        seconds = (
+            datetime.fromisoformat(row["FECHA_OFF"]) - datetime.fromisoformat(end)
+        ).total_seconds()
+        if sample_start <= datetime.fromisoformat(end) < sample_end:
+            return {
+                "policy": "outgoing_ar_continuity_during_model_change",
+                "revision": ar_interpretation_rules()["revision"],
+                "production_end": end,
+                "source_ar_end": row["FECHA_OFF"],
+                "overrun_seconds": seconds,
+                "transition_window": [sample_start.isoformat(timespec="seconds"), row["FECHA_OFF"]],
+                "source_timestamps_unchanged": True,
+            }
+    return None
 
 
 def zone_for_ar(bundle, row):
@@ -181,6 +213,7 @@ def ar_productions(bundle, row):
     models, prods = production_context(bundle)
     zone = zone_for_ar(bundle, row)
     result = []
+    outgoing = []
     for identity, p in prods.items():
         if (
             p["origen_fenix"] != row["origen_fenix"]
@@ -207,7 +240,35 @@ def ar_productions(bundle, row):
             for z in zones
         ):
             result.append(identity)
-    return sorted(result)
+        elif ar_end_overrun(bundle, row, identity) is not None:
+            outgoing.append(identity)
+    # Full temporal coverage takes precedence over the outgoing continuity rule.
+    return sorted(result or outgoing)
+
+
+def zc_outgoing_decision(items, start, end, prods):
+    """Resolve each physical tandem half independently without splitting wheel counts."""
+    groups = defaultdict(list)
+    for item in items:
+        if not overlaps(item["start"], item["end"], start, end):
+            continue
+        if "production" not in item:
+            return None  # An explicit preparation episode requires its own decision.
+        groups[prods[item["production"]]["ID_MAQUINA"]].append(item)
+    targets, episodes = set(), set()
+    transitioned = False
+    for pieces in groups.values():
+        decision = interval_decision(pieces, start, end)
+        if decision[0] != "ASSIGNED":
+            decision = physical_assignments.outgoing(pieces, start, end, prods)
+            if decision is None:
+                return None
+            transitioned = True
+        targets.update(decision[1])
+        episodes.update(decision[2])
+    if transitioned:
+        return "SHARED_MACHINE", sorted(targets), sorted(episodes)
+    return None
 
 
 def normalize_decision(raw, bundle, plant, lines):
@@ -602,6 +663,11 @@ def assign(bundle, registry, ar_index, review_scopes=()):
                             episode_ids = sorted({i for _, _, ids in decisions for i in ids})
                         else:
                             status = "PENDING_ZC_TRANSITION"
+                            if bundle.get("topology_enabled"):
+                                transition = zc_outgoing_decision(usable, start, end, prods)
+                                if transition is not None:
+                                    status, targets, episode_ids = transition
+                                    reason = "approved_zc_change_to_outgoing;"
                     else:
                         status, targets, episode_ids = interval_decision(usable, start, end)
                 else:
@@ -649,7 +715,7 @@ def assign(bundle, registry, ar_index, review_scopes=()):
                 )
                 if scope in review_scopes:
                     status, targets = "DECISION_REVIEW", []
-                reason = f"sample:[{start},{end})"
+                reason += f"sample:[{start},{end})"
             ledger.append(
                 {
                     "family": family,
@@ -663,6 +729,14 @@ def assign(bundle, registry, ar_index, review_scopes=()):
                     "rule": RULE,
                 }
             )
+    ar_rows = {source_id("LISTA_AR", row): row for row in bundle["sources"]["LISTA_AR"]}
+    for entry in ledger:
+        if entry["family"] != "LISTA_AR" or entry["status"] != "ASSIGNED":
+            continue
+        row = ar_rows[entry["source_id"]]
+        exception = ar_end_overrun(bundle, row, entry["productions"][0])
+        if exception is not None:
+            entry["temporal_exception"] = exception
     if bundle.get("topology_enabled"):
         from .ar_attribution import resolve
 

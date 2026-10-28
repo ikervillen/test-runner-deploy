@@ -32,7 +32,7 @@ def resolve(bundle, ledger, candidates):
         if row["ID_Agrupación"] is None:
             event = (identity,)
         groups[event].append((row, entry))
-        if entry["status"] == "AMBIGUOUS_PRODUCTION":
+        if entry["status"] == "AMBIGUOUS_PRODUCTION" or entry.get("temporal_exception"):
             contexts.add(context)
     witnesses = defaultdict(list)
     offset = 0
@@ -48,6 +48,33 @@ def resolve(bundle, ledger, candidates):
             )
             witnesses[context].append((start, end, entry))
         offset += len(rows)
+    prods = {p["id_produccion"]: p for p in bundle["sources"].get("CATALOGO_PRODUCCIONES", [])}
+    for items in groups.values():
+        for row, entry in items:
+            exception = entry.get("temporal_exception")
+            if not exception or entry["status"] != "ASSIGNED":
+                continue
+            outgoing = entry["productions"][0]
+            context = (row["origen_fenix"], row["MOLDE"], row["CAVIDAD"])
+            conflicts = [
+                evidence["source_id"]
+                for start, end, evidence in witnesses[context]
+                if start < row["FECHA_OFF"]
+                and exception["production_end"] < end
+                and evidence["status"] in {"ASSIGNED", "TRANSITION_TO_OUTGOING"}
+                and any(
+                    target != outgoing
+                    and prods[target]["ID_MAQUINA"] == prods[outgoing]["ID_MAQUINA"]
+                    for target in evidence["productions"]
+                )
+            ]
+            if conflicts:
+                entry.update(
+                    status="EVIDENCE_CONFLICT",
+                    productions=[],
+                    reason="Positive MIA evidence contradicts outgoing AR continuity",
+                    conflicting_evidence_source_ids=sorted(set(conflicts))[:8],
+                )
     for items in groups.values():
         ordered = sorted(items, key=lambda pair: (pair[0]["FECHA_ON"], pair[0]["FECHA_OFF"]))
         clusters = []

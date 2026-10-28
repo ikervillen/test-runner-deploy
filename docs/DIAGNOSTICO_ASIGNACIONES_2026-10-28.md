@@ -61,3 +61,37 @@ archivos y 4 MiB, lectura contextual, intención y confirmación propias. No se
 triplica la memoria del lote ni se aumenta el número de escritores por tabla.
 La parada sigue atendiendo el límite entre lotes y el trabajo confirmado se
 recupera sin reinicializar el lago ni los controles.
+
+## Decisiones operativas confirmadas y versionadas
+
+El propietario confirma el 28/10 las siguientes reglas, conservando todos los
+registros y fechas originales. El documento empaquetado
+`rules/ar_zone_defaults.json`, revisión 2, entra en la huella de cada cálculo:
+
+- TIPO 5, «Rechazo molde NP», se interpreta como ZF. Se conserva su denominación
+  original. Al igual que para TIPO 6, una zona explícita prevalece; un cambio de
+  significado del catálogo no hereda automáticamente la interpretación.
+- Una ventana CONT_ZC que cruza un cambio se asocia a la producción saliente.
+  Se comprueba cada máquina física de la tándem por separado: la mitad que sigue
+  fabricando mantiene su asociación habitual. La fila física de contadores no
+  se reparte ni se duplica. Se conserva el intervalo original y se registra
+  `approved_zc_change_to_outgoing` con sus episodios justificativos. Solapes
+  contradictorios o preparaciones explícitas quedan pendientes.
+- Un A/R de ZF que empezó dentro de la producción saliente y continúa durante
+  la ventana de transición se mantiene en ella: un cambio de modelo requiere
+  preparación y la fecha declarada no demuestra por sí sola que ya haya nuevas
+  botellas. Se usa la ventana de muestra de diez minutos, configurable en la
+  regla versionada, junto con origen, modelo y continuidad del evento. Una
+  producción con cobertura completa tiene prioridad, y evidencia MIA positiva
+  incompatible en la misma parte física impide la atribución automática.
+  No existe una tolerancia especial de dos segundos. El ledger conserva ambas
+  fechas, desfase real, ventana aplicada y revisión, sin recortar minutos-cavidad.
+
+Además, una anotación A/R instantánea puede discriminarse mediante una muestra
+MIA independiente con flujo positivo que contenga ese instante (`inicio <= t <
+fin`). No se inventa duración para el A/R ni se extiende su fecha de cierre.
+Siguen siendo necesarios contexto físico compatible y una única producción.
+
+La política de publicación v5 obliga a recalcular incluso cuando los CSV no han
+cambiado. Los resultados solo se dan por verificados al conciliar la publicación
+confirmada con su ledger inmutable después del despliegue.
