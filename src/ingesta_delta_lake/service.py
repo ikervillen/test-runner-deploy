@@ -354,6 +354,12 @@ def run(
 
                     process_reviews(config, control)
                     result = _process(config, control, attempt, stop_requested=stop_requested)
+                    from .repeated_hour import process as resolve_repeated_hour
+
+                    try:
+                        result = resolve_repeated_hour(config, control, result)
+                    except OSError as exc:
+                        raise IngestaError("Repeated-hour policy requires recovery") from exc
                     if hasattr(control, "input_scan_performed"):
                         result["input_scan_performed"] = control.input_scan_performed
                         result["input_scan_interval_seconds"] = config.input_scan_interval_seconds
