@@ -231,18 +231,18 @@ def decide(family, parsed, old, cases, machines, machine_cases, codes):
             if any(o in codes and codes[o] != row["codigo_linea_zc"] for o in origins):
                 reason = "LINE_CONFLICT"
         else:
-            machine = machine_for_period(
-                machines,
-                machine_cases,
-                row["id_maquina_fenix"],
-                row["vigente_desde"],
-                row["vigente_hasta"],
-            )
-            if machine is None:
+            # Catalogs can declare different historical lower bounds (1900 vs
+            # 2000). Keep both verbatim: their intersection is usable, while
+            # machine_for_period still enforces full coverage of each sample.
+            compatible = [
+                m
+                for m in machines.values()
+                if m["id_maquina_fenix"] == row["id_maquina_fenix"] and overlap(m, row)
+            ]
+            if not compatible or any(affected(MACHINES, machine_cases, m) for m in compatible):
                 reason = "MACHINE_PENDING"
-            elif (
-                row["origen_fenix"] in codes
-                and machine["codigo_linea_zc"] != codes[row["origen_fenix"]]
+            elif row["origen_fenix"] in codes and any(
+                m["codigo_linea_zc"] != codes[row["origen_fenix"]] for m in compatible
             ):
                 reason = "LINE_CONFLICT"
         if reason:

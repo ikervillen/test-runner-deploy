@@ -95,6 +95,47 @@ def test_dependency_recovers_from_bronze_after_live_file_disappears(config):
     assert sql(cfg, "SELECT COUNT(*) FROM topology_review_events") == [(1,)]
 
 
+def test_historical_catalog_bounds_are_intersected_without_rewriting_source(config):
+    from ingesta_delta_lake.physical_assignments import branch_for_period
+
+    put(config, t.MACHINES, machine(8, "AV31B", start="01/01/2000"))
+    run(config)
+    cfg = replace(config, family=t.BRANCHES)
+    put(cfg, t.BRANCHES, branch(start="01/01/1900"))
+    assert run(cfg)["complete"]
+    rows = data(cfg)
+    assert rows[("AV31", 13, "1900-01-01T00:00:00")]["vigente_desde"] == "1900-01-01T00:00:00"
+    bundle = {
+        "sources": {t.MACHINES: list(data(config).values()), t.BRANCHES: list(rows.values())},
+        "cases": {t.MACHINES: [], t.BRANCHES: []},
+        "line_codes": {"AV31": 31},
+    }
+    assert branch_for_period(bundle, "AV31", 1, "2026-10-14T07:20:00", "2026-10-14T07:30:00")
+    assert (
+        branch_for_period(bundle, "AV31", 1, "1999-10-14T07:20:00", "1999-10-14T07:30:00") is None
+    )
+
+
+def test_machine_dependency_resolves_with_different_catalog_start(config):
+    cfg = replace(config, family=t.BRANCHES)
+    put(cfg, t.BRANCHES, branch())
+    assert run(cfg)["status"] == "WAITING_DEPENDENCIES"
+    put(config, t.MACHINES, machine(8, "AV31B", start="01/01/2000"))
+    run(config)
+    assert run(cfg)["complete"]
+    assert sql(cfg, "SELECT COUNT(*) FROM issues WHERE status!='RESOLVED'") == [(0,)]
+    assert sql(cfg, "SELECT COUNT(*) FROM topology_review_events") == [(1,)]
+
+
+def test_nonoverlapping_machine_does_not_authorize_branch(config):
+    put(config, t.MACHINES, machine(8, "AV31B", end="01/01/2000"))
+    run(config)
+    cfg = replace(config, family=t.BRANCHES)
+    put(cfg, t.BRANCHES, branch(start="01/01/2020"))
+    assert run(cfg)["status"] == "WAITING_DEPENDENCIES"
+    assert not cfg.table_path.exists()
+
+
 @pytest.mark.parametrize("reverse", [False, True])
 def test_close_and_new_configuration_are_atomic_without_reopening(config, reverse):
     seed(config)
