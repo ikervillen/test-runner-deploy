@@ -81,9 +81,10 @@ registros y fechas originales. El documento empaquetado
   la ventana de transición se mantiene en ella: un cambio de modelo requiere
   preparación y la fecha declarada no demuestra por sí sola que ya haya nuevas
   botellas. Se usa la ventana de muestra de diez minutos, configurable en la
-  regla versionada, junto con origen, modelo y continuidad del evento. Una
-  producción con cobertura completa tiene prioridad, y evidencia MIA positiva
-  incompatible en la misma parte física impide la atribución automática.
+  regla versionada, junto con origen, modelo y continuidad del evento. Si otra
+  mitad tándem fabrica el mismo modelo se conservan ambas candidatas hasta que
+  una evidencia física las discrimine. Evidencia MIA positiva incompatible en
+  la misma parte física impide la atribución automática.
   No existe una tolerancia especial de dos segundos. El ledger conserva ambas
   fechas, desfase real, ventana aplicada y revisión, sin recortar minutos-cavidad.
 

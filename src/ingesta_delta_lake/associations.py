@@ -242,8 +242,9 @@ def ar_productions(bundle, row):
             result.append(identity)
         elif ar_end_overrun(bundle, row, identity) is not None:
             outgoing.append(identity)
-    # Full temporal coverage takes precedence over the outgoing continuity rule.
-    return sorted(result or outgoing)
+    # A concurrent tandem half with the same model cannot hide an outgoing match.
+    # Keep both candidates until independent physical evidence distinguishes them.
+    return sorted(set(result + outgoing))
 
 
 def zc_outgoing_decision(items, start, end, prods):

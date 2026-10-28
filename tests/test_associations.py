@@ -674,6 +674,16 @@ def test_ar_overrun_does_not_move_a_new_event_backwards(bundle):
     assert a.ar_productions(bundle, row) == []
 
 
+def test_outgoing_continuity_never_hides_same_model_on_other_tandem_half(bundle):
+    other = next(
+        p for p in bundle["sources"]["CATALOGO_PRODUCCIONES"] if p["id_produccion"] == pid(30)
+    )
+    other["id_modelo_fenix"] = 1
+    row = bundle["sources"]["LISTA_AR"][0]
+    row["FECHA_OFF"] = "2026-10-14T07:28:00"
+    assert a.ar_productions(bundle, row) == sorted([pid(10), pid(30)])
+
+
 def test_zc_transition_keeps_outgoing_and_unchanged_tandem_half():
     start, change, end = "2026-10-14T06:20:00", "2026-10-14T06:23:00", "2026-10-14T06:30:00"
     prods = {"old": {"ID_MAQUINA": 10}, "new": {"ID_MAQUINA": 10}, "other": {"ID_MAQUINA": 9}}
