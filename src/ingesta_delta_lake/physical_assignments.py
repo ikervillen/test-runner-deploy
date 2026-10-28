@@ -4,6 +4,46 @@ from . import topology as t
 from .common import digest
 
 ACTOR = "rule:declared_zf_topology_v2"
+ZC_ACTOR = "rule:declared_zc_topology_v1"
+
+
+def zc_presence(bundle, previous, prod, composition, machine):
+    """Use the ZC root, never the later global ZF closure, for shared-wheel presence."""
+    from .associations import source_id
+
+    root = composition["root"]
+    start = max(root["FECHA_ON"], machine["vigente_desde"])
+    ends = [e for e in (root["FECHA_OFF"], machine["vigente_hasta"]) if e is not None]
+    end = min(ends) if ends else None
+    if end is not None and end <= start:
+        return None
+    identity = "auto_zc_" + digest([prod["id_produccion"], t.key(t.MACHINES, machine)])
+    old = previous.get(identity)
+    if old and old["actor"] != ZC_ACTOR:
+        return None
+    decision = {
+        "id": identity,
+        "kind": "ZC_PRESENCE",
+        "origin": prod["origen_fenix"],
+        # CONT_ZC identifies the shared line/wheel, not the tandem half's ID.
+        "machine": machine["codigo_linea_zc"],
+        "production": prod["id_produccion"],
+        "start": start,
+        "end": end,
+        "revision": 1,
+        "previous_hash": None,
+        "actor": ZC_ACTOR,
+        "reason": "Presencia ZC declarada; rendimiento compartido de rueda sin repartir botellas",
+        "evidence": [
+            {"family": family, "source_id": source_id(family, row)}
+            for family, row in [("CATALOGO_PRODUCCIONES", prod), (t.MACHINES, machine)]
+        ],
+    }
+    if old:
+        if all(old[k] == v for k, v in decision.items() if k not in {"revision", "previous_hash"}):
+            return old
+        decision.update(revision=old["revision"] + 1, previous_hash=digest(old))
+    return decision
 
 
 def decisions(bundle, previous, codes):
@@ -22,6 +62,9 @@ def decisions(bundle, previous, codes):
                 or machine["codigo_linea_zc"] != codes[prod["origen_fenix"]]
             ):
                 continue
+            presence = zc_presence(bundle, previous, prod, composition, machine)
+            if presence is not None:
+                result.append(presence)
             for branch in branches:
                 if (
                     branch["origen_fenix"] != prod["origen_fenix"]
