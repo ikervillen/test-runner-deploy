@@ -17,7 +17,7 @@ on:
       remove_backup:
         type: boolean
         default: false
-        description: 'compact: retirar las copias antiguas solo después de validar cada sustitución'
+        description: 'compact: retirar las copias antiguas solo despuÃ©s de validar cada sustituciÃ³n'
 
 permissions:
   contents: read
@@ -235,7 +235,7 @@ jobs:
               --entrypoint python $image -c $check
             if ($LASTEXITCODE -eq 0) { Write-Output "INPUT_BIND_OK=$binding"; $found = $true; break }
           }
-          if (-not $found) { throw 'No se han encontrado los cinco orígenes en el montaje.' }
+          if (-not $found) { throw 'No se han encontrado los cinco orÃ­genes en el montaje.' }
 
   release-tested-onprem:
     if: github.event_name == 'workflow_dispatch' && inputs.operation == 'release-tested-onprem' && github.ref == 'refs/heads/develop'
@@ -289,7 +289,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $image = "ghcr.io/$($env:GITHUB_REPOSITORY.ToLower()):sha-$env:REVISION"
-          docker build --platform linux/amd64 --provenance=false --build-arg "REVISION=$env:REVISION" --build-arg "SOURCE=https://github.com/$env:GITHUB_REPOSITORY" --build-arg 'BRANCH=develop' -t $image .
+          docker build --platform linux/amd64 --build-arg "REVISION=$env:REVISION" --build-arg "SOURCE=https://github.com/$env:GITHUB_REPOSITORY" --build-arg 'BRANCH=develop' -t $image .
           if ($LASTEXITCODE -ne 0) { throw 'Image build failed' }
           docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,size=512m $image self-test
           if ($LASTEXITCODE -ne 0) { throw 'Final image self-test failed' }
