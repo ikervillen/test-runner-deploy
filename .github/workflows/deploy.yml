@@ -289,7 +289,14 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $image = "ghcr.io/$($env:GITHUB_REPOSITORY.ToLower()):sha-$env:REVISION"
-          docker build --platform linux/amd64 --build-arg "REVISION=$env:REVISION" --build-arg "SOURCE=https://github.com/$env:GITHUB_REPOSITORY" --build-arg 'BRANCH=develop' -t $image .
+          $dockerDirectory = Split-Path (Get-Command docker).Source
+          $buildxCandidates = @(
+            (Join-Path (Split-Path $dockerDirectory) 'cli-plugins/docker-buildx.exe'),
+            (Join-Path $env:ProgramFiles 'Docker/Docker/resources/cli-plugins/docker-buildx.exe')
+          )
+          $buildx = $buildxCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $buildx) { throw 'Docker Desktop BuildKit plugin is unavailable' }
+          & $buildx build --load --platform linux/amd64 --provenance=false --build-arg "REVISION=$env:REVISION" --build-arg "SOURCE=https://github.com/$env:GITHUB_REPOSITORY" --build-arg 'BRANCH=develop' -t $image .
           if ($LASTEXITCODE -ne 0) { throw 'Image build failed' }
           docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,size=512m $image self-test
           if ($LASTEXITCODE -ne 0) { throw 'Final image self-test failed' }
