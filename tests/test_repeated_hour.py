@@ -121,3 +121,17 @@ def test_repeated_hour_is_calendar_based_and_does_not_cover_normal_hours():
     assert not repeated("2026-10-25T03:50:00")
     assert not repeated("2026-10-24T02:50:00")
     assert not repeated("2026-03-29T02:50:00")
+
+
+def test_timezone_rules_are_available_without_an_operating_system_database():
+    import zoneinfo
+
+    previous = zoneinfo.TZPATH
+    try:
+        zoneinfo.reset_tzpath(())
+        zoneinfo.ZoneInfo.clear_cache()
+        assert repeated("2026-10-25T02:50:00")
+        assert not repeated("2026-10-25T03:00:00")
+    finally:
+        zoneinfo.reset_tzpath(previous)
+        zoneinfo.ZoneInfo.clear_cache()
