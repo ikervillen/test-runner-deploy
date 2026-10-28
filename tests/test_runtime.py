@@ -50,6 +50,21 @@ def test_bootstrap_is_explicit_repeatable_and_does_not_initialize_delta(mounted)
     assert all(v is None for v in runtime.check()["versions"].values())
 
 
+@pytest.mark.parametrize("budget", [1, 3, 5])
+def test_mia_turn_budget_is_configurable_without_changing_batch_memory(
+    mounted, monkeypatch, budget
+):
+    monkeypatch.setenv("INGESTA_MIA_BATCHES_PER_TURN", str(budget))
+    assert runtime.settings()[2].mia_batches_per_turn == budget
+
+
+@pytest.mark.parametrize("budget", ["0", "101", "invalid"])
+def test_invalid_mia_budget_is_rejected_before_ingestion(mounted, monkeypatch, budget):
+    monkeypatch.setenv("INGESTA_MIA_BATCHES_PER_TURN", budget)
+    with pytest.raises((ValueError, IngestaError)):
+        runtime.settings()
+
+
 def test_wrong_environment_or_nonempty_unknown_volume_is_never_adopted(mounted, monkeypatch):
     (mounted / "lake" / "unknown.txt").write_text("existing")
     with pytest.raises(IntegrityError, match="no vacío"):
@@ -240,7 +255,7 @@ def test_continuous_backlog_cannot_starve_derived(mounted, monkeypatch):
 
     def unit(cfg, **kwargs):
         calls.append(cfg.family)
-        assert cfg.mia_batches_per_turn == 1
+        assert cfg.mia_batches_per_turn == 3
         if cfg.family == "ASIGNACION_PRODUCCION_RAMAL":
             callbacks[signal.SIGTERM]()
         remaining = 2 if calls.count("LISTA_AR") == 1 and cfg.family == "LISTA_RECH" else 0
