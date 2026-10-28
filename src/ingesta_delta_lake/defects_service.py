@@ -83,7 +83,7 @@ def process(
     # never prevent reconciliation of an already prepared/committed operation.
     recovered, recovery_count = reconcile_pending(config, control, store_class)
     captured = control.captured_inputs()
-    snapshots = []
+    snapshots, verified = [], set()
     with input_scan(config, control) as due:
         if due:
             for origin, path, stamp in discover(config):
@@ -98,6 +98,7 @@ def process(
                     path,
                     stamp,
                     known=captured,
+                    verified=verified,
                 )
                 # Durable as soon as captured: a later capture error cannot lose this input.
                 control.receipts(attempt, [snapshot])

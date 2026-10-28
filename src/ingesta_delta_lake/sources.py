@@ -95,17 +95,32 @@ def parse_name(name: str, family: str = FAMILY) -> str | None:
 def discover(config: Config) -> list[tuple[str, Path, str | None]]:
     result = []
     for origin, folder in config.sources:
-        for path in sorted(folder.iterdir()):
-            if path.suffix.lower() != ".csv":
-                continue
-            if not path.stem.upper().endswith(config.family):
-                continue  # No incorporar otras familias antes de su entrega.
-            resolved = path.resolve()
-            if not resolved.is_relative_to(folder):
-                raise CaptureError(f"Archivo enlazado fuera del origen: {path}")
-            if not resolved.is_file():
+        root = folder.resolve()
+        # DirEntry reuses directory metadata. Resolving/stating every ordinary
+        # filename adds thousands of cross-WSL calls; only links need realpath.
+        with os.scandir(root) as entries:
+            selected = sorted(
+                (
+                    e
+                    for e in entries
+                    if e.name.lower().endswith(".csv")
+                    and e.name[:-4].upper().endswith(config.family)
+                ),
+                key=lambda e: e.name,
+            )
+        for entry in selected:
+            path = root / entry.name
+            if entry.is_symlink():
+                resolved = path.resolve()
+                if not resolved.is_relative_to(root):
+                    raise CaptureError(f"Archivo enlazado fuera del origen: {path}")
+                regular = resolved.is_file()
+            else:
+                resolved = path
+                regular = entry.is_file(follow_symlinks=False)
+            if not regular:
                 raise CaptureError(f"La entrada no es un archivo: {path}")
-            result.append((origin, resolved, parse_name(path.name, config.family)))
+            result.append((origin, resolved, parse_name(entry.name, config.family)))
     return result
 
 
@@ -151,11 +166,11 @@ def capture_inputs(config, control, attempt):
     paths. Only finish_attempt after durable handling acknowledges this queue.
     """
     known = control.known_captures()
-    snapshots, included = [], set()
+    snapshots, included, verified = [], set(), set()
     with input_scan(config, control) as due:
         if due:
             for origin, path, stamp in discover(config):
-                snapshot = capture(config, origin, path, stamp, known=known)
+                snapshot = capture(config, origin, path, stamp, known=known, verified=verified)
                 control.receipts(attempt, [snapshot])
                 snapshots.append(snapshot)
                 included.add((origin, snapshot.sha256))
@@ -178,7 +193,7 @@ def _read_limited(path: Path, maximum: int) -> bytes:
 
 
 def capture(
-    config: Config, origin: str, path: Path, producer_time: str | None, *, known=None
+    config: Config, origin: str, path: Path, producer_time: str | None, *, known=None, verified=None
 ) -> Snapshot:
     for attempt in range(config.capture_attempts):
         try:
@@ -190,12 +205,17 @@ def capture(
                 after = path.stat()
                 if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                     raise CaptureError(f"La entrada sigue cambiando: {path}")
-                bronze = Path(prior.bronze_path).resolve()
-                if not bronze.is_relative_to(config.bronze_root):
-                    raise IntegrityError("Evidencia conocida fuera de Bronze")
-                with bronze.open("rb") as stream:
-                    if hashlib.file_digest(stream, "sha256").hexdigest() != sha:
-                        raise IntegrityError("Copia Bronze alterada")
+                identity = (origin, sha, prior.bronze_path)
+                bronze = Path(prior.bronze_path)
+                if verified is None or identity not in verified:
+                    bronze = bronze.resolve()
+                    if not bronze.is_relative_to(config.bronze_root):
+                        raise IntegrityError("Evidencia conocida fuera de Bronze")
+                    with bronze.open("rb") as stream:
+                        if hashlib.file_digest(stream, "sha256").hexdigest() != sha:
+                            raise IntegrityError("Copia Bronze alterada")
+                    if verified is not None:
+                        verified.add(identity)
                 # The bytes match a previously stable immutable capture. Always hash
                 # input, including overwrites that preserve filename/size/mtime.
                 return Snapshot(
