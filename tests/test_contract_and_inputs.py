@@ -69,6 +69,59 @@ def test_unknown_selected_name_is_not_silently_ignored(config, source):
         discover(config)
 
 
+def test_discovery_resolves_root_once_instead_of_every_ordinary_file(config, source, monkeypatch):
+    from pathlib import Path
+
+    for hour in range(10):
+        (source.parent / f"16102026_{hour:02d}0028_SIP_MODELO.csv").write_bytes(source.read_bytes())
+    resolved = []
+    original = Path.resolve
+
+    def track(path, *args, **kwargs):
+        resolved.append(path)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", track)
+    assert len(discover(config)) == 11
+    assert resolved == [config.sources[0][1]]
+
+
+def test_discovery_rejects_symlink_escape(config, source, tmp_path):
+    outside = tmp_path / "outside.csv"
+    outside.write_bytes(source.read_bytes())
+    alias = source.parent / "20261015_SIP_MODELO.csv"
+    try:
+        alias.symlink_to(outside)
+    except OSError:
+        pytest.skip("Symbolic links require host privileges")
+    with pytest.raises(CaptureError, match="fuera del origen"):
+        discover(config)
+
+
+def test_aliases_verify_same_immutable_capture_once_per_scan(config, source, monkeypatch):
+    from ingesta_delta_lake import sources
+
+    first = capture(config, "AV21", source, None)
+    known = {("AV21", first.sha256): first}
+    original = sources.hashlib.file_digest
+    checks = []
+
+    def track(stream, algorithm):
+        checks.append(stream.name)
+        return original(stream, algorithm)
+
+    monkeypatch.setattr(sources.hashlib, "file_digest", track)
+    verified = set()
+    for _ in range(3):
+        assert (
+            capture(config, "AV21", source, None, known=known, verified=verified).sha256
+            == first.sha256
+        )
+    assert len(checks) == 1
+    capture(config, "AV21", source, None, known=known, verified=set())
+    assert len(checks) == 2
+
+
 @pytest.mark.parametrize(
     "changes",
     [
