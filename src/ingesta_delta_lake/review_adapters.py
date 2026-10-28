@@ -1,4 +1,4 @@
-"""Explicit correction adapters. No free SQL, key edits or dependency overrides."""
+"""Explicit correction adapters, including atomic replacement of observed MIA keys."""
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -39,6 +39,13 @@ class Adapter:
 
     def signature(self, row):
         return digest(self.project(row))
+
+    def homologous(self, old, candidate):
+        if self.key(old) == self.key(candidate):
+            return True
+        return self.config.family in {"LISTA_RECH", "LISTA_DEFECTOS"} and (
+            self.model.signature(old) == self.model.signature(candidate)
+        )
 
     def rows(self, rows):
         contract = self.config.contract
@@ -92,16 +99,18 @@ class Adapter:
             parsed = Parsed()
             for row in rows.values():
                 parsed.add(row, [])
-            if decide(parsed, rows, set(models), set())[2]:
+            if decide(parsed, {}, set(models), set())[2]:
                 raise IntegrityError("Correction violates MP9 model/ZC/ZF relationships")
         elif family in {"LISTA_RECH", "LISTA_DEFECTOS"}:
             indexes = self.model.indexes(list(rows.values()))
             if any(
                 len({r["INSPECC"] for r in values}) > 1
-                for index in indexes[1:]
+                for index in indexes[1:2]
                 for values in index.values()
             ):
-                raise IntegrityError("Correction creates inconsistent inspection denominators")
+                raise IntegrityError(
+                    "Correction leaves two active revisions of the same observation"
+                )
         elif family == "SIP_LINEA_ZF":
             from . import topology
             from .topology_storage import snapshot
@@ -195,6 +204,14 @@ def offer(config, payload):
             }
         if isinstance(accepted, list):
             if len(accepted) > 1:
+                candidate = payload.get("candidate")
+                if config.family == "LISTA_DEFECTOS" and candidate is not None:
+                    accepted = [
+                        row
+                        for row in accepted
+                        if a.model.signature(row) == a.model.signature(candidate)
+                    ]
+            if len(accepted) > 1:
                 return {
                     **unavailable,
                     "message": "Existen varios registros aceptados; "
@@ -218,7 +235,7 @@ def offer(config, payload):
         if not variants:
             return unavailable
         target = old if old is not None else next(iter(variants.values()))
-        same_key = all(a.key(r) == a.key(target) for r in variants.values())
+        same_key = all(a.homologous(target, r) for r in variants.values())
         if old is None and not same_key:
             return {
                 **unavailable,

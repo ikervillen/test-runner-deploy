@@ -228,7 +228,7 @@ def test_dependencies_never_offer_unchecked_overwrite(config):
         adapter(replace(config, family="CATALOGO_PRODUCCIONES"), "control")
 
 
-def test_counter_revision_can_keep_old_but_cannot_change_the_primary_key(config):
+def test_counter_revision_can_replace_the_observed_primary_key(config):
     config = replace(config, family="LISTA_DEFECTOS", timestamp_policy="local_naive_test_v1")
     from ingesta_delta_lake.lista_defectos import FIELDS
 
@@ -238,7 +238,7 @@ def test_counter_revision_can_keep_old_but_cannot_change_the_primary_key(config)
         config,
         {"reason": "COUNTER_REVISION", "accepted": [row], "candidate": {**row, "INSPECC": 97}},
     )
-    assert result["actions"] == [KEEP]
+    assert result["actions"] == [KEEP, REPLACE]
 
 
 def test_malformed_transport_does_not_stop_ordinary_ingestion(

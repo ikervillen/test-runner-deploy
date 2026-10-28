@@ -136,7 +136,14 @@ def _plan(config, control, command):
     rows = a.rows(existing)
     if rows.get(a.key(target)) != old:
         raise IntegrityError("Accepted value changed since the evidence was captured")
-    after = {**rows, a.key(target): candidate}
+    after = dict(rows)
+    if old is not None:
+        if not a.homologous(old, candidate):
+            raise IntegrityError("Selected candidate is not the homologous observation")
+        del after[a.key(old)]
+    if a.key(candidate) in after:
+        raise IntegrityError("The replacement would collide with another accepted identity")
+    after[a.key(candidate)] = candidate
     if command["action_id"] in {REPLACE, ADMIT}:
         a.validate(after)
         if config.family == "SIP_MAQUINA_MOLDEO":
