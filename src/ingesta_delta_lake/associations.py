@@ -1,8 +1,11 @@
 """Asociaciones ZF revisadas, evidencias candidatas y decisiones por observación física."""
 
+import json
 import re
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
+from functools import lru_cache
+from importlib.resources import files
 
 import pyarrow as pa
 
@@ -11,6 +14,16 @@ from .common import IntegrityError, digest, parse_int64
 
 CONTRACT = "asignacion_produccion_ramal_v2"
 RULE = "temporal_assignment_v2"
+ACCEPTED_STATUSES = frozenset(
+    {
+        "ASSIGNED",
+        "OLD_PLUS_PREPARATION",
+        "NEW_PLUS_PREPARATION",
+        "SHARED_MACHINE",
+        "PREPARATION",
+        "TRANSITION_TO_OUTGOING",
+    }
+)
 FIELDS = (
     "id_asignacion",
     "planta",
@@ -131,16 +144,37 @@ def decision_identity(raw):
 
 def production_context(bundle):
     models = {
-        r["id_modelo_fenix"]: r["codigo_modelo_botella"] for r in bundle["sources"]["SIP_MODELO"]
+        # Compare boundary whitespace consistently with LISTA_AR parsing. Keep
+        # the accepted dictionary and all Fenix IDs unchanged, including zeros.
+        r["id_modelo_fenix"]: r["codigo_modelo_botella"].strip()
+        for r in bundle["sources"]["SIP_MODELO"]
     }
     prods = {r["id_produccion"]: r for r in bundle["sources"]["CATALOGO_PRODUCCIONES"]}
     return models, prods
 
 
+@lru_cache(maxsize=1)
+def ar_zone_defaults():
+    """Versioned operational interpretation; raw Fenix catalogs remain untouched."""
+    document = json.loads(
+        files("ingesta_delta_lake").joinpath("data/ar_zone_defaults.json").read_text()
+    )
+    if document["version"] != 1:
+        raise IntegrityError("Unsupported AR zone interpretation version")
+    return document["defaults"]
+
+
 def zone_for_ar(bundle, row):
     types = {r["codigo_tipo_ar"]: r["descripcion"] for r in bundle["sources"]["SIP_DEFECTO_AR"]}
     description = types.get(row["TIPO"], "")
-    return "ZF" if description.endswith(" ZF") else "ZC" if description.endswith(" ZC") else None
+    description = description.strip()
+    if description.endswith(" ZF"):
+        return "ZF"
+    if description.endswith(" ZC"):
+        return "ZC"
+    default = ar_zone_defaults().get(str(row["TIPO"]), {})
+    # A changed description must be reviewed, not inherit an obsolete code mapping.
+    return default.get("zone") if description == default.get("description") else None
 
 
 def ar_productions(bundle, row):
@@ -643,5 +677,10 @@ def diagnostics(ledger):
             "assigned_rows": assigned,
             "unassigned_rows": len(items) - assigned,
             "by_status": dict(counts),
+            "pending_rows": sum(r["status"] not in ACCEPTED_STATUSES for r in items),
+            "by_origin": {
+                origin: dict(Counter(r["status"] for r in items if r["origin"] == origin))
+                for origin in sorted({r["origin"] for r in items})
+            },
         }
     return result
