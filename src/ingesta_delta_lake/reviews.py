@@ -220,8 +220,16 @@ def _execute(config, control, command, plan):
                 f"(t.`{f}` = s.`before_{f}` OR (t.`{f}` IS NULL AND s.`before_{f}` IS NULL))"
                 for f in fields
             )
-            arrow = a.arrow([plan["candidate"]])
-            if replacing:
+            scoped_overwrite = "overwrite_rows" in plan
+            if scoped_overwrite:
+                from .repeated_hour import RULE
+
+                if command.get("automatic_policy") != RULE:
+                    raise IntegrityError(
+                        "Scoped overwrite requires the approved repeated-hour policy"
+                    )
+            arrow = a.arrow(plan["overwrite_rows"] if scoped_overwrite else [plan["candidate"]])
+            if replacing and not scoped_overwrite:
                 before = a.arrow([plan["old"]])
                 for f in fields:
                     arrow = arrow.append_column("before_" + f, before[f])
@@ -240,7 +248,15 @@ def _execute(config, control, command, plan):
                 ),
                 max_commit_retries=0,
             )
-            if replacing:
+            if scoped_overwrite:
+                write_deltalake(
+                    table,
+                    arrow,
+                    mode="overwrite",
+                    predicate=plan["overwrite_predicate"],
+                    commit_properties=props,
+                )
+            elif replacing:
                 metrics = (
                     table.merge(
                         arrow,
@@ -295,6 +311,10 @@ def _execute(config, control, command, plan):
         "closed_source_issues": plan["close"],
         "rejected_hashes": plan["reject"],
     }
+    if command.get("automatic_policy"):
+        result["automatic_policy"] = command["automatic_policy"]
+        result["policy_slots"] = plan["policy_slots"]
+        result["replaced_rows"] = plan["replaced_rows"]
     with control.db:
         control.db.execute(
             "INSERT INTO settings VALUES('review_epoch',?) "
@@ -307,7 +327,11 @@ def _execute(config, control, command, plan):
                 (
                     "review:" + command["decision_id"],
                     operation,
-                    canonical(plan),
+                    canonical(
+                        {k: v for k, v in plan.items() if k != "overwrite_rows"}
+                        if command.get("automatic_policy")
+                        else plan
+                    ),
                     now(),
                     now(),
                     version,
@@ -326,6 +350,10 @@ def _execute(config, control, command, plan):
             "UPDATE issues SET status='RESOLVED' WHERE issue_id=?", [(i,) for i in plan["close"]]
         )
         if plan["scope"]:
+            control.db.executemany(
+                "DELETE FROM inspection_current WHERE group_id=?",
+                [(g,) for g in plan.get("removed_group_ids", [])],
+            )
             groups = a.model.inspection_groups(raw, control.cases())
             control.db.executemany(
                 "INSERT INTO inspection_current VALUES(?,?,?,?,?,?) ON CONFLICT(group_id) "
@@ -354,6 +382,10 @@ def _execute(config, control, command, plan):
             "WHERE decision_id=?",
             (canonical(result), now(), command["decision_id"]),
         )
+        if command.get("automatic_policy"):
+            from .repeated_hour import confirm
+
+            confirm(control, command, plan)
     return result
 
 
@@ -385,19 +417,18 @@ def apply_command(config, control, command):
 
 def process(config, control):
     root = os.environ.get("INGESTA_REVIEW_ROOT")
-    if not root:
-        if control.db.execute(
-            "SELECT 1 FROM review_operations WHERE state='PREPARED' LIMIT 1"
-        ).fetchone():
-            raise IntegrityError("Pending review requires its configured command/result transport")
-        return
-    root = Path(root)
+    root = Path(root) if root else None
     for pending in control.db.execute(
         "SELECT command_json FROM review_operations WHERE state='PREPARED' ORDER BY created_at"
     ).fetchall():
         command = json.loads(pending[0])
+        if root is None and not command.get("automatic_policy"):
+            raise IntegrityError("Pending review requires its configured command/result transport")
         result = apply_command(config, control, command)
-        atomic(root / "results" / config.family / (command["decision_id"] + ".json"), result)
+        if root is not None and not command.get("automatic_policy"):
+            atomic(root / "results" / config.family / (command["decision_id"] + ".json"), result)
+    if root is None:
+        return
     directory = root / "commands" / config.family
     if not directory.is_dir():
         return

@@ -11,6 +11,7 @@ dependencies = [
   "deltalake==1.6.6",
   "pyarrow>=21,<24",
   "portalocker>=3.2,<4",
+  "tzdata>=2025.2,<2027",
 ]
 
 [project.scripts]
