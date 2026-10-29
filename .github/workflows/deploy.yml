@@ -1,338 +1,36 @@
-name: Ingesta Delta Lake
+name: Fenix product and DAR catalogs (read only)
 on:
-  push:
-    branches: [main, develop]
-  pull_request:
   workflow_dispatch:
     inputs:
       operation:
-        type: choice
-        options: [validate, diagnose, rollback, inspect, compact, trial, reformulate, rebuild-index, compact-associations, release-tested-onprem]
-        default: validate
-        description: 'validate: CI/imagen; diagnose: Docker/montaje sin ingesta; rollback: release previa'
-      validated_run:
         type: string
-        required: false
-        description: Successful Windows/Linux test run for the same application source
-      remove_backup:
-        type: boolean
-        default: false
-        description: 'compact: retirar las copias antiguas solo despuÃ©s de validar cada sustituciÃ³n'
-
+        default: diagnose
 permissions:
   contents: read
-
 jobs:
-  control-maintenance:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop' && contains(fromJSON('["inspect","compact","trial","reformulate","rebuild-index","compact-associations"]'), inputs.operation)
-    uses: ./.github/workflows/maintenance.yml
-    with:
-      operation: ${{ inputs.operation }}
-      remove_backup: ${{ inputs.remove_backup }}
-
-  contracts-and-delta:
-    if: github.event_name != 'workflow_dispatch' || inputs.operation == 'validate'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: '3.12'
-      - name: Install pinned uv
-        shell: pwsh
-        run: |
-          "UV_PROJECT_ENVIRONMENT=$env:RUNNER_TEMP/ingesta-delta-venv" >> $env:GITHUB_ENV
-          python -m pip install uv==0.11.6
-      - name: Install locked dependencies
-        run: uv sync --locked --python 3.12
-      - name: Lint
-        run: uv run --locked ruff check .
-      - name: Format
-        run: uv run --locked ruff format --check .
-      - name: Contracts and real Delta transactions on synthetic inputs
-        run: uv run --locked python -m pytest --cov=ingesta_delta_lake --cov=deployment --cov-report=term-missing --cov-fail-under=85
-
-  image:
-    needs: contracts-and-delta
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      image: ${{ steps.publish.outputs.image }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - name: Build the immutable candidate
-        id: candidate
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA}"
-          echo "CANDIDATE=$image" >> "$GITHUB_ENV"
-          echo "image=$image" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          platforms: linux/amd64
-          load: true
-          push: false
-          tags: ${{ steps.candidate.outputs.image }}
-          build-args: |
-            REVISION=${{ github.sha }}
-            SOURCE=${{ github.server_url }}/${{ github.repository }}
-            BRANCH=${{ github.ref_name }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: Exercise the final image without operational mounts
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p release
-          docker run --rm --network none --read-only --cap-drop ALL \
-            --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,size=512m \
-            "$CANDIDATE" self-test | tee release/image-tests.json
-          docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,size=64m \
-            "$CANDIDATE" describe > release/contracts.json
-          docker image inspect "$CANDIDATE" > release/image.json
-          docker run --rm --network none --read-only --entrypoint python "$CANDIDATE" \
-            -c 'import importlib.metadata as m,json; print(json.dumps(sorted((d.metadata["Name"],d.version) for d in m.distributions())))' \
-            > release/packages.json
-      - name: Exercise real Docker activation and graceful update
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m deployment.smoke --image "$CANDIDATE" | tee release/docker-lifecycle.json
-      - name: Publish tested image
-        id: publish
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          docker push "$CANDIDATE"
-          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$CANDIDATE")
-          echo "image=$digest" >> "$GITHUB_OUTPUT"
-          echo "$digest" > release/image-reference.txt
-          docker logout ghcr.io
-      - name: Preserve validation evidence
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: image-${{ github.sha }}
-          path: release/
-          if-no-files-found: error
-          retention-days: 30
-
-  deploy:
-    needs: image
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
-    runs-on: ${{ fromJSON(vars.INGESTA_RUNNER_LABELS || '["self-hosted","Windows","X64"]') }}
-    environment: ${{ github.ref_name }}
-    concurrency:
-      group: ingesta-deploy-${{ github.repository }}-${{ github.ref_name }}
-      cancel-in-progress: false
-    timeout-minutes: 75
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: '3.12'
-      - name: Deploy exact tested image to the branch environment
-        shell: powershell
-        env:
-          INGESTA_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          INGESTA_REGISTRY_USER: ${{ github.actor }}
-          DEPLOY_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
-          INPUT_BIND: ${{ vars.INGESTA_INPUT_BIND }}
-          DOCKER_CONTEXT_NAME: ${{ vars.INGESTA_DOCKER_CONTEXT }}
-          RELEASE_IMAGE: ${{ needs.image.outputs.image }}
-          RELEASE_SHA: ${{ github.sha }}
-          RELEASE_BRANCH: ${{ github.ref_name }}
-          RELEASE_RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          $site = ./scripts/prepare_site.ps1 -Repository $env:GITHUB_REPOSITORY `
-            -Branch $env:RELEASE_BRANCH -SitePath $env:DEPLOY_SITE `
-            -InputBind $env:INPUT_BIND -DockerContext $env:DOCKER_CONTEXT_NAME
-          ./scripts/deploy.ps1 -Site $site -Branch $env:RELEASE_BRANCH `
-            -Image $env:RELEASE_IMAGE -Commit $env:RELEASE_SHA -RunUrl $env:RELEASE_RUN
-
-  rollback:
-    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'rollback' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
-    runs-on: ${{ fromJSON(vars.INGESTA_RUNNER_LABELS || '["self-hosted","Windows","X64"]') }}
-    environment: ${{ github.ref_name }}
-    concurrency:
-      group: ingesta-deploy-${{ github.repository }}-${{ github.ref_name }}
-      cancel-in-progress: false
-    timeout-minutes: 75
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: '3.12'
-      - name: Restore previous compatible release without reverting data
-        shell: powershell
-        env:
-          INGESTA_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          INGESTA_REGISTRY_USER: ${{ github.actor }}
-          DEPLOY_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
-          INPUT_BIND: ${{ vars.INGESTA_INPUT_BIND }}
-          DOCKER_CONTEXT_NAME: ${{ vars.INGESTA_DOCKER_CONTEXT }}
-          RELEASE_BRANCH: ${{ github.ref_name }}
-          RELEASE_RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          $site = ./scripts/prepare_site.ps1 -Repository $env:GITHUB_REPOSITORY `
-            -Branch $env:RELEASE_BRANCH -SitePath $env:DEPLOY_SITE `
-            -InputBind $env:INPUT_BIND -DockerContext $env:DOCKER_CONTEXT_NAME
-          ./scripts/deploy.ps1 -Site $site -Branch $env:RELEASE_BRANCH `
-            -RunUrl $env:RELEASE_RUN -Mode Rollback
-
   diagnose:
-    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'diagnose'
-    runs-on: ${{ fromJSON(vars.INGESTA_RUNNER_LABELS || '["self-hosted","Windows","X64"]') }}
-    timeout-minutes: 15
-    permissions:
-      contents: read
+    runs-on: [self-hosted, Windows, X64, fenix-ingesta]
+    timeout-minutes: 8
     steps:
-      - name: Inspect Docker and input directory without running ingestion
+      - name: Inventory delivered catalogs without altering ingestion
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          docker context show
-          docker info --format '{{.ID}} {{.OSType}} {{.Architecture}}'
-          if ($LASTEXITCODE -ne 0) { throw 'Motor Docker no disponible para la cuenta del runner.' }
-          $image = 'python:3.12.14-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e'
-          $check = 'from pathlib import Path; import json,sys; v={o:(Path("/input")/o).is_dir() for o in ["AV21","AV22","AV23","AV31","AV32"]}; print(json.dumps(v)); sys.exit(0 if all(v.values()) else 1)'
-          $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($check))
-          $check = "import base64;exec(base64.b64decode('$encoded'))"
-          $found = $false
-          foreach ($binding in @('C:/DataSharing/Fenix', '/mnt/c/DataSharing/Fenix')) {
-            Write-Output "Comprobando montaje de solo lectura: $binding"
-            docker run --rm --network none --read-only --cap-drop ALL `
-              --mount "type=bind,src=$binding,dst=/input,readonly" `
-              --entrypoint python $image -c $check
-            if ($LASTEXITCODE -eq 0) { Write-Output "INPUT_BIND_OK=$binding"; $found = $true; break }
-          }
-          if (-not $found) { throw 'No se han encontrado los cinco orÃ­genes en el montaje.' }
-
-  release-tested-onprem:
-    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'release-tested-onprem' && github.ref == 'refs/heads/develop'
-    permissions:
-      contents: read
-      actions: read
-      packages: write
-    runs-on: ${{ fromJSON(vars.INGESTA_RUNNER_LABELS || '["self-hosted","Windows","X64"]') }}
-    environment: develop
-    timeout-minutes: 60
-    concurrency:
-      group: ingesta-deploy-${{ github.repository }}-develop
-      cancel-in-progress: false
-    env:
-      REVISION: ${{ github.sha }}
-      VALIDATED_RUN: ${{ inputs.validated_run }}
-      INGESTA_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      INGESTA_REGISTRY_USER: ${{ github.actor }}
-    steps:
-      - name: Require successful Linux and Windows tests for current develop HEAD
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if ($env:REVISION -notmatch '^[a-f0-9]{40}$' -or $env:VALIDATED_RUN -notmatch '^\d+$') { throw 'Invalid release identity' }
-          $headers = @{ Authorization = "Bearer $env:INGESTA_GITHUB_TOKEN"; Accept = 'application/vnd.github+json' }
-          $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
-          $head = Invoke-RestMethod "$api/git/ref/heads/develop" -Headers $headers
-          $run = Invoke-RestMethod "$api/actions/runs/$env:VALIDATED_RUN" -Headers $headers
-          if ($head.object.sha -ne $env:REVISION -or $run.head_branch -ne 'develop' -or $run.event -ne 'push') { throw 'Release is not current develop HEAD' }
-          if ($run.head_sha -ne $env:REVISION) {
-            # Reuse tests only while this workflow is the sole changed file.
-            # Application, dependencies, Dockerfile and deployment code must be identical.
-            $comparison = Invoke-RestMethod "$api/compare/$($run.head_sha)...$env:REVISION" -Headers $headers
-            if ($comparison.status -ne 'ahead' -or $comparison.total_commits -gt 10 -or @($comparison.files).Count -ne 1 -or $comparison.files[0].filename -ne '.github/workflows/deploy.yml') { throw 'Application source differs from tested revision' }
-          }
-          $jobs = Invoke-RestMethod "$api/actions/runs/$env:VALIDATED_RUN/jobs?filter=latest" -Headers $headers
-          foreach ($os in @('ubuntu-latest', 'windows-latest')) {
-            $matches = @($jobs.jobs | Where-Object { $_.name -eq "contracts-and-delta ($os)" -and $_.conclusion -eq 'success' })
-            if ($matches.Count -ne 1) { throw "Missing successful tests for $os" }
-          }
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+          $workers = @(docker ps -q --filter 'label=es.fenix.ingesta.role=worker' --filter 'label=es.fenix.ingesta.channel=develop')
+          if ($workers.Count -ne 1) { throw 'Expected one active ingestion worker' }
+          $active = (docker inspect $workers[0] | ConvertFrom-Json)[0]
+          $inputMount = @($active.Mounts | Where-Object { $_.Destination -eq '/input' })
+          if ($inputMount.Count -ne 1) { throw 'Expected one input mount' }
+          $code = "import base64;exec(base64.b64decode('IiIiUmVhZC1vbmx5IGludmVudG9yeSBvZiBkZWxpdmVyZWQgRmVuaXggZmlsZXMgYW5kIGN1cnJlbnQgcHJvZHVjdC9BUiBjYXRhbG9ncy4iIiIKaW1wb3J0IGNzdgppbXBvcnQganNvbgppbXBvcnQgb3MKaW1wb3J0IHJlCmZyb20gY29sbGVjdGlvbnMgaW1wb3J0IENvdW50ZXIKZnJvbSBkYXRldGltZSBpbXBvcnQgZGF0ZXRpbWUsIHRpbWV6b25lCmZyb20gcGF0aGxpYiBpbXBvcnQgUGF0aAoKcm9vdCA9IFBhdGgoJy9pbnB1dCcpCmNvZGVzID0geyc1MycsICcyMjEnLCAnNDE0JywgJzExNScsICcyNyd9CmZpbGVzID0gW10KZXJyb3JzID0gW10KZm9yIGRpcmVjdG9yeSwgY2hpbGRyZW4sIG5hbWVzIGluIG9zLndhbGsocm9vdCwgZm9sbG93bGlua3M9RmFsc2UsIG9uZXJyb3I9bGFtYmRhIGU6IGVycm9ycy5hcHBlbmQoc3RyKGUpKSk6CiAgICBjaGlsZHJlbls6XSA9IFtkIGZvciBkIGluIGNoaWxkcmVuIGlmIG5vdCAoUGF0aChkaXJlY3RvcnkpL2QpLmlzX3N5bWxpbmsoKV0KICAgIGZvciBuYW1lIGluIG5hbWVzOgogICAgICAgIHBhdGggPSBQYXRoKGRpcmVjdG9yeSkvbmFtZQogICAgICAgIGlmIG5vdCBwYXRoLmlzX3N5bWxpbmsoKToKICAgICAgICAgICAgZmlsZXMuYXBwZW5kKHBhdGgpCgpkZWYgZmFtaWx5KHBhdGgpOgogICAgcmV0dXJuIHJlLnN1YihyJ15cZHs4fSg/Ol9cZHs1LDZ9KT9fJywgJycsIHBhdGgubmFtZS51cHBlcigpKQoKZGVmIHJvd3MocGF0aCk6CiAgICB3aXRoIHBhdGgub3BlbihlbmNvZGluZz0nY3AxMjUyJywgbmV3bGluZT0nJykgYXMgc3RyZWFtOgogICAgICAgIGZvciByb3cgaW4gY3N2LnJlYWRlcihzdHJlYW0sIGRlbGltaXRlcj0nOycpOgogICAgICAgICAgICBpZiByb3c6CiAgICAgICAgICAgICAgICB5aWVsZCB0dXBsZShyb3dbOi0xXSBpZiByb3dbLTFdID09ICcnIGVsc2Ugcm93KQoKcmVwb3J0ID0geydjaGVja2VkX2F0X3V0Yyc6IGRhdGV0aW1lLm5vdyh0aW1lem9uZS51dGMpLmlzb2Zvcm1hdCgpLAogICAgICAgICAgJ3Jvb3QnOiBzdHIocm9vdCksICdpbmR1c3RyaWFsX211dGF0aW9ucyc6IDAsCiAgICAgICAgICAndG90YWxfZmlsZXMnOiBsZW4oZmlsZXMpLCAnaW52ZW50b3J5X2Vycm9ycyc6IGVycm9ycywKICAgICAgICAgICdleHRlbnNpb25zJzogZGljdChDb3VudGVyKHAuc3VmZml4Lmxvd2VyKCkgZm9yIHAgaW4gZmlsZXMpKSwKICAgICAgICAgICdtYXJibGVfcGF0aHMnOiBbc3RyKHAucmVsYXRpdmVfdG8ocm9vdCkpIGZvciBwIGluIGZpbGVzIGlmICdtYXJibGUnIGluIHAubmFtZS5sb3dlcigpXSwKICAgICAgICAgICdzcHJlYWRzaGVldF9wYXRocyc6IFtzdHIocC5yZWxhdGl2ZV90byhyb290KSkgZm9yIHAgaW4gZmlsZXMgaWYgcC5zdWZmaXgubG93ZXIoKSBpbiAoJy54bHN4JywnLnhscycsJy54bHNtJyldLAogICAgICAgICAgJ3NlZ21lbnRfbmFtZWRfc291cmNlcyc6IHNvcnRlZCh7ZmFtaWx5KHApIGZvciBwIGluIGZpbGVzIGlmIHJlLnNlYXJjaChyJ3NlZ21lbnR8cHJlbWl1bXxsaWdlcm98Y2xhc3NpZnxjbGFzaWYnLCBwLm5hbWUsIHJlLkkpfSksCiAgICAgICAgICAnbGluZXMnOiBbXX0KZm9yIGxpbmUgaW4gKCdBVjIxJywnQVYyMicsJ0FWMjMnLCdBVjMxJywnQVYzMicpOgogICAgb3duID0gW3AgZm9yIHAgaW4gZmlsZXMgaWYgcC5yZWxhdGl2ZV90byhyb290KS5wYXJ0c1swXSA9PSBsaW5lXQogICAgZW50cnkgPSB7J2xpbmUnOiBsaW5lLCAnZmFtaWxpZXMnOiBkaWN0KENvdW50ZXIoZmFtaWx5KHApIGZvciBwIGluIG93bikpLCAnY2F0YWxvZ3MnOiB7fX0KICAgIGZvciBraW5kIGluICgnU0lQX01PREVMTy5DU1YnLCAnU0lQX0RFRkVDVE8uQ1NWJyk6CiAgICAgICAgc2VsZWN0ZWQgPSBzb3J0ZWQoKHAgZm9yIHAgaW4gb3duIGlmIGZhbWlseShwKSA9PSBraW5kKSwga2V5PWxhbWJkYSBwOnAuc3RhdCgpLnN0X210aW1lX25zLCByZXZlcnNlPVRydWUpWzozXQogICAgICAgIG9ic2VydmF0aW9ucyA9IFtdCiAgICAgICAgZm9yIHAgaW4gc2VsZWN0ZWQ6CiAgICAgICAgICAgIGJlZm9yZSA9IHAuc3RhdCgpCiAgICAgICAgICAgIHVuaXF1ZSA9IHNldChyb3dzKHApKQogICAgICAgICAgICBhZnRlciA9IHAuc3RhdCgpCiAgICAgICAgICAgIGl0ZW0gPSB7J2ZpbGUnOiBzdHIocC5yZWxhdGl2ZV90byhyb290KSksICdieXRlcyc6IGJlZm9yZS5zdF9zaXplLAogICAgICAgICAgICAgICAgICAgICdtb2RpZmllZF9hdF91dGMnOmRhdGV0aW1lLmZyb210aW1lc3RhbXAoYmVmb3JlLnN0X210aW1lLCB0aW1lem9uZS51dGMpLmlzb2Zvcm1hdCgpLAogICAgICAgICAgICAgICAgICAgICdzdGFibGUnOiAoYmVmb3JlLnN0X210aW1lX25zLGJlZm9yZS5zdF9zaXplKT09KGFmdGVyLnN0X210aW1lX25zLGFmdGVyLnN0X3NpemUpLAogICAgICAgICAgICAgICAgICAgICdmaWVsZF9jb3VudHMnOiBkaWN0KENvdW50ZXIobGVuKHIpIGZvciByIGluIHVuaXF1ZSkpLAogICAgICAgICAgICAgICAgICAgICd1bmlxdWVfcm93cyc6IGxlbih1bmlxdWUpfQogICAgICAgICAgICBpZiBraW5kID09ICdTSVBfREVGRUNUTy5DU1YnOgogICAgICAgICAgICAgICAgaXRlbVsnZGFyX3Jvd3MnXSA9IFtsaXN0KHJbOjRdKSBmb3IgciBpbiBzb3J0ZWQodW5pcXVlKSBpZiBsZW4ocik+PTQgYW5kIHJbMV0gaW4gY29kZXNdCiAgICAgICAgICAgIGVsc2U6CiAgICAgICAgICAgICAgICBpdGVtWydzYW1wbGVfcm93cyddID0gW2xpc3QocikgZm9yIHIgaW4gc29ydGVkKHVuaXF1ZSlbOjNdXQogICAgICAgICAgICAgICAgaXRlbVsnc2VnbWVudF9vcl9jbG9zdXJlX2xhYmVscyddID0gW2xpc3QocikgZm9yIHIgaW4gc29ydGVkKHVuaXF1ZSkgaWYgYW55KHJlLnNlYXJjaChyJ3ByZW1pdW18bGlnZXJvfGNvcmNob3xyb3NjYXxzZWdtZW50JywgdiwgcmUuSSkgZm9yIHYgaW4gcildCiAgICAgICAgICAgIG9ic2VydmF0aW9ucy5hcHBlbmQoaXRlbSkKICAgICAgICBlbnRyeVsnY2F0YWxvZ3MnXVtraW5kXSA9IG9ic2VydmF0aW9ucwogICAgcmVwb3J0WydsaW5lcyddLmFwcGVuZChlbnRyeSkKcHJpbnQoanNvbi5kdW1wcyhyZXBvcnQsIGVuc3VyZV9hc2NpaT1UcnVlKSkK'))"
+          $report = Join-Path $env:RUNNER_TEMP 'segment-dar-evidence.json'
+          $result = & docker run --rm --pull never --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 512m --cpus 0.5 --mount "type=bind,src=$($inputMount[0].Source),dst=/input,readonly" --entrypoint python $active.Image -B -c $code
+          if ($LASTEXITCODE -ne 0) { throw 'Read-only evidence audit failed' }
+          [IO.File]::WriteAllText($report, ($result -join "`n"), (New-Object Text.UTF8Encoding($false)))
+          $doc = Get-Content $report -Raw | ConvertFrom-Json
+          $doc | Select-Object checked_at_utc,industrial_mutations | ConvertTo-Json
+          $doc.lines | Select-Object line,hot_files_available,bytes_read | Format-Table
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: '3.12'
-      - name: Build and exercise the exact tested source without operational mounts
-        id: image
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $image = "ghcr.io/$($env:GITHUB_REPOSITORY.ToLower()):sha-$env:REVISION"
-          $dockerDirectory = Split-Path (Get-Command docker).Source
-          $buildxCandidates = @(
-            (Join-Path (Split-Path $dockerDirectory) 'cli-plugins/docker-buildx.exe'),
-            (Join-Path $env:ProgramFiles 'Docker/Docker/resources/cli-plugins/docker-buildx.exe')
-          )
-          $buildx = $buildxCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-          if (-not $buildx) { throw 'Docker Desktop BuildKit plugin is unavailable' }
-          & $buildx build --load --platform linux/amd64 --provenance=false --build-arg "REVISION=$env:REVISION" --build-arg "SOURCE=https://github.com/$env:GITHUB_REPOSITORY" --build-arg 'BRANCH=develop' -t $image .
-          if ($LASTEXITCODE -ne 0) { throw 'Image build failed' }
-          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,size=512m $image self-test
-          if ($LASTEXITCODE -ne 0) { throw 'Final image self-test failed' }
-          $originalConfig = $env:DOCKER_CONFIG
-          $buildContext = docker context show
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot determine Docker context' }
-          $sourceConfig = if ($originalConfig) { $originalConfig } else { Join-Path $env:USERPROFILE '.docker' }
-          $temporaryParent = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
-          $temporaryConfig = Join-Path $temporaryParent ('fenix-release-' + [guid]::NewGuid().ToString('N'))
-          New-Item -ItemType Directory -Path $temporaryConfig | Out-Null
-          try {
-            $contexts = Join-Path $sourceConfig 'contexts'
-            if (Test-Path -LiteralPath $contexts) { Copy-Item -LiteralPath $contexts -Destination $temporaryConfig -Recurse }
-            $env:DOCKER_CONFIG = $temporaryConfig
-            python deployment/registry.py
-            if ($LASTEXITCODE -ne 0) { throw 'Registry authentication failed' }
-            docker --context $buildContext push --platform linux/amd64 $image
-            if ($LASTEXITCODE -ne 0) { throw 'Image publication failed' }
-            $digest = docker --context $buildContext image inspect --format '{{index .RepoDigests 0}}' $image
-            if ($LASTEXITCODE -ne 0 -or $digest -notmatch '@sha256:[a-f0-9]{64}$') { throw 'Missing immutable image digest' }
-            [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "image=$digest`n", [Text.UTF8Encoding]::new($false))
-          }
-          finally {
-            $env:DOCKER_CONFIG = $originalConfig
-            $target = [IO.Path]::GetFullPath($temporaryConfig)
-            if (-not $target.StartsWith($temporaryParent + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe temporary cleanup path' }
-            Remove-Item -LiteralPath $target -Recurse -Force
-          }
-      - name: Activate the image using the existing graceful deployment protocol
-        shell: powershell
-        env:
-          DEPLOY_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
-          INPUT_BIND: ${{ vars.INGESTA_INPUT_BIND }}
-          DOCKER_CONTEXT_NAME: ${{ vars.INGESTA_DOCKER_CONTEXT }}
-          RELEASE_IMAGE: ${{ steps.image.outputs.image }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $site = ./scripts/prepare_site.ps1 -Repository $env:GITHUB_REPOSITORY -Branch develop -SitePath $env:DEPLOY_SITE -InputBind $env:INPUT_BIND -DockerContext $env:DOCKER_CONTEXT_NAME
-          ./scripts/deploy.ps1 -Site $site -Branch develop -Image $env:RELEASE_IMAGE -Commit $env:REVISION -RunUrl "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          name: segment-dar-evidence
+          path: ${{ runner.temp }}/segment-dar-evidence.json
+          retention-days: 7
