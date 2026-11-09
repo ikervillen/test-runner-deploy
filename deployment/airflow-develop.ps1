@@ -14,8 +14,14 @@ if ($expectedRevision -notmatch '^[a-f0-9]{40}$' -or
 }
 
 # Recheck the volume identity and prepare the Airflow-owned volumes.
-$probe = python -m deployment.gold_site --site $Site | ConvertFrom-Json
-if ($LASTEXITCODE -ne 0) { throw 'No se ha validado el volumen de develop.' }
+$silverBy = (Get-Date).AddMinutes(15)
+do {
+    $probe = python -m deployment.gold_site --site $Site | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0) { throw 'No se ha validado el volumen de develop.' }
+    if (-not $Activate -or $probe.silver_publication) { break }
+    Write-Output "Esperando Silver confirmada del worker. Estado del exportador: $($probe.silver_export.status)"
+    Start-Sleep -Seconds 30
+} while ((Get-Date) -lt $silverBy)
 $probe | ConvertTo-Json -Compress
 if ($Activate -and -not $probe.silver_publication) {
     throw 'El worker de develop aún no ha confirmado su primera publicación Silver.'
