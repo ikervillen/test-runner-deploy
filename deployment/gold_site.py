@@ -98,16 +98,40 @@ for path in sorted(paths, key=lambda item: item.stat().st_mtime)[-2:]:
 
 READ_SILVER_SIZE = """
 import json
+from datetime import timedelta
 from pathlib import Path
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
 from app.gold.publications import Snapshot
 
 snapshot = Snapshot.open(Path('/lake'))
 names = ('observation_assignments', 'LISTA_DEFECTOS', 'LISTA_RECH', 'LISTA_AR', 'CONT_ZC')
+datasets = {name: snapshot.table(name).to_pyarrow_dataset() for name in names}
+latest = {}
+for family in ('LISTA_DEFECTOS', 'LISTA_RECH', 'CONT_ZC'):
+    batches = datasets[family].to_batches(columns=['FECHA'])
+    values = (pc.max(batch.column(0)).as_py() for batch in batches)
+    latest[family] = max((value for value in values if value is not None), default=None)
+ceiling = min((value for value in latest.values() if value is not None), default=None)
+candidate_rows = {}
+if ceiling is not None:
+    for days in (1, 3, 7):
+        start = (ceiling - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+        candidate_rows[start.isoformat()] = {
+            family: datasets[family].count_rows(filter=ds.field('FECHA') > start)
+            for family in latest
+        }
+        end = ds.field('FECHA_OFF')
+        candidate_rows[start.isoformat()]['LISTA_AR'] = datasets['LISTA_AR'].count_rows(
+            filter=end.is_null() | (end > start),
+        )
 print(json.dumps({
     'silver_id': snapshot.publication_id,
     'source_mode': snapshot.manifest.get('source_mode'),
-    'rows': {name: snapshot.table(name).to_pyarrow_dataset().count_rows() for name in names},
-}))
+    'rows': {name: datasets[name].count_rows() for name in names},
+    'latest_by_source': latest,
+    'candidate_rows': candidate_rows,
+}, default=str))
 """
 
 
