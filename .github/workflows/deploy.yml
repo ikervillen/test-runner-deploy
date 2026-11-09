@@ -7,7 +7,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [validate, diagnose, gold-prepare, gold-enable-export, gold-airflow-status, gold-data-status, gold-airflow, gold-activate, docker-inventory, docker-cleanup, rollback, inspect, compact, trial, reformulate, rebuild-index, compact-associations, release-tested-onprem]
+        options: [validate, diagnose, gold-prepare, gold-enable-export, gold-airflow-status, gold-data-status, gold-airflow, gold-activate, gold-verify, docker-inventory, docker-cleanup, rollback, inspect, compact, trial, reformulate, rebuild-index, compact-associations, release-tested-onprem]
         default: validate
         description: 'validate: CI/imagen; diagnose: Docker/montaje; docker-inventory: recursos de develop; rollback: release previa'
       validated_run:
@@ -293,7 +293,7 @@ jobs:
           python @arguments
 
   gold-airflow:
-    if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["gold-airflow","gold-activate"]'), inputs.operation) && github.ref == 'refs/heads/develop'
+    if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["gold-airflow","gold-activate","gold-verify"]'), inputs.operation) && github.ref == 'refs/heads/develop'
     runs-on: ${{ fromJSON(vars.INGESTA_RUNNER_LABELS || '["self-hosted","Windows","X64"]') }}
     environment: develop
     concurrency:
@@ -332,7 +332,8 @@ jobs:
           $contextPath = Join-Path $env:RUNNER_TEMP "gold-${{ github.run_id }}-${{ github.run_attempt }}"
           python -m deployment.gold_context $contextPath
           if ($LASTEXITCODE -ne 0) { throw 'No se pudo obtener el contexto fijado.' }
-          ./deployment/airflow-develop.ps1 -Site $site -GoldContext $contextPath -Activate:($env:GOLD_OPERATION -eq 'gold-activate')
+          ./deployment/airflow-develop.ps1 -Site $site -GoldContext $contextPath `
+            -Activate:($env:GOLD_OPERATION -eq 'gold-activate') -VerifyOnly:($env:GOLD_OPERATION -eq 'gold-verify')
 
   diagnose:
     if: github.event_name == 'workflow_dispatch' && inputs.operation == 'diagnose'

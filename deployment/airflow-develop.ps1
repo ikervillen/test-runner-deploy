@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$Site,
     [Parameter(Mandatory = $true)][string]$GoldContext,
-    [switch]$Activate
+    [switch]$Activate,
+    [switch]$VerifyOnly
 )
 $ErrorActionPreference = 'Stop'
 $siteConfig = Get-Content -LiteralPath $Site -Raw | ConvertFrom-Json
@@ -27,6 +28,9 @@ do {
 $probe | ConvertTo-Json -Compress
 if ($Activate -and -not $probe.silver_publication) {
     throw 'El worker de develop aún no ha confirmado su primera publicación Silver.'
+}
+if ($VerifyOnly -and (-not $probe.gold_publication -or -not $env:GOLD_EXISTING_IMAGES)) {
+    throw 'La verificación requiere una publicación Gold y las huellas de las imágenes existentes.'
 }
 
 $env:INGESTA_DEVELOP_VOLUME = $siteConfig.environments.develop.volume
@@ -94,6 +98,40 @@ if ($env:GOLD_EXISTING_IMAGES) {
     }
 }
 
+function Start-VerifiedGoldApplication {
+    # The writer validates every table before promotion. Reopen its manifest and
+    # receipts and read counts without reloading the historical facts into Python.
+    $verify = @'
+import json
+from pathlib import Path
+from app.gold.publications import Snapshot
+
+gold = Snapshot.open(Path('/gold'), require_gold_contract=True)
+print(json.dumps({
+    'publication_id': gold.publication_id,
+    'input_publication_id': gold.manifest['input_publication_id'],
+    'tables': len(gold.manifest['tables']),
+    'scores': gold.table('quality_scores').to_pyarrow_dataset().count_rows(),
+}))
+'@
+    & $composeExe @stack run --rm --no-deps --entrypoint /opt/calidad/.venv/bin/python `
+        -e PYTHONPATH=/opt/calidad/backend airflow-scheduler -c $verify
+    if ($LASTEXITCODE -ne 0) { throw 'La publicación no supera el contrato Gold.' }
+    & $composeExe @stack up -d --no-build --wait --wait-timeout 300 backend frontend
+    if ($LASTEXITCODE -ne 0) { throw 'La aplicación no alcanzó un estado sano.' }
+    $frontendPort = if ($env:FRONTEND_PORT) { $env:FRONTEND_PORT } else { '5174' }
+    $catalog = Invoke-RestMethod -Uri "http://127.0.0.1:$frontendPort/api/catalog" -TimeoutSec 60
+    if ($catalog.source -ne 'gold' -or -not $catalog.publication_id) {
+        throw 'La aplicación no está leyendo el catálogo Gold.'
+    }
+    Write-Output "Aplicación Gold verificada. Publicación: $($catalog.publication_id)"
+}
+
+if ($VerifyOnly) {
+    Start-VerifiedGoldApplication
+    return
+}
+
 # The database and UI can be validated before any Gold calculation is enabled.
 & $composeExe @stack up -d --no-build --wait --wait-timeout 300 airflow-apiserver airflow-dag-processor
 if ($LASTEXITCODE -ne 0) { throw 'Airflow no alcanzó su estado de arranque.' }
@@ -158,13 +196,4 @@ if (-not $published.gold_publication_id -or $published.gold_publication_id -eq $
     throw 'Airflow aún no ha promovido una publicación Gold nueva.'
 }
 
-& $composeExe @stack run --rm --no-deps --entrypoint calidad-gold airflow-scheduler validate-gold --root /gold
-if ($LASTEXITCODE -ne 0) { throw 'La publicación no supera el contrato Gold.' }
-& $composeExe @stack up -d --no-build --wait --wait-timeout 180 backend frontend
-if ($LASTEXITCODE -ne 0) { throw 'La aplicación no alcanzó un estado sano.' }
-$frontendPort = if ($env:FRONTEND_PORT) { $env:FRONTEND_PORT } else { '5174' }
-$catalog = Invoke-RestMethod -Uri "http://127.0.0.1:$frontendPort/api/catalog" -TimeoutSec 20
-if ($catalog.source -ne 'gold' -or -not $catalog.publication_id) {
-    throw 'La aplicación no está leyendo el catálogo Gold.'
-}
-Write-Output "Aplicación Gold verificada. Publicación: $($catalog.publication_id)"
+Start-VerifiedGoldApplication
