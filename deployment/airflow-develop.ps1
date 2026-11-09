@@ -99,7 +99,13 @@ if ($env:GOLD_EXISTING_IMAGES) {
 if ($LASTEXITCODE -ne 0) { throw 'Airflow no alcanzó su estado de arranque.' }
 & $composeExe @stack ps -a
 if ($LASTEXITCODE -ne 0) { throw 'No se pudo inspeccionar la pila.' }
-python -m deployment.gold_site --site $Site --configure-from $root
+if ($Activate) {
+    & $composeExe @stack stop --timeout 120 airflow-scheduler
+    if ($LASTEXITCODE -ne 0) { throw 'No se pudo detener el scheduler antes de actualizar Gold.' }
+}
+$configureArgs = @('-m', 'deployment.gold_site', '--site', $Site, '--configure-from', $root)
+if ($Activate) { $configureArgs += '--allow-budget-increase' }
+python @configureArgs
 if ($LASTEXITCODE -ne 0) { throw 'Airflow arrancó, pero falta inicializar la configuración Gold.' }
 if (-not $Activate) { return }
 
@@ -141,7 +147,7 @@ foreach ($id in $publishers) {
 & $composeExe @stack up -d --no-build --wait --wait-timeout 300 airflow-scheduler
 if ($LASTEXITCODE -ne 0) { throw 'El scheduler no alcanzó un estado sano.' }
 
-$publishBy = (Get-Date).AddMinutes(15)
+$publishBy = (Get-Date).AddMinutes(25)
 do {
     $published = python -m deployment.gold_site --site $Site | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'No se pudo comprobar la publicación Gold.' }

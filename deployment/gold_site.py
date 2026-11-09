@@ -67,18 +67,34 @@ import sys
 from pathlib import Path
 
 values = json.load(sys.stdin)
-for name, value in values.items():
-    path = Path('/config') / name
-    if path.exists() and json.loads(path.read_text(encoding='utf-8')) != value:
-        raise SystemExit(f'Configuration already exists with different content: {name}')
+allow_budget_increase = sys.argv[1] == 'true'
+gold = Path('/gold')
+updates = {}
 for name, value in values.items():
     path = Path('/config') / name
     if not path.exists():
-        temporary = path.with_suffix('.tmp')
-        temporary.write_text(json.dumps(value, ensure_ascii=False), encoding='utf-8')
-        temporary.chmod(0o644)
-        temporary.replace(path)
-gold = Path('/gold')
+        updates[path] = value
+        continue
+    previous = json.loads(path.read_text(encoding='utf-8'))
+    if previous == value:
+        continue
+    budgets = ('max_rows_per_source', 'max_total_rows')
+    if (
+        name == 'settings.json'
+        and allow_budget_increase
+        and isinstance(previous, dict)
+        and {k: previous[k] for k in previous if k not in budgets}
+        == {k: value[k] for k in value if k not in budgets}
+        and all(isinstance(value.get(k), int) and value[k] >= previous.get(k, 0) for k in budgets)
+    ):
+        updates[path] = value
+        continue
+    raise SystemExit(f'Configuration already exists with different content: {name}')
+for path, value in updates.items():
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(value, ensure_ascii=False), encoding='utf-8')
+    temporary.chmod(0o644)
+    temporary.replace(path)
 if not (gold / 'current.json').exists():
     os.chown(gold, 10001, 0)
     gold.chmod(0o750)
@@ -156,7 +172,8 @@ def prepare(site, *, enable_export=False):
     volume = site["environments"]["develop"]["volume"]
     if not active or active["volume"] != volume:
         raise RuntimeError("El volumen no coincide con el descriptor activo de develop")
-    if docker.json("info", "--format", "{{json .}}")["ID"] != active["engine_id"]:
+    engine = docker.json("info", "--format", "{{json .}}")
+    if engine["ID"] != active["engine_id"]:
         raise RuntimeError("El motor Docker no coincide con el descriptor activo")
     expected = {
         "es.fenix.ingesta.namespace": site["namespace"],
@@ -238,10 +255,15 @@ def prepare(site, *, enable_export=False):
         )
     present = set(docker.call("volume", "ls", "--format", "{{.Name}}").splitlines())
     airflow = {role: compose_volume(docker, role, present) for role in AIRFLOW_VOLUMES}
-    return {"volume": volume, "airflow_volumes": airflow, **probe}
+    return {
+        "volume": volume,
+        "airflow_volumes": airflow,
+        "engine_memory_bytes": engine.get("MemTotal"),
+        **probe,
+    }
 
 
-def configure(site, report, source):
+def configure(site, report, source, *, allow_budget_increase=False):
     if not report["gold_exists"]:
         raise RuntimeError("No existe el subdirectorio Gold esperado")
     docker = Docker(site["docker_context"])
@@ -288,6 +310,7 @@ def configure(site, report, source):
             "python",
             "-c",
             WRITE_CONFIG,
+            str(allow_budget_increase).lower(),
         ],
         input=json.dumps(config, ensure_ascii=True),
         text=True,
@@ -301,6 +324,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--site", type=Path, required=True)
     parser.add_argument("--configure-from", type=Path)
+    parser.add_argument("--allow-budget-increase", action="store_true")
     parser.add_argument("--enable-export", action="store_true")
     parser.add_argument("--airflow-status", action="store_true")
     parser.add_argument("--data-status", action="store_true")
@@ -308,7 +332,14 @@ def main():
     site = load_site(args.site)
     report = prepare(site, enable_export=args.enable_export)
     if args.configure_from:
-        report.update(configure(site, report, args.configure_from))
+        report.update(
+            configure(
+                site,
+                report,
+                args.configure_from,
+                allow_budget_increase=args.allow_budget_increase,
+            )
+        )
     if args.airflow_status:
         docker = Docker(site["docker_context"])
         name = f"{PROJECT}-airflow-dag-processor-1"

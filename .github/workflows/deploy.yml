@@ -299,10 +299,10 @@ jobs:
     concurrency:
       group: gold-develop-${{ github.repository }}
       cancel-in-progress: false
-    timeout-minutes: 55
+    timeout-minutes: 75
     env:
-      GOLD_CONTEXT_COMMIT: 4840ead70b9f2b0aa150f66ca5dcb2203412896b
-      GOLD_SOURCE_COMMIT: 1d771583264c07f23cf37a7637aea335b7ab5d18
+      GOLD_CONTEXT_COMMIT: dd221b9290a9b786bb6abf0866500b8b08000890
+      GOLD_SOURCE_COMMIT: 181d42890f742a88ead56042426f406196a2c458
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
