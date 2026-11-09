@@ -1,0 +1,12 @@
+# Keep repository text stable across Windows development and Linux containers.
+* text=auto eol=lf
+
+# Files that must never receive line-ending conversion.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.parquet binary
+*.xlsx binary
+*.xls binary
