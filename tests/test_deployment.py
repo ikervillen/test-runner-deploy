@@ -52,13 +52,8 @@ class FakeDocker:
                 for n, r in self.containers.items()
                 if r["running"] and r["record"]["channel"] == channel
             )
-        if args[0] == "run":
-            if args[-1] == "describe":
-                return json.dumps({"contracts": "different" if self.incompatible else "v2"})
-            if args[-1] == "self-test":
-                if self.failed == "self-test":
-                    raise RuntimeError("self-test failure")
-                return json.dumps({"status": "PASSED"})
+        if args[0] == "run" and args[-1] == "describe":
+            return json.dumps({"contracts": "different" if self.incompatible else "v2"})
         raise AssertionError(args)
 
     def json(self, *args):
@@ -150,7 +145,7 @@ def test_gold_image_activates_export_only_in_develop(site, motor, monkeypatch, b
     release = controller.deploy(IMAGE1, SHA1, "run")["release"]
     assert release["gold_revision"] == "c" * 40
     assert "INGESTA_GOLD_EXPORT=1" in common_args(release)
-    assert any("INGESTA_GOLD_EXPORT=1" in event and "self-test" in event for event in motor.events)
+    assert not any(event[-1] == "self-test" for event in motor.events if event)
 
 
 def test_two_branches_have_independent_worker_volumes_and_descriptors(site, motor):
@@ -222,7 +217,7 @@ def test_update_waits_for_old_and_confirms_pointer_before_activation(site, motor
     assert len(list((dep.root / "receipts").glob("*.json"))) == 2
 
 
-@pytest.mark.parametrize("failure", ["self-test", "drain", "launch", "ready", "activate"])
+@pytest.mark.parametrize("failure", ["drain", "launch", "ready", "activate"])
 def test_failure_keeps_or_restores_previous_without_second_writer(site, motor, failure):
     dep = deployer(site, motor)
     old = dep.deploy(IMAGE1, SHA1, "run1")["release"]

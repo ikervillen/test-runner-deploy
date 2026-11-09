@@ -638,27 +638,7 @@ class Deployment:
                 self.prepare_volume(record, allow_create=False)
                 self.docker.ready(old)
                 return {"status": "ALREADY_ACTIVE", "release": old}
-            # Prueba final aislada en tmpfs, sin montar datos/CSV de ninguno de los entornos.
-            tested = json.loads(
-                self.docker.call(
-                    "run",
-                    "--rm",
-                    "--network",
-                    "none",
-                    "--read-only",
-                    "--cap-drop",
-                    "ALL",
-                    "--security-opt",
-                    "no-new-privileges",
-                    "--tmpfs",
-                    "/tmp:rw,nosuid,size=512m",
-                    *(["--env", "INGESTA_GOLD_EXPORT=1"] if gold_revision else []),
-                    image,
-                    "self-test",
-                )
-            )
-            if tested.get("status") != "PASSED":
-                raise RuntimeError("La imagen candidata no supera la validación aislada")
+            # La imagen ya superó self-test en el job image, sobre este mismo digest.
             if record.get("review_volumes"):
                 self.docker.prepare_reviews(
                     record, allow_create=not bool(old and old.get("review_volumes"))
@@ -669,7 +649,6 @@ class Deployment:
                 "operation_id": uuid.uuid4().hex,
                 "candidate": record,
                 "previous": old,
-                "image_tests": tested,
                 "started_at": time.time(),
             }
             self.audit(journal, "PREPARED")
