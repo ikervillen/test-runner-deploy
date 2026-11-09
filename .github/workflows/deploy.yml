@@ -7,7 +7,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [validate, diagnose, docker-inventory, docker-cleanup, rollback, inspect, compact, trial, reformulate, rebuild-index, compact-associations, release-tested-onprem]
+        options: [validate, diagnose, gold-prepare, docker-inventory, docker-cleanup, rollback, inspect, compact, trial, reformulate, rebuild-index, compact-associations, release-tested-onprem]
         default: validate
         description: 'validate: CI/imagen; diagnose: Docker/montaje; docker-inventory: recursos de develop; rollback: release previa'
       validated_run:
@@ -235,6 +235,30 @@ jobs:
           $arguments = @('-m', 'deployment.inventory', '--site', $site, '--branch', 'develop')
           if ($env:DOCKER_OPERATION -eq 'docker-cleanup') { $arguments += '--remove-retired' }
           python @arguments
+
+  gold-prepare:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'gold-prepare' && github.ref == 'refs/heads/develop'
+    runs-on: ${{ fromJSON(vars.INGESTA_RUNNER_LABELS || '["self-hosted","Windows","X64"]') }}
+    environment: develop
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+      - name: Inspect Gold and prepare Airflow volumes
+        shell: powershell
+        env:
+          DEPLOY_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
+          INPUT_BIND: ${{ vars.INGESTA_INPUT_BIND }}
+          DOCKER_CONTEXT_NAME: ${{ vars.INGESTA_DOCKER_CONTEXT }}
+        run: |
+          $site = ./scripts/prepare_site.ps1 -Repository $env:GITHUB_REPOSITORY `
+            -Branch develop -SitePath $env:DEPLOY_SITE `
+            -InputBind $env:INPUT_BIND -DockerContext $env:DOCKER_CONTEXT_NAME
+          python -m deployment.gold_site --site $site
 
   diagnose:
     if: github.event_name == 'workflow_dispatch' && inputs.operation == 'diagnose'
