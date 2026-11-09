@@ -4,10 +4,13 @@
 # Airflow and the application never share site-packages: Airflow keeps its
 # constraint-pinned install, the Gold CLI runs from /opt/calidad/.venv built
 # from uv.lock with the same Python minor version as gold/Dockerfile.
+FROM python:3.11-slim AS uv
+RUN python -m pip install --no-cache-dir uv==0.11.6
+
 FROM apache/airflow:3.4.0-python3.11
 
 USER root
-COPY --from=ghcr.io/astral-sh/uv:0.11.6 /uv /usr/local/bin/uv
+COPY --from=uv /usr/local/bin/uv /usr/local/bin/uv
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/calidad/.venv \
     UV_PYTHON_DOWNLOADS=never \
