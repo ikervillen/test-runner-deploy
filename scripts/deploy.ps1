@@ -41,6 +41,13 @@ try {
         }
         & $Python @deploymentArguments
         if ($LASTEXITCODE -ne 0) { throw 'El despliegue no se ha completado. Consultar su recibo/journal.' }
+        if ($Branch -eq 'develop') {
+            & $Python -m deployment.inventory --site $Site --branch $Branch
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning 'Release activada. No se pudo generar el inventario Docker.'
+                $global:LASTEXITCODE = 0
+            }
+        }
     }
     finally { Pop-Location }
 }

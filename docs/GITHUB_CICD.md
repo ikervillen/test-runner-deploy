@@ -131,12 +131,24 @@ Desde Actions → workflow → Run workflow:
 - `validate`: CI y prueba de imagen, sin publicar/activar por ser una ejecución manual.
 - `diagnose`: consulta contexto/motor y comprueba directorios de entrada con montaje de solo
   lectura. No lee filas ni ejecuta ingesta, no monta volúmenes de datos.
+- `docker-inventory`: inventario de recursos retirables de `develop` en el runner de planta.
 - `rollback`: elegir `main` o `develop` y reactivar la release anterior compatible con la
   misma frontera segura. Conserva todos los commits de datos. No es una restauración de BD.
 
 El rollback reutiliza el contenedor/imagen retenidos y verifica compatibilidad y ausencia
-de operaciones pendientes. No borrar contenedores/imágenes anteriores necesarios para este
-camino; su retención/mantenimiento se gestionan por separado. Un fallo previo a activar
+de operaciones pendientes. Tras activar o revertir `develop`, el resumen del job de servidor
+publica el inventario Docker de esa instancia. `keep` identifica la release activa y el
+destino de rollback. `retire_containers` contiene los workers detenidos de la instancia
+que ya no son necesarios. `retire_images` lista ID, referencias, commit y los contenedores
+que hay que retirar primero. Una imagen usada por cualquier otro contenedor queda excluida.
+El inventario es de solo lectura y se aplaza mientras haya un despliegue sin reconciliar.
+
+Para retirar recursos, actualizar primero el inventario con
+`python -m deployment.inventory --site SITIO.json --branch develop` en el servidor.
+Retirar únicamente los IDs indicados, primero los contenedores y luego las imágenes,
+sin forzar la eliminación. Conservar los volúmenes y evitar limpiezas globales.
+
+Un fallo previo a activar
 mantiene/restaura la versión anterior; un estado incierto conserva journal y falla de forma
 explícita. El siguiente intento lo reconcilia antes de otra activación.
 
