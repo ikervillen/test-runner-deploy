@@ -7,7 +7,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [validate, diagnose, gold-prepare, docker-inventory, docker-cleanup, rollback, inspect, compact, trial, reformulate, rebuild-index, compact-associations, release-tested-onprem]
+        options: [validate, diagnose, gold-prepare, gold-airflow, docker-inventory, docker-cleanup, rollback, inspect, compact, trial, reformulate, rebuild-index, compact-associations, release-tested-onprem]
         default: validate
         description: 'validate: CI/imagen; diagnose: Docker/montaje; docker-inventory: recursos de develop; rollback: release previa'
       validated_run:
@@ -259,6 +259,40 @@ jobs:
             -Branch develop -SitePath $env:DEPLOY_SITE `
             -InputBind $env:INPUT_BIND -DockerContext $env:DOCKER_CONTEXT_NAME
           python -m deployment.gold_site --site $site
+
+  gold-airflow:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'gold-airflow' && github.ref == 'refs/heads/develop'
+    runs-on: ${{ fromJSON(vars.INGESTA_RUNNER_LABELS || '["self-hosted","Windows","X64"]') }}
+    environment: develop
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 34dd9de6f399e1b08fcc028de70626b17d711f08
+          path: .gold-context
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+      - name: Build Gold and start the Airflow control plane
+        shell: powershell
+        env:
+          DEPLOY_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
+          INPUT_BIND: ${{ vars.INGESTA_INPUT_BIND }}
+          DOCKER_CONTEXT_NAME: ${{ vars.INGESTA_DOCKER_CONTEXT }}
+          AIRFLOW_DB_PASSWORD: ${{ secrets.GOLD_AIRFLOW_DB_PASSWORD }}
+          AIRFLOW_FERNET_KEY: ${{ secrets.GOLD_AIRFLOW_FERNET_KEY }}
+          AIRFLOW_JWT_SECRET: ${{ secrets.GOLD_AIRFLOW_JWT_SECRET }}
+          AIRFLOW_ADMIN_PASSWORD: ${{ secrets.GOLD_AIRFLOW_ADMIN_PASSWORD }}
+          DOCKER_BUILDKIT: '1'
+        run: |
+          $site = ./scripts/prepare_site.ps1 -Repository $env:GITHUB_REPOSITORY `
+            -Branch develop -SitePath $env:DEPLOY_SITE `
+            -InputBind $env:INPUT_BIND -DockerContext $env:DOCKER_CONTEXT_NAME
+          ./deployment/airflow-develop.ps1 -Site $site -GoldContext .gold-context
 
   diagnose:
     if: github.event_name == 'workflow_dispatch' && inputs.operation == 'diagnose'

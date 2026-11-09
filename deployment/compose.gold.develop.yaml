@@ -1,0 +1,34 @@
+# Final overlay for the protected develop deployment on the Fenix Docker engine.
+x-gold: &gold
+  type: volume
+  source: ingesta-develop
+  target: /gold
+  volume:
+    subpath: gold
+
+services:
+  backend:
+    volumes:
+      - <<: *gold
+        read_only: true
+  airflow-scheduler:
+    volumes:
+      - *gold
+      - type: volume
+        source: gold-config
+        target: /config
+        read_only: true
+      - type: volume
+        source: gold-backup
+        target: /backup
+  publisher:
+    volumes:
+      - *gold
+      - type: volume
+        source: gold-config
+        target: /config
+        read_only: true
+
+volumes:
+  gold-config:
+  gold-backup:
