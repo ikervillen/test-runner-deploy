@@ -51,6 +51,8 @@ print(json.dumps({
                            if pointer.is_file() else None,
     'gold_config_files': [name for name in paths if (gold / name).is_file()],
     'silver_publication': (root / 'current.json').is_file(),
+    'volume_root_uid': root.stat().st_uid,
+    'volume_root_mode': oct(root.stat().st_mode & 0o777),
     'silver_export': {key: export[key] for key in (
         'status', 'error_type', 'error', 'last_attempt_at', 'last_success_at', 'publication_id'
     ) if key in export},
@@ -96,7 +98,7 @@ def compose_volume(docker, role, present):
     return name
 
 
-def prepare(site):
+def prepare(site, *, enable_export=False):
     docker = Docker(site["docker_context"])
     controller = Deployment(site, "develop", docker)
     active = controller.active()
@@ -113,21 +115,59 @@ def prepare(site):
     ownership = docker.json("volume", "inspect", volume)[0].get("Labels") or {}
     if any(ownership.get(key) != value for key, value in expected.items()):
         raise RuntimeError("El volumen de ingesta no pertenece a la instancia activa")
-    probe = docker.call(
-        "run",
-        "--rm",
-        "--network",
-        "none",
-        "--read-only",
-        "--cap-drop",
-        "ALL",
-        "--mount",
-        f"type=volume,source={volume},target=/lake,readonly",
-        UTILITY_IMAGE,
-        "python",
-        "-c",
-        PROBE,
+    mount = f"type=volume,source={volume},target=/lake"
+    probe = json.loads(
+        docker.call(
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--mount",
+            f"{mount},readonly",
+            UTILITY_IMAGE,
+            "python",
+            "-c",
+            PROBE,
+        )
     )
+    logs = docker.call("logs", "--tail", 300, active["container"], optional=True) or ""
+    export_events = []
+    for line in logs.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("family") == "GOLD_EXPORT":
+            export_events.append({"time": event.get("time"), "result": event.get("result")})
+    probe["worker_export_events"] = export_events[-3:]
+    if enable_export:
+        if not active.get("gold_revision") or probe["volume_root_uid"] not in {0, 10001}:
+            raise RuntimeError("No se reconoce el propietario o el exportador activo de develop")
+        probe["export_root_repair"] = docker.call(
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "CHOWN",
+            "--user",
+            "0:0",
+            "--mount",
+            mount,
+            UTILITY_IMAGE,
+            "python",
+            "-c",
+            "import os, stat; p='/lake'; s=os.stat(p); "
+            "assert s.st_uid in (0, 10001) and s.st_mode & stat.S_IWUSR; "
+            "os.chown(p, 10001, 10001) if s.st_uid == 0 else None; "
+            "assert os.stat(p).st_uid == 10001; print('uid=10001')",
+        )
     present = set(docker.call("volume", "ls", "--format", "{{.Name}}").splitlines())
     airflow = {role: compose_volume(docker, role, present) for role in AIRFLOW_VOLUMES}
     return {"volume": volume, "airflow_volumes": airflow, **json.loads(probe)}
@@ -193,9 +233,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--site", type=Path, required=True)
     parser.add_argument("--configure-from", type=Path)
+    parser.add_argument("--enable-export", action="store_true")
     args = parser.parse_args()
     site = load_site(args.site)
-    report = prepare(site)
+    report = prepare(site, enable_export=args.enable_export)
     if args.configure_from:
         report.update(configure(site, report, args.configure_from))
     print(json.dumps(report, sort_keys=True))

@@ -7,7 +7,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [validate, diagnose, gold-prepare, gold-airflow, gold-activate, docker-inventory, docker-cleanup, rollback, inspect, compact, trial, reformulate, rebuild-index, compact-associations, release-tested-onprem]
+        options: [validate, diagnose, gold-prepare, gold-enable-export, gold-airflow, gold-activate, docker-inventory, docker-cleanup, rollback, inspect, compact, trial, reformulate, rebuild-index, compact-associations, release-tested-onprem]
         default: validate
         description: 'validate: CI/imagen; diagnose: Docker/montaje; docker-inventory: recursos de develop; rollback: release previa'
       validated_run:
@@ -260,7 +260,7 @@ jobs:
           python @arguments
 
   gold-prepare:
-    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'gold-prepare' && github.ref == 'refs/heads/develop'
+    if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["gold-prepare","gold-enable-export"]'), inputs.operation) && github.ref == 'refs/heads/develop'
     runs-on: ${{ fromJSON(vars.INGESTA_RUNNER_LABELS || '["self-hosted","Windows","X64"]') }}
     environment: develop
     timeout-minutes: 10
@@ -274,6 +274,7 @@ jobs:
       - name: Inspect Gold and prepare Airflow volumes
         shell: powershell
         env:
+          GOLD_OPERATION: ${{ inputs.operation }}
           DEPLOY_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
           INPUT_BIND: ${{ vars.INGESTA_INPUT_BIND }}
           DOCKER_CONTEXT_NAME: ${{ vars.INGESTA_DOCKER_CONTEXT }}
@@ -281,7 +282,9 @@ jobs:
           $site = ./scripts/prepare_site.ps1 -Repository $env:GITHUB_REPOSITORY `
             -Branch develop -SitePath $env:DEPLOY_SITE `
             -InputBind $env:INPUT_BIND -DockerContext $env:DOCKER_CONTEXT_NAME
-          python -m deployment.gold_site --site $site
+          $arguments = @('-m', 'deployment.gold_site', '--site', $site)
+          if ($env:GOLD_OPERATION -eq 'gold-enable-export') { $arguments += '--enable-export' }
+          python @arguments
 
   gold-airflow:
     if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["gold-airflow","gold-activate"]'), inputs.operation) && github.ref == 'refs/heads/develop'
@@ -292,8 +295,8 @@ jobs:
       cancel-in-progress: false
     timeout-minutes: 55
     env:
-      GOLD_CONTEXT_COMMIT: 1cea9e3449ef97f925ec643002c00e50639456f0
-      GOLD_SOURCE_COMMIT: 848d4ff4534ee6f9519eca42ead06860ade1ad5a
+      GOLD_CONTEXT_COMMIT: 4840ead70b9f2b0aa150f66ca5dcb2203412896b
+      GOLD_SOURCE_COMMIT: 1d771583264c07f23cf37a7637aea335b7ab5d18
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
