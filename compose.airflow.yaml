@@ -131,8 +131,8 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
-    # Publication runs here: Airflow's own footprint plus the publisher's 2g budget.
-    mem_limit: ${AIRFLOW_SCHEDULER_MEMORY_LIMIT:-3g}
+    # Publication runs here. The first historical read keeps the Silver tables in memory.
+    mem_limit: ${AIRFLOW_SCHEDULER_MEMORY_LIMIT:-8g}
     cpus: ${AIRFLOW_SCHEDULER_CPU_LIMIT:-2.5}
     stop_grace_period: 5m
 

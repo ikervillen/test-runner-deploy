@@ -190,7 +190,7 @@ def main(argv=None):
             if not 1 <= settings["poll_seconds"] <= 3600:
                 raise IntegrityError("Invalid poll interval")
             for name in ("max_rows_per_source", "max_total_rows"):
-                if type(settings[name]) is not int or not 1 <= settings[name] <= 1_000_000:
+                if type(settings[name]) is not int or not 1 <= settings[name] <= 50_000_000:
                     raise IntegrityError("Invalid explicit row budget")
 
             def configured(name):

@@ -155,12 +155,13 @@ class _SourceReader:
         if name not in self._cache:
             if name not in self._names and optional:
                 return []
-            self._cache[name] = self.snapshot.rows(name, max_rows=self.max_rows_per_source)
+            # One Silver table is not a query scope: the total budget is the guard.
+            self._cache[name] = self.snapshot.rows(name, max_rows=self.max_total_rows)
             self.count(len(self._cache[name]))
         return self._cache[name]
 
     def batches(self, name: str):
-        for batch in self.snapshot.batches(name, max_rows=self.max_rows_per_source):
+        for batch in self.snapshot.batches(name, max_rows=self.max_total_rows):
             self.count(batch.num_rows)
             yield batch
 
@@ -440,8 +441,8 @@ def build(
     config: dict,
     cutoff: datetime,
     calculation_time: datetime,
-    max_rows_per_source: int = 250_000,
-    max_total_rows: int = 500_000,
+    max_rows_per_source: int = 5_000_000,
+    max_total_rows: int = 20_000_000,
     previous: Snapshot | None = None,
     statistics: dict | None = None,
     recalculate_closed_ids: set[str] | None = None,
@@ -465,7 +466,7 @@ def build(
         _fact_tables(reader, tables, Attribution(decisions, prods), pending)
         by_zc = _zc_links(decisions, tables)
     with clock.stage("previous"):
-        old_tables = _previous_tables(previous, max_rows_per_source, REUSED_TABLES)
+        old_tables = _previous_tables(previous, max_total_rows, REUSED_TABLES)
         for name in REFERENCE_TABLES:
             tables[name] = list(old_tables.get(name, [])) if previous else tables.get(name, [])
         previous_states = {
@@ -473,7 +474,7 @@ def build(
         }
         previous_scores = {r["id_resultado"]: r for r in old_tables.get("quality_scores", [])}
         previous_coverage = coverage.published_until(
-            _previous_tables(previous, max_rows_per_source, ("publication_scope_status",)).get(
+            _previous_tables(previous, max_total_rows, ("publication_scope_status",)).get(
                 "publication_scope_status", []
             )
         )
@@ -550,7 +551,7 @@ def build(
             plant=snapshot.manifest["plant"],
             machines=reader.rows("SIP_MAQUINA_MOLDEO"),
             recorded_at=calculation_time,
-            previous=_previous_tables(previous, max_rows_per_source, DIMENSION_TABLES),
+            previous=_previous_tables(previous, max_total_rows, DIMENSION_TABLES),
         )
     with clock.stage("validate"):
         # One representation per logical key, even when hours/turns share base samples.
@@ -574,8 +575,8 @@ def _run(
     cutoff: datetime,
     environment: str,
     plant: str,
-    max_rows_per_source=250_000,
-    max_total_rows=500_000,
+    max_rows_per_source=5_000_000,
+    max_total_rows=20_000_000,
     failpoint=None,
     recalculate_closed_ids=None,
     recalculation_reason=None,

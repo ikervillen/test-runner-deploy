@@ -389,6 +389,16 @@ def test_uncovered_inputs_and_resource_budget_never_produce_complete_scores(calc
             calculation_time=CUTOFF,
             max_total_rows=1,
         )
+    # A single Silver table may exceed the old per-source cap; the total is the guard.
+    build(
+        snap,
+        bundle=bundle(),
+        config=config,
+        cutoff=CUTOFF,
+        calculation_time=CUTOFF,
+        max_rows_per_source=1,
+        max_total_rows=500_000,
+    )
 
 
 def covered(snap, until):
@@ -525,7 +535,12 @@ def test_cli_build_inspect_validate_and_offline_watch_guard(calculation, tmp_pat
     assert "budget" in capsys.readouterr().err
     assert main([*args[:-1], CUTOFF.isoformat() + "+01:00"]) == EXIT_DATA
     assert "industrial cutoff" in capsys.readouterr().err
-    for changes in ({"poll_seconds": 0}, {"max_total_rows": 0}, {"schema_id": "unknown"}):
+    for changes in (
+        {"poll_seconds": 0},
+        {"max_total_rows": 0},
+        {"max_total_rows": 50_000_001},
+        {"schema_id": "unknown"},
+    ):
         atomic_json(settings_path, {**settings, **changes})
         assert main(args) == EXIT_DATA
         failure = json.loads(capsys.readouterr().err)
