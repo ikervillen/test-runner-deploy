@@ -19,7 +19,8 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/calidad/.venv \
 
 WORKDIR /opt/calidad
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --extra gold --python /usr/local/bin/python3.11 \
+RUN python3 -c 'import sys; assert sys.version_info[:2] == (3, 11), sys.version' \
+    && uv sync --frozen --no-dev --extra gold --python "$(command -v python3)" \
     && rm /usr/local/bin/uv
 COPY backend/app ./backend/app
 COPY --chmod=755 orchestration/airflow/calidad-gold /usr/local/bin/calidad-gold
