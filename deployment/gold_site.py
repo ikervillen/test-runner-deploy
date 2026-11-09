@@ -25,6 +25,25 @@ gold = root / 'gold'
 paths = ('settings.json', 'catalogs.json', 'customer_score.json',
          'config/settings.json', 'config/catalogs.json', 'config/customer_score.json')
 pointer = gold / 'current.json'
+export_path = root / 'gold-export-status.json'
+export = json.loads(export_path.read_text(encoding='utf-8')) if export_path.is_file() else {}
+families = {}
+for path in sorted((root / 'logs').glob('*.jsonl'))[-2:]:
+    with path.open('rb') as stream:
+        stream.seek(max(0, path.stat().st_size - 512 * 1024))
+        for line in stream:
+            try:
+                entry = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            result = entry.get('result', {})
+            families[entry['family']] = {
+                'time': entry.get('time'),
+                **{key: result[key] for key in (
+                    'status', 'error_type', 'remaining_versions', 'reason',
+                    'attempted', 'input_scan_performed'
+                ) if key in result},
+            }
 print(json.dumps({
     'gold_exists': gold.is_dir(),
     'gold_publication': pointer.is_file(),
@@ -32,6 +51,10 @@ print(json.dumps({
                            if pointer.is_file() else None,
     'gold_config_files': [name for name in paths if (gold / name).is_file()],
     'silver_publication': (root / 'current.json').is_file(),
+    'silver_export': {key: export[key] for key in (
+        'status', 'error_type', 'error', 'last_attempt_at', 'last_success_at', 'publication_id'
+    ) if key in export},
+    'worker_families': families,
 }))
 """
 WRITE_CONFIG = """

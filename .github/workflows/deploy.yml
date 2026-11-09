@@ -23,8 +23,8 @@ permissions:
   contents: read
 
 env:
-  GOLD_CONTEXT_COMMIT: 22ea4874d751e3fe20012be895acb757560d8612
-  GOLD_SOURCE_COMMIT: 29622d5f54302ba44c9bf5cc7641f175b3d59483
+  GOLD_CONTEXT_COMMIT: 34dd9de6f399e1b08fcc028de70626b17d711f08
+  GOLD_SOURCE_COMMIT: aed67ba50aee8fd7251db412610c11a1ce179f73
 
 jobs:
   control-maintenance:
@@ -291,6 +291,9 @@ jobs:
       group: gold-develop-${{ github.repository }}
       cancel-in-progress: false
     timeout-minutes: 55
+    env:
+      GOLD_CONTEXT_COMMIT: 1cea9e3449ef97f925ec643002c00e50639456f0
+      GOLD_SOURCE_COMMIT: 848d4ff4534ee6f9519eca42ead06860ade1ad5a
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
