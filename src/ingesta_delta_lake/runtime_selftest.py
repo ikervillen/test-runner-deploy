@@ -1,5 +1,6 @@
 """Prueba de la imagen final sin pytest, red, CSV reales ni montajes operativos."""
 
+import os
 import tempfile
 from dataclasses import replace
 from pathlib import Path
@@ -15,6 +16,8 @@ def self_test():
     from .catalog_service import search
     from .delta import DeltaStore
     from .runtime import ORDER
+
+    export_enabled = os.environ.get("INGESTA_GOLD_EXPORT", "0") == "1"
 
     def require(condition, message):
         if not condition:
@@ -60,6 +63,17 @@ def self_test():
         )
         for family in ORDER:
             run(replace(base, family=family))
+        if export_enabled:
+            from .gold_export import publish
+
+            first = publish(base, {})
+            require(first["status"] == "EXPORTED", f"Exportación Gold: {first}")
+            repeated = publish(base, {})
+            require(
+                repeated["status"] == "UNCHANGED"
+                and repeated["publication_id"] == first["publication_id"],
+                f"Exportación Gold no idempotente: {repeated}",
+            )
         before = {str(p): p.read_bytes() for p in base.silver_root.rglob("*") if p.is_file()}
         for family in ORDER:
             replay = run(replace(base, family=family))
@@ -123,5 +137,6 @@ def self_test():
             "closures",
             "lost-ack-recovery",
             "conflict",
+            *(["gold-export", "gold-export-replay"] if export_enabled else []),
         ],
     }
