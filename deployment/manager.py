@@ -470,6 +470,37 @@ class Deployment:
             else None
         )
 
+    def _adopt_engine_id(self, active, engine_id):
+        """Keep the release when Docker Desktop regenerates its daemon id.
+
+        The named volume and its instance labels are the identity. A different
+        daemon id with that volume still present is the same machine.
+        """
+        if active.get("engine_id") == engine_id:
+            return active
+        try:
+            labels = self.docker.json("volume", "inspect", active["volume"])[0].get("Labels") or {}
+        except Exception:
+            labels = {}
+        expected = {
+            "es.fenix.ingesta.namespace": active["namespace"],
+            "es.fenix.ingesta.channel": active["channel"],
+            "es.fenix.ingesta.instance": active["instance"],
+        }
+        if any(labels.get(key) != value for key, value in expected.items()):
+            raise RuntimeError("El motor Docker no coincide con el descriptor activo")
+        adopted = dict(active)
+        adopted["engine_id"] = engine_id
+        save(self.active_path, adopted)
+        return adopted
+
+    def adopt_engine_id(self, engine_id):
+        with locked(self.root / "deployment.lock"):
+            active = self.active()
+            if not active:
+                raise RuntimeError("El motor Docker no coincide con el descriptor activo")
+            return self._adopt_engine_id(active, engine_id)
+
     def audit(self, journal, phase):
         journal["phase"] = phase
         journal.setdefault("timeline", []).append({"phase": phase, "time": time.time()})
@@ -596,6 +627,11 @@ class Deployment:
             if gold_revision:
                 record["gold_revision"] = gold_revision
             old = self.active()
+            if old and old.get("engine_id") != info["ID"]:
+                try:
+                    old = self._adopt_engine_id(old, info["ID"])
+                except RuntimeError:
+                    pass
             if old and (
                 old["volume"] != record["volume"]
                 or old["instance"] != record["instance"]

@@ -189,6 +189,36 @@ def test_association_storage_downgrade_is_rejected_before_writer_handoff(site, m
     assert not any(event[0] == "drain" for event in motor.events)
 
 
+def test_rotated_daemon_id_is_adopted_when_the_same_volume_remains(site, motor):
+    dep = deployer(site, motor)
+    release = dep.deploy(IMAGE1, SHA1, "run")["release"]
+    release["engine_id"] = "previous-daemon"
+    save(dep.active_path, release)
+    assert dep.adopt_engine_id("engine-1")["engine_id"] == "engine-1"
+    assert dep.active()["engine_id"] == "engine-1"
+
+
+def test_rotated_daemon_id_without_the_instance_volume_is_rejected(site, motor):
+    dep = deployer(site, motor)
+    release = dep.deploy(IMAGE1, SHA1, "run")["release"]
+    release["engine_id"] = "previous-daemon"
+    save(dep.active_path, release)
+    motor.volumes.clear()
+    with pytest.raises(RuntimeError, match="no coincide"):
+        dep.adopt_engine_id("engine-1")
+
+
+def test_code_update_adopts_a_rotated_daemon_id(site, motor):
+    dep = deployer(site, motor)
+    dep.deploy(IMAGE1, SHA1, "run1")
+    active = dep.active()
+    active["engine_id"] = "previous-daemon"
+    save(dep.active_path, active)
+    motor.latest = SHA2
+    assert dep.deploy(IMAGE2, SHA2, "run2")["status"] == "DEPLOYED"
+    assert dep.active()["engine_id"] == "engine-1"
+
+
 def test_same_digest_configuration_replay_does_not_restart(site, motor):
     dep = deployer(site, motor)
     dep.deploy(IMAGE1, SHA1, "run1")

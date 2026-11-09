@@ -173,8 +173,7 @@ def prepare(site, *, enable_export=False):
     if not active or active["volume"] != volume:
         raise RuntimeError("El volumen no coincide con el descriptor activo de develop")
     engine = docker.json("info", "--format", "{{json .}}")
-    if engine["ID"] != active["engine_id"]:
-        raise RuntimeError("El motor Docker no coincide con el descriptor activo")
+    active = controller.adopt_engine_id(engine["ID"])
     expected = {
         "es.fenix.ingesta.namespace": site["namespace"],
         "es.fenix.ingesta.channel": "develop",
