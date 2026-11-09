@@ -8,6 +8,7 @@ x-gold: &gold
 
 services:
   backend:
+    image: calidad-serie-develop-backend:${AIRFLOW_IMAGE_TAG:?Set Gold source revision}
     volumes:
       - <<: *gold
         read_only: true
@@ -28,6 +29,8 @@ services:
         source: gold-config
         target: /config
         read_only: true
+  frontend:
+    image: calidad-serie-develop-frontend:${AIRFLOW_IMAGE_TAG:?Set Gold source revision}
 
 volumes:
   gold-config:
