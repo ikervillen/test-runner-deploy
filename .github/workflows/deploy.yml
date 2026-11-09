@@ -305,6 +305,7 @@ jobs:
           AIRFLOW_FERNET_KEY: ${{ secrets.GOLD_AIRFLOW_FERNET_KEY }}
           AIRFLOW_JWT_SECRET: ${{ secrets.GOLD_AIRFLOW_JWT_SECRET }}
           AIRFLOW_ADMIN_PASSWORD: ${{ secrets.GOLD_AIRFLOW_ADMIN_PASSWORD }}
+          GOLD_CATALOGS_GZIP_B64: ${{ secrets.GOLD_CATALOGS_GZIP_B64 }}
           GOLD_CONTEXT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DOCKER_BUILDKIT: '1'
         run: |

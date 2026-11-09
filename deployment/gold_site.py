@@ -1,7 +1,11 @@
 """Prepare the Airflow volumes and inspect the existing Gold develop store."""
 
 import argparse
+import base64
+import gzip
 import json
+import os
+import subprocess
 from pathlib import Path
 
 from deployment.manager import Deployment, Docker, load_site
@@ -27,6 +31,43 @@ print(json.dumps({
     'silver_publication': (root / 'current.json').is_file(),
 }))
 """
+WRITE_CONFIG = """
+import json
+import os
+import sys
+from pathlib import Path
+
+values = json.load(sys.stdin)
+for name, value in values.items():
+    path = Path('/config') / name
+    if path.exists() and json.loads(path.read_text(encoding='utf-8')) != value:
+        raise SystemExit(f'Configuration already exists with different content: {name}')
+for name, value in values.items():
+    path = Path('/config') / name
+    if not path.exists():
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(value, ensure_ascii=False), encoding='utf-8')
+        temporary.chmod(0o644)
+        temporary.replace(path)
+gold = Path('/gold')
+if not (gold / 'current.json').exists():
+    os.chown(gold, 10001, 0)
+    gold.chmod(0o750)
+"""
+
+
+def compose_volume(docker, role, present):
+    name = f"{PROJECT}_{role}"
+    labels = {"com.docker.compose.project": PROJECT, "com.docker.compose.volume": role}
+    if name not in present:
+        args = [
+            argument for key, value in labels.items() for argument in ("--label", f"{key}={value}")
+        ]
+        docker.call("volume", "create", *args, name)
+    metadata = docker.json("volume", "inspect", name)[0].get("Labels") or {}
+    if any(metadata.get(key) != value for key, value in labels.items()):
+        raise RuntimeError(f"El volumen {name} pertenece a otra pila")
+    return name
 
 
 def prepare(site):
@@ -62,32 +103,76 @@ def prepare(site):
         PROBE,
     )
     present = set(docker.call("volume", "ls", "--format", "{{.Name}}").splitlines())
-    airflow = {}
-    for role in AIRFLOW_VOLUMES:
-        name = f"{PROJECT}_{role}"
-        labels = {"com.docker.compose.project": PROJECT, "com.docker.compose.volume": role}
-        if name not in present:
-            docker.call(
-                "volume",
-                "create",
-                "--label",
-                f"com.docker.compose.project={PROJECT}",
-                "--label",
-                f"com.docker.compose.volume={role}",
-                name,
-            )
-        metadata = docker.json("volume", "inspect", name)[0].get("Labels") or {}
-        if any(metadata.get(key) != value for key, value in labels.items()):
-            raise RuntimeError(f"El volumen {name} pertenece a otra pila")
-        airflow[role] = name
+    airflow = {role: compose_volume(docker, role, present) for role in AIRFLOW_VOLUMES}
     return {"volume": volume, "airflow_volumes": airflow, **json.loads(probe)}
+
+
+def configure(site, report, source):
+    if not report["gold_exists"]:
+        raise RuntimeError("No existe el subdirectorio Gold esperado")
+    docker = Docker(site["docker_context"])
+    catalog = json.loads(gzip.decompress(base64.b64decode(os.environ["GOLD_CATALOGS_GZIP_B64"])))
+    if not catalog.get("model_segments") or any(
+        row.get("estado_dar") == "CONFIRMED" for row in catalog["model_segments"]
+    ):
+        raise ValueError("Se esperaba el catálogo provisional de develop")
+    settings = json.loads(
+        (source / "gold/settings.container.example.json").read_text(encoding="utf-8")
+    )
+    settings["plant"] = site["settings"]["plant"]
+    config = {
+        "settings.json": settings,
+        "customer_score.json": json.loads(
+            (source / "config/customer_score.json").read_text(encoding="utf-8")
+        ),
+        "catalogs.json": catalog,
+    }
+    present = set(docker.call("volume", "ls", "--format", "{{.Name}}").splitlines())
+    target = compose_volume(docker, "gold-config", present)
+    subprocess.run(
+        [
+            "docker",
+            "--context",
+            docker.context,
+            "run",
+            "--rm",
+            "-i",
+            "--network",
+            "none",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "CHOWN",
+            "--cap-add",
+            "FOWNER",
+            "--mount",
+            f"type=volume,source={target},target=/config",
+            "--mount",
+            f"type=volume,source={report['volume']},target=/gold,volume-subpath=gold",
+            UTILITY_IMAGE,
+            "python",
+            "-c",
+            WRITE_CONFIG,
+        ],
+        input=json.dumps(config, ensure_ascii=True),
+        text=True,
+        timeout=90,
+        check=True,
+    )
+    return {"gold_config_volume": target, "provisional_models": len(catalog["model_segments"])}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--site", type=Path, required=True)
+    parser.add_argument("--configure-from", type=Path)
     args = parser.parse_args()
-    print(json.dumps(prepare(load_site(args.site)), sort_keys=True))
+    site = load_site(args.site)
+    report = prepare(site)
+    if args.configure_from:
+        report.update(configure(site, report, args.configure_from))
+    print(json.dumps(report, sort_keys=True))
 
 
 if __name__ == "__main__":

@@ -25,12 +25,24 @@ $env:HOST_GOLD_BACKUP_ROOT = '/unused-gold-backup-bind'
 $env:APP_ENV_FILE = Join-Path $root 'backend.develop.env'
 [IO.File]::WriteAllText($env:APP_ENV_FILE, "APP_AUTH_MODE=disabled`n")
 
-$pluginDirectory = Join-Path $env:ProgramFiles 'Docker/Docker/resources/cli-plugins'
-$composeExe = Join-Path $pluginDirectory 'docker-compose.exe'
-$buildxExe = Join-Path $pluginDirectory 'docker-buildx.exe'
-if (-not (Test-Path -LiteralPath $composeExe) -or -not (Test-Path -LiteralPath $buildxExe)) {
-    throw 'Faltan los ejecutables Compose o Buildx de Docker Desktop.'
+function Get-PinnedDockerTool($name, $uri, $sha256) {
+    $toolDirectory = Join-Path $env:RUNNER_TEMP 'fenix-gold-tools'
+    New-Item -ItemType Directory -Path $toolDirectory -Force | Out-Null
+    $tool = Join-Path $toolDirectory $name
+    if (-not (Test-Path -LiteralPath $tool) -or (Get-FileHash -LiteralPath $tool).Hash -ne $sha256) {
+        Invoke-WebRequest -UseBasicParsing -Uri $uri -OutFile $tool
+    }
+    if ((Get-FileHash -LiteralPath $tool).Hash -ne $sha256) {
+        throw "Huella incorrecta de $name."
+    }
+    return $tool
 }
+$composeExe = Get-PinnedDockerTool 'docker-compose-v5.6.1.exe' `
+    'https://github.com/docker/compose/releases/download/v5.6.1/docker-compose-windows-x86_64.exe' `
+    '91b1492f0a923427651e2b955739d732ac36b8191193bf4799e62f3e3525c4cd'
+$buildxExe = Get-PinnedDockerTool 'docker-buildx-v0.38.1.exe' `
+    'https://github.com/docker/buildx/releases/download/v0.38.1/buildx-v0.38.1.windows-amd64.exe' `
+    'fd2e18501910dd535ea3aa7f69010b3cfdfba0f47aa27674124554386dfa26f3'
 $stack = @('-p', 'calidad-serie-develop',
     '-f', (Join-Path $root 'compose.gold.yaml'),
     '-f', (Join-Path $root 'compose.airflow.yaml'),
@@ -56,3 +68,5 @@ foreach ($image in $images.Keys) {
 if ($LASTEXITCODE -ne 0) { throw 'Airflow no alcanzó su estado de arranque.' }
 & $composeExe @stack ps -a
 if ($LASTEXITCODE -ne 0) { throw 'No se pudo inspeccionar la pila.' }
+python -m deployment.gold_site --site $Site --configure-from $root
+if ($LASTEXITCODE -ne 0) { throw 'Airflow arrancó, pero falta inicializar la configuración Gold.' }
