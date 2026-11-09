@@ -73,6 +73,18 @@ def test_uncertain_helper_termination_is_an_explicit_recovery_boundary(monkeypat
         docker.helper(helper_record(), ["compact-control"], readonly=False, timeout=1)
 
 
+def test_optional_call_timeout_does_not_abort_the_caller(monkeypatch):
+    docker = Docker("desktop-linux")
+
+    def run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], kwargs.get("timeout", 15))
+
+    monkeypatch.setattr("deployment.manager.subprocess.run", run)
+    assert docker.call("exec", "worker", "health", optional=True, timeout=15) is None
+    with pytest.raises(subprocess.TimeoutExpired):
+        docker.call("exec", "worker", "health", timeout=15)
+
+
 def test_non_maintenance_timeout_does_not_signal_any_container(monkeypatch):
     docker = Docker("test")
     commands = []

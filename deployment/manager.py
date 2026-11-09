@@ -142,14 +142,20 @@ class Docker:
         self.context = context
 
     def call(self, *args, optional=False, timeout=900):
-        result = subprocess.run(
-            ["docker", "--context", self.context, *map(str, args)],
-            text=True,
-            encoding="utf-8",
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                ["docker", "--context", self.context, *map(str, args)],
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            # An optional probe (worker health) must not abort the Gold check.
+            if optional:
+                return None
+            raise
         if result.returncode and not optional:
             raise RuntimeError("Docker " + args[0] + ": " + result.stderr[-4000:])
         return None if result.returncode else result.stdout.strip()
