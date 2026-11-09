@@ -14,6 +14,10 @@ on:
         type: string
         required: false
         description: Successful Windows/Linux test run for the same application source
+      gold_images:
+        type: string
+        required: false
+        description: Comma-separated image IDs from a completed Gold build (Airflow, backend, frontend)
       remove_backup:
         type: boolean
         default: false
@@ -318,6 +322,7 @@ jobs:
           GOLD_CATALOGS_GZIP_B64: ${{ secrets.GOLD_CATALOGS_GZIP_B64 }}
           GOLD_CONTEXT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GOLD_OPERATION: ${{ inputs.operation }}
+          GOLD_EXISTING_IMAGES: ${{ inputs.gold_images }}
           DOCKER_BUILDKIT: '1'
         run: |
           $site = ./scripts/prepare_site.ps1 -Repository $env:GITHUB_REPOSITORY `

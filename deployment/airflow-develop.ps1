@@ -46,9 +46,6 @@ function Get-PinnedDockerTool($name, $uri, $sha256) {
 $composeExe = Get-PinnedDockerTool 'docker-compose-v5.6.1.exe' `
     'https://github.com/docker/compose/releases/download/v5.6.1/docker-compose-windows-x86_64.exe' `
     '91b1492f0a923427651e2b955739d732ac36b8191193bf4799e62f3e3525c4cd'
-$buildxExe = Get-PinnedDockerTool 'docker-buildx-v0.38.1.exe' `
-    'https://github.com/docker/buildx/releases/download/v0.38.1/buildx-v0.38.1.windows-amd64.exe' `
-    'fd2e18501910dd535ea3aa7f69010b3cfdfba0f47aa27674124554386dfa26f3'
 $stack = @('-p', 'calidad-serie-develop',
     '-f', (Join-Path $root 'compose.gold.yaml'),
     '-f', (Join-Path $root 'compose.airflow.yaml'),
@@ -63,14 +60,34 @@ $images = [ordered]@{
     "calidad-serie-develop-backend:${tag}" = 'backend/Dockerfile'
     "calidad-serie-develop-frontend:${tag}" = 'Dockerfile.frontend'
 }
-foreach ($image in $images.Keys) {
-    & $buildxExe build --load --platform linux/amd64 --provenance=false `
-        --file (Join-Path $root $images[$image]) --tag $image $root
-    if ($LASTEXITCODE -ne 0) { throw "No se pudo construir $image." }
+if ($env:GOLD_EXISTING_IMAGES) {
+    $expectedImages = $env:GOLD_EXISTING_IMAGES.Split(',')
+    $invalidImages = $expectedImages | Where-Object { $_ -cnotmatch '^sha256:[a-f0-9]{64}$' }
+    if ($expectedImages.Count -ne $images.Count -or $invalidImages) {
+        throw 'Se requieren las tres huellas de imagen del build Gold.'
+    }
+    $index = 0
+    foreach ($image in $images.Keys) {
+        $identity = & docker --context $context image inspect --format '{{.Id}}' $image
+        if ($LASTEXITCODE -ne 0 -or $identity -ne $expectedImages[$index]) {
+            throw "La imagen existente $image no coincide con el build verificado."
+        }
+        Write-Output "Imagen verificada $image $identity"
+        $index++
+    }
+} else {
+    $buildxExe = Get-PinnedDockerTool 'docker-buildx-v0.38.1.exe' `
+        'https://github.com/docker/buildx/releases/download/v0.38.1/buildx-v0.38.1.windows-amd64.exe' `
+        'fd2e18501910dd535ea3aa7f69010b3cfdfba0f47aa27674124554386dfa26f3'
+    foreach ($image in $images.Keys) {
+        & $buildxExe build --load --platform linux/amd64 --provenance=false `
+            --file (Join-Path $root $images[$image]) --tag $image $root
+        if ($LASTEXITCODE -ne 0) { throw "No se pudo construir $image." }
+    }
 }
 
 # The database and UI can be validated before any Gold calculation is enabled.
-& $composeExe @stack up -d --no-build --wait --wait-timeout 180 airflow-apiserver airflow-dag-processor
+& $composeExe @stack up -d --no-build --wait --wait-timeout 300 airflow-apiserver airflow-dag-processor
 if ($LASTEXITCODE -ne 0) { throw 'Airflow no alcanzó su estado de arranque.' }
 & $composeExe @stack ps -a
 if ($LASTEXITCODE -ne 0) { throw 'No se pudo inspeccionar la pila.' }
@@ -113,7 +130,7 @@ foreach ($id in $publishers) {
     if ($state -ne 'false') { throw 'Watch sigue activo. Airflow no tomará el volumen.' }
 }
 
-& $composeExe @stack up -d --no-build --wait --wait-timeout 180 airflow-scheduler
+& $composeExe @stack up -d --no-build --wait --wait-timeout 300 airflow-scheduler
 if ($LASTEXITCODE -ne 0) { throw 'El scheduler no alcanzó un estado sano.' }
 
 $publishBy = (Get-Date).AddMinutes(15)
