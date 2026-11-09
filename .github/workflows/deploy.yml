@@ -307,8 +307,8 @@ jobs:
       cancel-in-progress: false
     timeout-minutes: 1080
     env:
-      GOLD_CONTEXT_COMMIT: f90d37ebf932cfb701326d2dc9d61eb13e8e94ea
-      GOLD_SOURCE_COMMIT: b8bab076c1652116a684dbfa340f87b7cec6b2db
+      GOLD_CONTEXT_COMMIT: 5d44f21581c5da776f0c45abe2857deeaf194bf0
+      GOLD_SOURCE_COMMIT: f72d556ad4621571562f4f9ae46e45826b64ef97
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
