@@ -41,12 +41,22 @@ class DockerInventory:
     def __init__(self, containers, images):
         self.containers = {c["Id"]: c for c in containers}
         self.images = {i["Id"]: i for i in images}
+        self.removals = []
 
     def call(self, *args):
         if args == ("ps", "-aq", "--no-trunc"):
             return "\n".join(self.containers)
         if args[:2] == ("image", "ls"):
             return "\n".join(self.images)
+        if args[:2] == ("container", "rm"):
+            self.removals.append(args)
+            del self.containers[args[-1]]
+            return args[-1]
+        if args[:3] == ("image", "rm", "--no-prune"):
+            self.removals.append(args)
+            assert all(c["Image"] != args[-1] for c in self.containers.values())
+            del self.images[args[-1]]
+            return args[-1]
         raise AssertionError(args)
 
     def json(self, kind, *args):
@@ -111,3 +121,29 @@ def test_inventory_reports_exact_retired_resources_and_keeps_shared_images(tmp_p
 def test_inventory_defers_during_unreconciled_handoff(tmp_path):
     controller = _controller(tmp_path, None, "SWITCHED", {"container": "candidate"})
     assert inventory(controller)["status"] == "DEFERRED"
+    assert inventory(controller, remove_retired=True)["status"] == "DEFERRED"
+
+
+def test_cleanup_removes_only_retired_resources_and_preserves_rollback(tmp_path):
+    active, previous, retired = [_image(n) for n in range(3)]
+    docker = DockerInventory(
+        [
+            _container("active", active, status="running"),
+            _container("previous", previous),
+            _container("retired", retired),
+        ],
+        [active, previous, retired],
+    )
+    controller = _controller(
+        tmp_path, docker, "COMPLETE", _record("active", active), _record("previous", previous)
+    )
+    result = inventory(controller, remove_retired=True)
+
+    assert result["status"] == "CLEANED"
+    assert docker.removals == [
+        ("container", "rm", "retired-id"),
+        ("image", "rm", "--no-prune", retired["Id"]),
+    ]
+    assert set(docker.containers) == {"active-id", "previous-id"}
+    assert set(docker.images) == {active["Id"], previous["Id"]}
+    assert inventory(controller, remove_retired=True)["removed"] == []

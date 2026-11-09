@@ -132,6 +132,9 @@ Desde Actions → workflow → Run workflow:
 - `diagnose`: consulta contexto/motor y comprueba directorios de entrada con montaje de solo
   lectura. No lee filas ni ejecuta ingesta, no monta volúmenes de datos.
 - `docker-inventory`: inventario de recursos retirables de `develop` en el runner de planta.
+- `docker-cleanup`: recalcula el inventario bajo el bloqueo de despliegue de `develop`,
+  retira únicamente sus candidatos y registra los IDs retirados y cualquier conflicto.
+  Conserva la release activa, el rollback y los volúmenes.
 - `rollback`: elegir `main` o `develop` y reactivar la release anterior compatible con la
   misma frontera segura. Conserva todos los commits de datos. No es una restauración de BD.
 

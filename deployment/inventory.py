@@ -1,4 +1,4 @@
-"""Report which Docker resources a completed deployment no longer needs."""
+"""Report and explicitly retire Docker resources from completed deployments."""
 
 import argparse
 import json
@@ -18,8 +18,10 @@ def _inspect(docker, kind, ids):
         yield from docker.json(kind, "inspect", *group)
 
 
-def inventory(controller):
-    """Take a read-only inventory under the same lock used by deploy and rollback."""
+def inventory(controller, *, remove_retired=False):
+    """Use the deploy lock for the inventory and for any explicitly requested removal."""
+    if remove_retired and controller.channel != "develop":
+        raise ValueError("La retirada solo está habilitada en develop.")
     with locked(controller.root / "deployment.lock"):
         active = controller.active()
         journal = json.loads(controller.journal_path.read_text(encoding="utf-8"))
@@ -28,7 +30,42 @@ def inventory(controller):
         docker = controller.docker
         if docker.json("info", "--format", "{{json .}}")["ID"] != active["engine_id"]:
             raise RuntimeError("El inventario se está ejecutando en otro motor Docker.")
-        return _inventory(controller, active, journal.get("previous"))
+        previous = journal.get("previous")
+        report = _inventory(controller, active, previous)
+        if remove_retired:
+            _remove_retired(controller, report, active, previous)
+        return report
+
+
+def _remove_retired(controller, report, active, previous):
+    docker = controller.docker
+    removed, errors = [], []
+
+    def remove(kind, resource):
+        flags = ["--no-prune"] if kind == "image" else []
+        try:
+            docker.call(kind, "rm", *flags, resource["id"])
+        except (RuntimeError, SubprocessError) as exc:
+            errors.append({"kind": kind, **resource, "error": str(exc)})
+        else:
+            removed.append({"kind": kind, **resource})
+
+    for container in report["retire_containers"]:
+        remove("container", container)
+
+    # Recheck references after container removal. Docker also refuses removal
+    # without --force if another container acquired a reference in the meantime.
+    current = _inventory(controller, active, previous)
+    candidates = {image["id"] for image in report["retire_images"]}
+    for image in current["retire_images"]:
+        if image["id"] in candidates and not image["after_removing_containers"]:
+            remove("image", image)
+
+    report.update(
+        status="CLEANUP_PARTIAL" if errors else "CLEANED",
+        removed=removed,
+        errors=errors,
+    )
 
 
 def _inventory(controller, active, previous):
@@ -109,10 +146,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--site", type=Path, required=True)
     parser.add_argument("--branch", choices=["main", "develop"], required=True)
+    parser.add_argument("--remove-retired", action="store_true")
     args = parser.parse_args()
     try:
         site = load_site(args.site)
-        result = inventory(Deployment(site, args.branch, Docker(site["docker_context"])))
+        result = inventory(
+            Deployment(site, args.branch, Docker(site["docker_context"])),
+            remove_retired=args.remove_retired,
+        )
     except (OSError, ValueError, RuntimeError, KeyError, SubprocessError) as exc:
         result = {"status": "INVENTORY_FAILED", "error": str(exc)}
     output = json.dumps(result, ensure_ascii=True, indent=2)
@@ -120,7 +161,10 @@ def main():
     if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
         with Path(summary).open("a", encoding="utf-8") as stream:
             stream.write(f"## Inventario Docker de {args.branch}\n\n```json\n{output}\n```\n")
-    return 1 if result["status"] == "INVENTORY_FAILED" else 0
+    return int(
+        result["status"] in {"INVENTORY_FAILED", "CLEANUP_PARTIAL"}
+        or (args.remove_retired and result["status"] != "CLEANED")
+    )
 
 
 if __name__ == "__main__":
