@@ -265,6 +265,7 @@ def worker(interval=600):
     status = {"token": token, "phase": "READY", "time": now()}
     guard = threading.Lock()
     heartbeat_stop = threading.Event()
+    source_discoveries = {}
 
     def heartbeat():
         while not heartbeat_stop.is_set():
@@ -287,12 +288,16 @@ def worker(interval=600):
                 backlog = False
                 failed = False
                 next_scans = []
+                association_confirmed = False
 
                 def record(family, result, seconds, *, scan_deadlines=next_scans):
-                    nonlocal backlog, failed, next_derived
+                    nonlocal backlog, failed, next_derived, association_confirmed
                     backlog = backlog or bool(result.get("remaining_versions", 0))
                     failed = failed or result["status"] == "FAILED"
+                    if result.get("input_scan_performed") and result["status"] != "FAILED":
+                        source_discoveries[family] = now()
                     if family == "ASIGNACION_PRODUCCION_RAMAL" and result.get("attempted", True):
+                        association_confirmed = result["status"] != "FAILED"
                         next_derived = time.monotonic() + (
                             30 if result["status"] == "FAILED" else interval
                         )
@@ -366,6 +371,15 @@ def worker(interval=600):
                             result = {"status": "FAILED", "error": str(exc)}
                         record(family, result, round(time.monotonic() - started, 3))
                         service_reviews(base, stop, record)
+                if not stop.is_set() and not failed and not backlog and association_confirmed:
+                    from .gold_export import publish
+
+                    exported = publish(base, source_discoveries)
+                    if exported["status"] != "DISABLED":
+                        print(
+                            canonical({"family": "GOLD_EXPORT", "time": now(), "result": exported}),
+                            flush=True,
+                        )
                 with guard:
                     status.update(phase="IDLE", family=None)
                 # Rotate immediately while a durable backlog exists. When caught

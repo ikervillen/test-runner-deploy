@@ -1,0 +1,54 @@
+"""Optional producer-owned export after a confirmed worker cycle; disabled by default."""
+
+import json
+import os
+
+from .common import IntegrityError, now
+from .runtime import atomic_json
+
+
+def publish(config, discoveries, *, exporter=None):
+    if os.environ.get("INGESTA_GOLD_EXPORT", "0") != "1":
+        return {"status": "DISABLED"}
+    try:
+        return _publish(config, discoveries, exporter)
+    except Exception as exc:
+        # Even unavailable state storage must not end the ingestion worker.
+        return _failure(exc)
+
+
+def _failure(exc):
+    return {"status": "FAILED", "error_type": type(exc).__name__, "error": str(exc)}
+
+
+def _publish(config, discoveries, exporter):
+    root = config.silver_root.parent.resolve()
+    if any(not p.resolve().is_relative_to(root) for p in (config.bronze_root, config.control_root)):
+        raise IntegrityError("Gold export requires one qualified producer-owned storage root")
+    path = root / "gold-export-status.json"
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        previous = {}
+    except (json.JSONDecodeError, UnicodeError):
+        previous = {}
+    if not isinstance(previous, dict) or not isinstance(previous.get("discoveries", {}), dict):
+        previous = {}
+    discoveries = {**previous.get("discoveries", {}), **discoveries}
+    status = {"last_attempt_at": now(), "discoveries": discoveries}
+    if "last_success_at" in previous:
+        status["last_success_at"] = previous["last_success_at"]
+    try:
+        if exporter is None:
+            from app.gold.producer import export_confirmed
+
+            exporter = export_confirmed
+        result = exporter(
+            config, root, max_ledger_rows=None, source_mode="continuous", discoveries=discoveries
+        )
+        status.update(result, last_success_at=now())
+    except Exception as exc:
+        # Export failure must not undo accepted ingestion commits or their receipts.
+        status.update(_failure(exc))
+    atomic_json(path, status)
+    return status

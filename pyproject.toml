@@ -17,6 +17,9 @@ dependencies = [
 [project.scripts]
 ingesta-delta = "ingesta_delta_lake.cli:main"
 
+[project.optional-dependencies]
+gold-export = ["ijson>=3.3,<4"]
+
 [dependency-groups]
 dev = ["pytest>=8.4,<10", "pytest-cov>=6,<8", "ruff>=0.11,<1"]
 
