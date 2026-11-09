@@ -109,8 +109,9 @@ services:
       RAYON_NUM_THREADS: "2"
       TOKIO_WORKER_THREADS: "2"
       OMP_NUM_THREADS: "1"
-      # Two productions at a time. Each worker loads only its own spilled rows.
-      GOLD_SCORE_WORKERS: "2"
+      # One scoring process. A second interpreter copies the calculation and
+      # does not fit beside ingestion on this machine.
+      GOLD_SCORE_WORKERS: "1"
     volumes:
       - airflow-logs:/opt/airflow/logs
       - type: bind
@@ -133,8 +134,10 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
-    # Publication runs here. Facts are spilled per production; two workers score at once.
-    mem_limit: ${AIRFLOW_SCHEDULER_MEMORY_LIMIT:-8g}
+    # Publication runs here. Families stay on disk and are written 1000 rows
+    # at a time. 10g is the scheduler cap inside a 12GB Docker VM: the other
+    # containers keep the rest of the machine's 16GB.
+    mem_limit: ${AIRFLOW_SCHEDULER_MEMORY_LIMIT:-10g}
     cpus: ${AIRFLOW_SCHEDULER_CPU_LIMIT:-2.5}
     stop_grace_period: 5m
 

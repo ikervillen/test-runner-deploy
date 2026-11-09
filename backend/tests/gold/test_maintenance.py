@@ -91,7 +91,7 @@ def test_history_tables_are_partitioned_by_production_and_pruned_on_read(gold_ap
     snapshot = Snapshot.open(root, require_gold_contract=True)
     for name in PARTITIONED_TABLES:
         assert snapshot.table(name).metadata().partition_columns == [PARTITION_COLUMN]
-    assert snapshot.table("quality_scores").metadata().partition_columns == []
+    assert snapshot.table("quality_scores").metadata().partition_columns == [PARTITION_COLUMN]
     query = Query(root)
     productions = [p["id_produccion"] for p in query.rows("productions")]
     everything = set(snapshot.table("mia_inspections").to_pyarrow_dataset().files)

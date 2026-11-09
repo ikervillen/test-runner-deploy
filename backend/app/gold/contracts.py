@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, replace
 
 from .common import IntegrityError, digest
-from .schemas import DIMENSIONAL_FACTS, KEYS, SCHEMAS, make_table
+from .schemas import DIMENSIONAL_FACTS, KEYS, SCHEMAS, check_row, make_table
 
 CONTRACT_VERSION = "quality-gold-dimensional-v3"
 
@@ -311,8 +312,108 @@ def contract_id():
     return digest(describe())
 
 
+def _iter_table(tables, name):
+    spilled = getattr(tables, "spilled", None)
+    if spilled and name in spilled:
+        return tables.store.iter_rows(name)
+    return tables[name]
+
+
+def _validate_spilled(tables, *, complete=False):
+    """Same rules as `validate`, scanning one spilled family at a time."""
+    if complete and set(tables) != set(CONTRACTS):
+        raise IntegrityError(f"Incomplete Gold contract: {sorted(set(CONTRACTS) ^ set(tables))}")
+    names = ordered(tables)
+    for name in names:
+        if name not in getattr(tables, "spilled", ()):
+            make_table(name, tables[name])
+    productions = {r["id_produccion"] for r in tables.get("productions", [])}
+    references = (
+        {r["reference_id"] for r in _iter_table(tables, "mia_reference_sets")}
+        if ("mia_reference_sets" in tables)
+        else set()
+    )
+    scores = {}
+    score_grains = set()
+    components = defaultdict(list)
+    for name in names:
+        for raw in _iter_table(tables, name):
+            row = check_row(name, raw) if name in tables.spilled else raw
+            if {"inicio", "corte", "fin"}.issubset(row) and not (
+                row["inicio"] < row["corte"] <= row["fin"]
+            ):
+                raise IntegrityError(f"{name}: invalid window or cutoff")
+            if name == "quality_scores":
+                grain = tuple(
+                    row[k]
+                    for k in ("id_produccion", "tipo_ventana", "inicio", "fin", "seleccion_id")
+                )
+                if grain in score_grains:
+                    raise IntegrityError("quality_scores: multiple results for the same window")
+                score_grains.add(grain)
+                scores[row["id_resultado"]] = (
+                    row["total_penalty"],
+                    row["evaluated_weight"],
+                    row["normalized_score"],
+                )
+            if (
+                "id_produccion" in row
+                and row["id_produccion"] is not None
+                and "productions" in tables
+                and row["id_produccion"] not in productions
+            ):
+                raise IntegrityError(f"{name}: unknown production")
+            if (
+                name in {"mia_reference_members", "mia_reference_values"}
+                and "mia_reference_sets" in tables
+                and row["reference_id"] not in references
+            ):
+                raise IntegrityError(f"{name}: unknown reference population")
+            if (name.endswith("_details") or name == "quality_score_components") and (
+                "quality_scores" in tables and row["id_resultado"] not in scores
+            ):
+                raise IntegrityError(f"{name}: detail without official complete score")
+            if name == "quality_score_components":
+                components[row["id_resultado"]].append(
+                    (row["componente"], row["contribucion"], row["peso"])
+                )
+    for identity, (total, weight, normalized) in scores.items():
+        parts = components[identity]
+        if {item[0] for item in parts} != {
+            "MIA",
+            "Critico",
+            "Grave",
+            "Mayor",
+            "Menor",
+            "Leve",
+            "DAR",
+            "ZC",
+        }:
+            raise IntegrityError("Official score requires every component")
+        got_total = round(sum(item[1] for item in parts), 4)
+        got_weight = round(sum(item[2] for item in parts), 4)
+        if got_total != total or got_weight != weight:
+            raise IntegrityError("Score components and total/weight do not reconcile")
+        if weight <= 0 or round(got_total / weight, 4) != normalized:
+            raise IntegrityError("Normalized score does not reconcile")
+    for child, columns, parent, target in FOREIGN_KEYS:
+        if child not in tables or parent not in tables:
+            continue
+        identities = {tuple(r[k] for k in target) for r in _iter_table(tables, parent)}
+        for row in _iter_table(tables, child):
+            key = tuple(row.get(k) for k in columns)
+            if None not in key and key not in identities:
+                raise IntegrityError(f"{child}: missing {parent} reference {columns}")
+    from .dimensional import validate_links
+
+    validate_links(tables)
+
+
 def validate(tables, *, complete=False):
     """Reject invalid business references before writing any Delta table."""
+    if getattr(tables, "spilled", None):
+        _validate_spilled(tables, complete=complete)
+        return
     if complete and set(tables) != set(CONTRACTS):
         raise IntegrityError(f"Incomplete Gold contract: {sorted(set(CONTRACTS) ^ set(tables))}")
     ordered(tables)

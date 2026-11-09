@@ -191,59 +191,87 @@ def materialize(tables, *, plant, machines, recorded_at, previous=None):
     physical = [r for r in tables["dim_machine"] if r["is_current"]]
     productions = {p["id_produccion"]: p for p in tables["productions"]}
     dates = {r["date_key"]: r for r in previous.get("dim_date", [])}
+    context = DimensionLookup(plant_key, productions, physical, by_model, by_defect, dates)
+    spilled = getattr(tables, "spilled", None)
     for name in DIMENSIONAL_FACTS:
+        if spilled and name in spilled:
+            continue
         for row in tables.get(name, []):
-            p = productions.get(row.get("id_produccion"), {})
-            instant = next(
-                (
-                    row[k]
-                    for k in ("periodo_inicio", "fecha_on", "inicio", "fecha_inicio_zc")
-                    if row.get(k) is not None
-                ),
-                None,
-            )
-            day = (
-                instant.date()
-                if isinstance(instant, datetime)
-                else instant
-                if isinstance(instant, date)
-                else None
-            )
-            date_key = int(day.strftime("%Y%m%d")) if day else None
-            if day:
-                dates[date_key] = dict(
-                    date_key=date_key,
-                    fecha=day,
-                    year=day.year,
-                    month=day.month,
-                    day=day.day,
-                    weekday=day.isoweekday(),
-                )
-            matched = [
-                m
-                for m in physical
-                if m["id_maquina_fenix"] == p.get("id_maquina_fenix")
-                and instant is not None
-                and m["valid_from"] <= instant
-                and (m["valid_to"] is None or instant < m["valid_to"])
-            ]
-            if len(matched) > 1:
-                raise IntegrityError("Ambiguous temporal machine dimension")
-            # Existing closed result remains attached to its original catalog version.
-            if name == "quality_scores" and row.get("plant_key"):
-                continue
-            row.update(
-                plant_key=plant_key,
-                date_key=date_key,
-                machine_key=matched[0]["dimension_key"] if matched else None,
-                model_key=by_model.get(p.get("codigo_modelo_botella")),
-                defect_key=by_defect.get((row.get("espacio_defecto"), row.get("codigo_defecto"))),
-            )
+            attach_dimensions(name, row, context)
     tables["dim_date"] = sorted(dates.values(), key=lambda r: r["date_key"])
-    validate_links(tables)
+    # Spilled facts are stamped by the caller, then checked with the full link pass.
+    validate_links(tables, include_spilled=False)
+    return context
 
 
-def validate_links(tables):
+class DimensionLookup:
+    def __init__(self, plant_key, productions, physical, by_model, by_defect, dates):
+        self.plant_key = plant_key
+        self.productions = productions
+        self.physical = physical
+        self.by_model = by_model
+        self.by_defect = by_defect
+        self.dates = dates
+
+
+def attach_dimensions(name: str, row: dict, lookup: DimensionLookup) -> dict:
+    """Stamp one fact. A closed score keeps the dimension keys it was published with."""
+    p = lookup.productions.get(row.get("id_produccion"), {})
+    instant = next(
+        (
+            row[k]
+            for k in ("periodo_inicio", "fecha_on", "inicio", "fecha_inicio_zc")
+            if row.get(k) is not None
+        ),
+        None,
+    )
+    day = (
+        instant.date()
+        if isinstance(instant, datetime)
+        else instant
+        if isinstance(instant, date)
+        else None
+    )
+    date_key = int(day.strftime("%Y%m%d")) if day else None
+    if day:
+        lookup.dates[date_key] = dict(
+            date_key=date_key,
+            fecha=day,
+            year=day.year,
+            month=day.month,
+            day=day.day,
+            weekday=day.isoweekday(),
+        )
+    matched = [
+        m
+        for m in lookup.physical
+        if m["id_maquina_fenix"] == p.get("id_maquina_fenix")
+        and instant is not None
+        and m["valid_from"] <= instant
+        and (m["valid_to"] is None or instant < m["valid_to"])
+    ]
+    if len(matched) > 1:
+        raise IntegrityError("Ambiguous temporal machine dimension")
+    if name == "quality_scores" and row.get("plant_key"):
+        return row
+    row.update(
+        plant_key=lookup.plant_key,
+        date_key=date_key,
+        machine_key=matched[0]["dimension_key"] if matched else None,
+        model_key=lookup.by_model.get(p.get("codigo_modelo_botella")),
+        defect_key=lookup.by_defect.get((row.get("espacio_defecto"), row.get("codigo_defecto"))),
+    )
+    return row
+
+
+def _iter_rows(tables, name):
+    spilled = getattr(tables, "spilled", None)
+    if spilled and name in spilled:
+        return tables.store.iter_rows(name)
+    return tables.get(name, [])
+
+
+def validate_links(tables, *, include_spilled=True):
     dimensions = {
         "plant_key": ("dim_plant", "plant_key"),
         "date_key": ("dim_date", "date_key"),
@@ -254,6 +282,8 @@ def validate_links(tables):
     for field, (name, key) in dimensions.items():
         identities = {r[key] for r in tables.get(name, [])}
         for fact in DIMENSIONAL_FACTS:
-            for row in tables.get(fact, []):
+            if not include_spilled and getattr(tables, "spilled", None) and fact in tables.spilled:
+                continue
+            for row in _iter_rows(tables, fact):
                 if row.get(field) is not None and row[field] not in identities:
                     raise IntegrityError(f"{fact}.{field}: missing dimension version")

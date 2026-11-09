@@ -42,7 +42,7 @@ from .freshness import source_freshness
 from .incremental import Prepared
 from .metrics import Window, ar_bases, live_windows, production_windows, zc_bases
 from .publications import Publisher, Snapshot
-from .schemas import KEYS, make_table
+from .schemas import KEYS, SCHEMAS, check_row, make_table
 from .scoring import ScoreResult, calculate, validate_config
 from .spill import FactStore
 
@@ -238,7 +238,13 @@ def _spill_facts(reader, tables, attribution, pending, store: FactStore, by_zc):
             rows, issues = facts.mia(family, batch.to_pylist(), attribution)
             for row in rows:
                 _check_assignment(target, row, assigned)
-                store.add(target, row["id_produccion"], row["id_observacion"], row)
+                store.add(
+                    target,
+                    row["id_produccion"],
+                    row["id_observacion"],
+                    row,
+                    key=tuple(row[k] for k in KEYS[target]),
+                )
             pending.extend(issues)
     for batch in reader.batches("LISTA_AR"):
         rows, issues = facts.ar(
@@ -252,7 +258,13 @@ def _spill_facts(reader, tables, attribution, pending, store: FactStore, by_zc):
         )
         for row in rows:
             _check_assignment("ar_intervals", row, assigned)
-            store.add("ar_intervals", row["id_produccion"], row["id_observacion"], row)
+            store.add(
+                "ar_intervals",
+                row["id_produccion"],
+                row["id_observacion"],
+                row,
+                key=tuple(row[k] for k in KEYS["ar_intervals"]),
+            )
         pending.extend(issues)
     linked = defaultdict(list)
     for production_id, observations in by_zc.items():
@@ -261,7 +273,13 @@ def _spill_facts(reader, tables, attribution, pending, store: FactStore, by_zc):
     for batch in reader.batches("CONT_ZC"):
         for row in facts.zc(batch.to_pylist()):
             observation_id = row["id_observacion"]
-            store.add("zc_observations", "", observation_id, row)
+            store.add(
+                "zc_observations",
+                "",
+                observation_id,
+                row,
+                key=tuple(row[k] for k in KEYS["zc_observations"]),
+            )
             for production_id in linked.get(observation_id, ()):
                 store.add("zc_for_production", production_id, observation_id, row)
     store.ready()
@@ -575,6 +593,113 @@ def _pending_scope_rows(pending, snapshot, last_discovery):
     ]
 
 
+_SPILLED = object()
+
+
+class SpilledTables(dict):
+    """Small tables stay here. A family that grows with history is read back from the store."""
+
+    def __init__(self, store: FactStore, directory):
+        super().__init__()
+        self.store = store
+        self.spilled: set[str] = set()
+        self._directory = directory
+        self._closed = False
+
+    def mark(self, name: str) -> None:
+        self.spilled.add(name)
+        super().__setitem__(name, _SPILLED)
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        if value is _SPILLED:
+            # A caller that inspects or edits a family owns that list from then on.
+            loaded = list(self.store.iter_rows(key))
+            super().__setitem__(key, loaded)
+            self.spilled.discard(key)
+            return loaded
+        return value
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.store.close()
+        self._directory.cleanup()
+
+    def __del__(self) -> None:
+        self.close()
+
+
+def _store_row(store: FactStore, name: str, production_id, row: dict) -> None:
+    row = check_row(name, row)
+    key = tuple(row[k] for k in KEYS[name])
+    store.add(name, str(production_id or ""), str(key[0]), row, key=key)
+
+
+def _history(previous, production_id: str, max_rows: int):
+    """Previous rows for one production. A later pass never reloads the whole publication."""
+    if previous is None:
+        return {}, {}, {}
+    import pyarrow.dataset as ds
+
+    available = {r["name"] for r in previous.manifest["tables"]}
+    old = {}
+    for name in REUSED_TABLES:
+        if name not in available or "id_produccion" not in SCHEMAS[name].names:
+            continue
+        old[name] = previous.rows(
+            name,
+            expression=ds.field("id_produccion") == production_id,
+            max_rows=max_rows,
+        )
+    scores = {r["id_resultado"]: r for r in old.get("quality_scores", [])}
+    result_ids = list(scores)
+    for name in SCORE_TABLES:
+        if name in old or name not in available:
+            continue
+        old[name] = (
+            previous.rows(
+                name,
+                expression=ds.field("id_resultado").isin(result_ids),
+                max_rows=max_rows,
+            )
+            if result_ids
+            else []
+        )
+    states = {r["id_produccion"]: r for r in old.get("production_calculation_state", [])}
+    return old, states, scores
+
+
+def _carry_references(previous, store: FactStore, max_rows: int) -> None:
+    """Keep reference rows a preserved score still points at."""
+    if previous is None:
+        return
+    available = {r["name"] for r in previous.manifest["tables"]}
+    for name in REFERENCE_TABLES:
+        if name not in available:
+            continue
+        for row in previous.rows(name, max_rows=max_rows):
+            _store_row(store, name, row.get("id_produccion") or "", row)
+
+
+def _previous_coverage(previous, max_rows: int) -> dict:
+    if previous is None:
+        return {}
+    import pyarrow.dataset as ds
+
+    available = {r["name"] for r in previous.manifest["tables"]}
+    if "publication_scope_status" not in available:
+        return {}
+    return coverage.published_until(
+        previous.rows(
+            "publication_scope_status",
+            expression=ds.field("source") == "coverage",
+            max_rows=max_rows,
+        )
+    )
+
+
 def build(
     snapshot: Snapshot,
     *,
@@ -613,141 +738,169 @@ def build(
         },
         "score_workers": _score_workers(),
     }
-    with tempfile.TemporaryDirectory(prefix="gold-facts-") as spill_dir:
-        store = FactStore(Path(spill_dir) / "facts.sqlite")
-        try:
-            with clock.stage("facts"):
-                by_zc = _zc_links(decisions, tables)
-                _spill_facts(reader, tables, Attribution(decisions, prods), pending, store, by_zc)
-                del decisions
-                reader.release("observation_assignments")
-            with clock.stage("previous"):
-                old_tables = _previous_tables(previous, max_total_rows, REUSED_TABLES)
-                for name in REFERENCE_TABLES:
-                    tables[name] = (
-                        list(old_tables.get(name, [])) if previous else tables.get(name, [])
-                    )
-                previous_states = {
-                    r["id_produccion"]: r
-                    for r in old_tables.get("production_calculation_state", [])
-                }
-                previous_scores = {
-                    r["id_resultado"]: r for r in old_tables.get("quality_scores", [])
-                }
-                previous_coverage = coverage.published_until(
-                    _previous_tables(previous, max_total_rows, ("publication_scope_status",)).get(
-                        "publication_scope_status", []
-                    )
+    spill_dir = tempfile.TemporaryDirectory(prefix="gold-facts-")
+    store = FactStore(Path(spill_dir.name) / "facts.sqlite")
+    published = None
+    handed = False
+    try:
+        with clock.stage("facts"):
+            by_zc = _zc_links(decisions, tables)
+            links = tables.pop("zc_production_links", [])
+            for row in links:
+                _store_row(store, "zc_production_links", row["id_produccion"], row)
+            del links
+            _spill_facts(reader, tables, Attribution(decisions, prods), pending, store, by_zc)
+            del decisions
+            reader.release("observation_assignments")
+        with clock.stage("previous"):
+            previous_coverage = _previous_coverage(previous, max_total_rows)
+            _carry_references(previous, store, max_total_rows)
+        with clock.stage("references"):
+            rates = {}
+            for production in prods:
+                windows = production_windows(production, cutoff)
+                if not (windows and production["estado_produccion"] == "CLOSED"):
+                    continue
+                old_tables, previous_states, _scores = _history(
+                    previous, production["id_produccion"], max_total_rows
                 )
-            with clock.stage("references"):
-                rates = {}
-                for production in prods:
-                    windows = production_windows(production, cutoff)
-                    if not (windows and production["estado_produccion"] == "CLOSED"):
-                        continue
-                    prepared, _rows = _prepared_for(
-                        store, production, capacities, by_zc, previous_states, old_tables
-                    )
-                    base = prepared.mia(windows[0])
-                    score_stats["mia_windows_reused"] += prepared.stats["mia_windows_reused"]
-                    score_stats["mia_windows_recalculated"] += prepared.stats[
-                        "mia_windows_recalculated"
-                    ]
-                    if base["exposure"]["inspeccionadas"] > 0 and _coverage_ready(
-                        snapshot,
-                        production,
-                        windows[0],
-                        pending,
-                        {"LISTA_DEFECTOS", "LISTA_RECH"},
-                    ):
-                        rates[production["id_produccion"]] = base["rates"]
-                    del prepared, _rows
-            segments = {r["codigo_modelo_botella"]: r for r in tables["model_segment_catalog"]}
-            config_id = digest([config, bundle])
-            catalog_version = digest(catalog_bundle)
-            payloads = [
-                {
-                    "spill": str(store.path),
-                    "production": production,
-                    "productions": prods,
-                    "capacities": capacities,
-                    "by_zc": by_zc,
-                    "previous_states": previous_states,
-                    "old_tables": old_tables,
-                    "previous_scores": previous_scores,
-                    "previous_coverage": previous_coverage.get(production["id_produccion"]),
-                    "pending": pending,
-                    "segments": segments,
-                    "rates": rates,
-                    "config": config,
-                    "config_id": config_id,
-                    "catalog_version": catalog_version,
-                    "minimum_samples": int(config["mia"]["historical_scope"]["min_samples"]),
-                    "cutoff": cutoff,
-                    "calculation_time": calculation_time,
-                    "last_discovery": last_discovery,
-                    "publication_id": snapshot.publication_id,
-                    "coverage": snapshot.manifest["coverage"],
-                    "recalculate_closed_ids": recalculate_closed_ids,
-                }
-                for production in prods
-            ]
-            with clock.stage("scores"):
-                workers = score_stats["score_workers"]
-                if workers == 1 or len(payloads) < 2:
-                    results = [_score_job(payload) for payload in payloads]
-                    score_stats["score_workers"] = 1
-                else:
-                    context = multiprocessing.get_context("spawn")
-                    with ProcessPoolExecutor(
-                        max_workers=min(workers, len(payloads)), mp_context=context
-                    ) as pool:
-                        results = list(pool.map(_score_job, payloads, chunksize=1))
-            scope_rows = []
-            for result in results:
-                tables.setdefault("production_calculation_state", []).append(result["state"])
-                for key, name in zip(("sets", "members", "values"), REFERENCE_TABLES, strict=True):
-                    tables.setdefault(name, []).extend(result["reference"][key])
-                scope_rows.extend(result["scope_rows"])
-                for name, rows in result["tables"].items():
-                    tables.setdefault(name, []).extend(rows)
-                pending.extend(result["pending"])
-                score_stats["mia_windows_reused"] += result["reused"]
-                score_stats["mia_windows_recalculated"] += result["recalculated"]
-                score_stats["unchanged_productions"] += int(result["unchanged"])
-            with clock.stage("assemble"):
-                for name in (
-                    "mia_rejections",
-                    "mia_inspections",
-                    "ar_intervals",
-                    "zc_observations",
+                prepared, _rows = _prepared_for(
+                    store, production, capacities, by_zc, previous_states, old_tables
+                )
+                base = prepared.mia(windows[0])
+                score_stats["mia_windows_reused"] += prepared.stats["mia_windows_reused"]
+                score_stats["mia_windows_recalculated"] += prepared.stats[
+                    "mia_windows_recalculated"
+                ]
+                if base["exposure"]["inspeccionadas"] > 0 and _coverage_ready(
+                    snapshot,
+                    production,
+                    windows[0],
+                    pending,
+                    {"LISTA_DEFECTOS", "LISTA_RECH"},
                 ):
-                    tables[name] = store.materialize(name)
-        finally:
-            store.close()
-    scope_rows.extend(_pending_scope_rows(pending, snapshot, last_discovery))
-    tables["publication_scope_status"] = scope_rows
-    for name in (*SCORE_TABLES, *contracts.CONTRACTS):
-        tables.setdefault(name, [])
-    with clock.stage("dimensions"):
-        dimensional.materialize(
-            tables,
-            plant=snapshot.manifest["plant"],
-            machines=reader.rows("SIP_MAQUINA_MOLDEO"),
-            recorded_at=calculation_time,
-            previous=_previous_tables(previous, max_total_rows, DIMENSION_TABLES),
-        )
-    with clock.stage("validate"):
-        # One representation per logical key, even when hours/turns share base samples.
-        for name, rows in tables.items():
-            tables[name] = _unique(name, rows)
-            make_table(name, tables[name])
-        contracts.validate(tables, complete=True)
-    if statistics is not None:
-        statistics.update(score_stats)
-        statistics["source_rows_read"] = reader.seen_rows
-        statistics["stage_seconds"] = clock.stages
-    return tables, tables["publication_scope_status"]
+                    rates[production["id_produccion"]] = base["rates"]
+                del prepared, _rows, old_tables
+        segments = {r["codigo_modelo_botella"]: r for r in tables["model_segment_catalog"]}
+        config_id = digest([config, bundle])
+        catalog_version = digest(catalog_bundle)
+        scope_rows: list[dict] = []
+
+        def payload_for(production, old_tables, previous_states, previous_scores):
+            return {
+                "spill": str(store.path),
+                "production": production,
+                "productions": prods,
+                "capacities": capacities,
+                "by_zc": by_zc,
+                "previous_states": previous_states,
+                "old_tables": old_tables,
+                "previous_scores": previous_scores,
+                "previous_coverage": previous_coverage.get(production["id_produccion"]),
+                "pending": pending,
+                "segments": segments,
+                "rates": rates,
+                "config": config,
+                "config_id": config_id,
+                "catalog_version": catalog_version,
+                "minimum_samples": int(config["mia"]["historical_scope"]["min_samples"]),
+                "cutoff": cutoff,
+                "calculation_time": calculation_time,
+                "last_discovery": last_discovery,
+                "publication_id": snapshot.publication_id,
+                "coverage": snapshot.manifest["coverage"],
+                "recalculate_closed_ids": recalculate_closed_ids,
+            }
+
+        def absorb(result):
+            identity = result["state"]["id_produccion"]
+            tables.setdefault("production_calculation_state", []).append(result["state"])
+            for key, name in zip(("sets", "members", "values"), REFERENCE_TABLES, strict=True):
+                for row in result["reference"][key]:
+                    _store_row(store, name, identity, row)
+            scope_rows.extend(result["scope_rows"])
+            for name, rows in result["tables"].items():
+                for row in rows:
+                    _store_row(store, name, row.get("id_produccion") or identity, row)
+            pending.extend(result["pending"])
+            score_stats["mia_windows_reused"] += result["reused"]
+            score_stats["mia_windows_recalculated"] += result["recalculated"]
+            score_stats["unchanged_productions"] += int(result["unchanged"])
+
+        with clock.stage("scores"):
+            workers = score_stats["score_workers"]
+            if workers == 1 or len(prods) < 2:
+                score_stats["score_workers"] = 1
+                for production in prods:
+                    old_tables, previous_states, previous_scores = _history(
+                        previous, production["id_produccion"], max_total_rows
+                    )
+                    absorb(
+                        _score_job(
+                            payload_for(production, old_tables, previous_states, previous_scores)
+                        )
+                    )
+                    del old_tables, previous_states, previous_scores
+            else:
+                payloads = []
+                for production in prods:
+                    old_tables, previous_states, previous_scores = _history(
+                        previous, production["id_produccion"], max_total_rows
+                    )
+                    payloads.append(
+                        payload_for(production, old_tables, previous_states, previous_scores)
+                    )
+                context = multiprocessing.get_context("spawn")
+                with ProcessPoolExecutor(
+                    max_workers=min(workers, len(payloads)), mp_context=context
+                ) as pool:
+                    for result in pool.map(_score_job, payloads, chunksize=1):
+                        absorb(result)
+        store.dedupe()
+        scope_rows.extend(_pending_scope_rows(pending, snapshot, last_discovery))
+        published = SpilledTables(store, spill_dir)
+        published.update(tables)
+        for name in store.families():
+            if name in contracts.CONTRACTS:
+                published.mark(name)
+        published["publication_scope_status"] = scope_rows
+        for name in (*SCORE_TABLES, *contracts.CONTRACTS):
+            published.setdefault(name, [])
+        with clock.stage("dimensions"):
+            lookup = dimensional.materialize(
+                published,
+                plant=snapshot.manifest["plant"],
+                machines=reader.rows("SIP_MAQUINA_MOLDEO"),
+                recorded_at=calculation_time,
+                previous=_previous_tables(previous, max_total_rows, DIMENSION_TABLES),
+            )
+            for name in sorted(published.spilled & set(dimensional.DIMENSIONAL_FACTS)):
+
+                def stamp(row, name=name):
+                    return dimensional.attach_dimensions(name, row, lookup)
+
+                store.rewrite(name, stamp)
+            published["dim_date"] = sorted(lookup.dates.values(), key=lambda r: r["date_key"])
+        with clock.stage("validate"):
+            for name in list(published):
+                if name in published.spilled:
+                    continue
+                published[name] = _unique(name, published[name])
+                make_table(name, published[name])
+            contracts.validate(published, complete=True)
+        if statistics is not None:
+            statistics.update(score_stats)
+            statistics["source_rows_read"] = reader.seen_rows
+            statistics["stage_seconds"] = clock.stages
+        handed = True
+        return published, published["publication_scope_status"]
+    finally:
+        if not handed:
+            if published is not None:
+                published.close()
+            else:
+                store.close()
+                spill_dir.cleanup()
 
 
 def _run(
@@ -829,50 +982,58 @@ def _run(
             statistics=statistics,
             recalculate_closed_ids=set(recalculate_closed_ids or []),
         )
-        # Bounded first snapshot; the writer also supports explicit per-scope replacement.
-        publication_config = digest([bundle, config, code_id, recalculation])
-        publication_id = digest(
-            ["gold-v1", snap.publication_id, publication_config, cutoff.isoformat(), {}]
-        )
-        for row in tables["quality_scores"]:
-            if row.get("basis_publication_id") is None:
-                row["basis_publication_id"] = publication_id
-        result = Publisher(
-            output_root, environment=environment, plant=plant, failpoint=failpoint
-        ).publish(
-            snap,
-            tables,
-            config_id=publication_config,
-            cutoff=cutoff.isoformat(),
-            coverage=[
-                {
-                    "source": "publication_scope_status",
-                    "source_discovery_at": min(
-                        (
-                            r["last_successful_discovery"].isoformat()
-                            for r in coverage
-                            if r["last_successful_discovery"]
+        try:
+            # Bounded first snapshot; the writer also supports explicit per-scope replacement.
+            publication_config = digest([bundle, config, code_id, recalculation])
+            publication_id = digest(
+                ["gold-v1", snap.publication_id, publication_config, cutoff.isoformat(), {}]
+            )
+            if "quality_scores" not in getattr(tables, "spilled", ()):
+                for row in tables["quality_scores"]:
+                    if row.get("basis_publication_id") is None:
+                        row["basis_publication_id"] = publication_id
+            result = Publisher(
+                output_root, environment=environment, plant=plant, failpoint=failpoint
+            ).publish(
+                snap,
+                tables,
+                config_id=publication_config,
+                cutoff=cutoff.isoformat(),
+                coverage=[
+                    {
+                        "source": "publication_scope_status",
+                        "source_discovery_at": min(
+                            (
+                                r["last_successful_discovery"].isoformat()
+                                for r in coverage
+                                if r["last_successful_discovery"]
+                            ),
+                            default=None,
                         ),
-                        default=None,
-                    ),
-                    "rows": len(coverage),
-                    "estado": "READY"
-                    if all(r["estado"] == "READY" for r in coverage)
-                    else "WAITING_DEPENDENCY",
-                }
-            ],
-        )
-        state.update(status="ACKNOWLEDGED", publication_id=result["publication_id"])
-        state["incremental"] = statistics
-        atomic_json(state_path, state)
-        return {
-            **result,
-            "rows": {k: len(v) for k, v in tables.items()},
-            "pending_scopes": sum(r["estado"] != "READY" for r in coverage),
-            "incremental": statistics,
-            "source": source,
-            "coverage": coverage_summary(coverage, cutoff),
-        }
+                        "rows": len(coverage),
+                        "estado": "READY"
+                        if all(r["estado"] == "READY" for r in coverage)
+                        else "WAITING_DEPENDENCY",
+                    }
+                ],
+            )
+            state.update(status="ACKNOWLEDGED", publication_id=result["publication_id"])
+            state["incremental"] = statistics
+            atomic_json(state_path, state)
+            spilled = getattr(tables, "spilled", ())
+            return {
+                **result,
+                "rows": {
+                    name: tables.store.count(name) if name in spilled else len(tables[name])
+                    for name in tables
+                },
+                "pending_scopes": sum(r["estado"] != "READY" for r in coverage),
+                "incremental": statistics,
+                "source": source,
+                "coverage": coverage_summary(coverage, cutoff),
+            }
+        finally:
+            tables.close()
 
 
 def run(input_root, output_root, **kwargs):

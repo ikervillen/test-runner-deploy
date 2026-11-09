@@ -7,6 +7,7 @@ cross-volume or object-store transactions.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -19,8 +20,17 @@ import pyarrow.dataset as ds
 from deltalake import CommitProperties, DeltaTable, write_deltalake
 from deltalake.transaction import Transaction
 
-from .common import IntegrityError, atomic_json, digest, immutable_json, read_json, utc_now, within
-from .schemas import KEYS, SCHEMAS, make_table, partition_columns, schema_id
+from .common import (
+    IntegrityError,
+    atomic_json,
+    canonical,
+    digest,
+    immutable_json,
+    read_json,
+    utc_now,
+    within,
+)
+from .schemas import KEYS, SCHEMAS, check_row, make_table, partition_columns, schema_id
 
 MANIFEST_SCHEMA = "quality-publication-v1"
 POINTER_SCHEMA = "quality-pointer-v1"
@@ -300,9 +310,225 @@ class Publisher:
                 snapshot, tables, config_id, cutoff, coverage, replacement_scopes or {}
             )
 
+    def _publish_stream(self, snapshot, rows, config_id, cutoff, coverage):
+        """Publish from the spill file, one batch of 1000 rows at a time."""
+        from .contracts import CONTRACT_VERSION, CONTRACTS, contract_id, ordered, validate
+
+        validate(rows, complete=set(rows) == set(CONTRACTS))
+        operation = digest(["gold-v1", snapshot.publication_id, config_id, cutoff, {}])
+        pointer_path = self.root / "current.json"
+        pointer, previous = envelope(self.root) if pointer_path.exists() else (None, None)
+        if previous and (
+            previous["environment"] != self.environment or previous["plant"] != self.plant
+        ):
+            raise IntegrityError("Existing Gold store belongs to a different environment/plant")
+        expected_contract = {"version": CONTRACT_VERSION, "id": contract_id()}
+        if previous and previous.get("contract") != expected_contract:
+            raise IntegrityError(
+                "Existing Gold contract differs; use an isolated output and validate migration"
+            )
+        prior_names = {r["name"] for r in previous["tables"]} if previous else set()
+        affected = set(rows)
+        for name in ordered():
+            if any(parent in affected for parent in CONTRACTS[name].parents):
+                affected.add(name)
+        omitted = (affected & prior_names) - rows.keys()
+        if omitted:
+            raise IntegrityError(
+                f"Dependent tables must be recalculated together: {sorted(omitted)}"
+            )
+        previous_scores = {}
+        if previous and any(r["name"] == "quality_scores" for r in previous["tables"]):
+            previous_scores = {
+                r["id_resultado"]: r for r in Snapshot(self.root, previous).rows("quality_scores")
+            }
+
+        def prepared(name):
+            source = rows.store.iter_rows(name) if name in rows.spilled else rows[name]
+            for raw in source:
+                row = dict(raw)
+                if name == "quality_scores":
+                    if row.get("basis_publication_id") is None:
+                        row["basis_publication_id"] = operation
+                    accepted = previous_scores.get(row["id_resultado"])
+                    if accepted and all(
+                        row.get(k) == v for k, v in accepted.items() if k != "fecha_calculo"
+                    ):
+                        row["fecha_calculo"] = accepted["fecha_calculo"]
+                yield check_row(name, row)
+
+        def content_hash(name) -> str:
+            hasher = hashlib.sha256()
+            count = 0
+            for row in prepared(name):
+                hasher.update(canonical(row))
+                hasher.update(b"\0")
+                count += 1
+            hasher.update(str(count).encode())
+            return hasher.hexdigest()
+
+        names = ordered(rows)
+        hashes = {name: content_hash(name) for name in names}
+        if pointer and pointer["publication_id"] == operation:
+            journal = self.root / "operations" / f"{operation}.json"
+            if journal.exists():
+                state = read_json(journal)
+                if state["table_hashes"] != hashes:
+                    raise IntegrityError("Repeated operation produced different data")
+                state["state"] = "ACKNOWLEDGED"
+                atomic_json(journal, state)
+            return {"status": "UNCHANGED", "publication_id": operation}
+        journal = self.root / "operations" / f"{operation}.json"
+        if journal.exists():
+            state = read_json(journal)
+            if state["table_hashes"] != hashes:
+                raise IntegrityError("Recovery inputs or transformation changed")
+            if state["state"] == "ACKNOWLEDGED":
+                raise IntegrityError(
+                    "Operation was already published and has been superseded; "
+                    "replaying it would roll the current pointer back"
+                )
+        else:
+            pending = [
+                p
+                for p in (self.root / "operations").glob("*.json")
+                if read_json(p)["state"] != "ACKNOWLEDGED"
+            ]
+            if pending:
+                raise IntegrityError(
+                    "Recover the pending operation before publishing another input"
+                )
+            state = {
+                "operation_id": operation,
+                "input_publication_id": snapshot.publication_id,
+                "state": "PREPARED",
+                "table_hashes": hashes,
+                "receipts": {},
+            }
+            atomic_json(journal, state)
+        self.failpoint("prepared")
+        prior_refs = {r["name"]: r for r in previous["tables"]} if previous else {}
+        for name in names:
+            target = self.root / "tables" / name
+            scoped_hash = digest([hashes[name], {}])
+            ref = state["receipts"].get(name)
+            if ref is None:
+                current = DeltaTable(str(target)) if (target / "_delta_log").exists() else None
+                last = current.history(1)[0] if current else {}
+                if current is not None and last.get("gold_operation_id") != operation:
+                    accepted = prior_refs.get(name)
+                    if accepted is None:
+                        raise IntegrityError(
+                            "Existing output has no published owner; "
+                            "restore its pointer before writing"
+                        )
+                    if current.version() != accepted["delta_version"]:
+                        raise IntegrityError(
+                            "Output changed outside the pending confirmed operation"
+                        )
+                if last.get("gold_operation_id") == operation:
+                    if last.get("gold_content_hash") != scoped_hash:
+                        raise IntegrityError("Existing commit has different transformation content")
+                elif last.get("gold_content_hash") == scoped_hash:
+                    if name not in prior_refs:
+                        raise IntegrityError(
+                            "Unreferenced existing output requires explicit recovery"
+                        )
+                    ref = prior_refs[name]
+                else:
+                    properties = CommitProperties(
+                        custom_metadata={
+                            "gold_operation_id": operation,
+                            "gold_content_hash": scoped_hash,
+                        },
+                        app_transactions=[Transaction(f"gold:{operation}:{name}", 1)],
+                    )
+                    data = _batch_reader(name, prepared(name))
+                    if current is None:
+                        write_deltalake(
+                            target,
+                            data,
+                            mode="error",
+                            partition_by=partition_columns(name),
+                            configuration=RETENTION,
+                            commit_properties=properties,
+                        )
+                    else:
+                        join = " AND ".join(f't."{k}" = s."{k}"' for k in KEYS[name])
+                        changed = " OR ".join(
+                            f'(t."{k}" IS DISTINCT FROM s."{k}")' for k in SCHEMAS[name].names
+                        )
+                        before_version = current.version()
+                        (
+                            current.merge(
+                                data,
+                                join,
+                                source_alias="s",
+                                target_alias="t",
+                                commit_properties=properties,
+                                streamed_exec=True,
+                            )
+                            .when_matched_update_all(predicate=changed)
+                            .when_not_matched_insert_all()
+                            .when_not_matched_by_source_delete()
+                            .execute()
+                        )
+                        after = DeltaTable(str(target))
+                        if after.version() == before_version:
+                            if name not in prior_refs:
+                                raise IntegrityError("No-op commit has no confirmed output receipt")
+                            ref = prior_refs[name]
+                    self.failpoint(f"commit:{name}")
+                if ref is None:
+                    current = DeltaTable(str(target))
+                    ref = reference(self.root, name, f"tables/{name}", current.version(), operation)
+                state["receipts"][name] = ref
+                atomic_json(journal, state)
+            prior_refs[name] = ref
+        state["state"] = "VERIFIED"
+        atomic_json(journal, state)
+        for ref in prior_refs.values():
+            Snapshot(self.root, {"tables": [ref]}).table(ref["name"])
+        self.failpoint("verified")
+        manifest = promote(
+            self.root,
+            list(prior_refs.values()),
+            environment=self.environment,
+            plant=self.plant,
+            input_id=snapshot.publication_id,
+            operation_id=operation,
+            generation=pointer["generation"] + 1 if pointer else 1,
+            previous=pointer["publication_id"] if pointer else None,
+            coverage=coverage,
+            dependencies=[
+                {
+                    "table": name,
+                    "input_versions": {
+                        parent: prior_refs[parent]["delta_version"]
+                        for parent in CONTRACTS[name].parents
+                        if parent in prior_refs
+                    },
+                }
+                for name in sorted(prior_refs)
+            ],
+            contract=expected_contract,
+        )
+        self.failpoint("promoted")
+        state["state"] = "ACKNOWLEDGED"
+        atomic_json(journal, state)
+        return {
+            "status": "PUBLISHED",
+            "publication_id": manifest["publication_id"],
+            "tables": len(prior_refs),
+        }
+
     def _publish(self, snapshot, rows, config_id, cutoff, coverage, scopes):
         from .contracts import CONTRACT_VERSION, CONTRACTS, contract_id, ordered, validate
 
+        if getattr(rows, "spilled", None):
+            if scopes:
+                raise IntegrityError("A spilled publication has no partial replacement scope")
+            return self._publish_stream(snapshot, rows, config_id, cutoff, coverage)
         ordered(rows)
         for name, values in rows.items():
             make_table(name, values)
@@ -534,6 +760,27 @@ class Publisher:
             "publication_id": manifest["publication_id"],
             "tables": len(prior_refs),
         }
+
+
+def _batch_reader(name: str, rows: Iterator[dict]):
+    """Arrow batches of 1000 prepared rows, or an empty table when the family is empty."""
+    iterator = iter(rows)
+    try:
+        first = next(iterator)
+    except StopIteration:
+        return pa.Table.from_pylist([], schema=SCHEMAS[name])
+
+    def batches():
+        buffer = [first]
+        for row in iterator:
+            buffer.append(row)
+            if len(buffer) == 1000:
+                yield pa.RecordBatch.from_pylist(buffer, schema=SCHEMAS[name])
+                buffer = []
+        if buffer:
+            yield pa.RecordBatch.from_pylist(buffer, schema=SCHEMAS[name])
+
+    return pa.RecordBatchReader.from_batches(SCHEMAS[name], batches())
 
 
 def _validate_scopes(rows, scopes):

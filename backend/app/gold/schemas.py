@@ -201,6 +201,12 @@ PARTITIONED_TABLES = frozenset(
         "inspection_bases",
         "mia_window_exposures",
         "mia_window_bases",
+        # A click asks for one production. These are the tables that click opens.
+        "quality_scores",
+        "production_calculation_state",
+        "production_assignments",
+        "ar_window_exposures",
+        "ar_window_bases",
     }
 )
 
@@ -213,19 +219,21 @@ def schema_id(value: pa.Schema) -> str:
     return digest([(f.name, str(f.type), f.nullable) for f in value])
 
 
-def make_table(name: str, rows: list[dict]) -> pa.Table:
+_ROW_ADDITIONS = {
+    "model_segment_catalog": ("estado_modelo", "estado_dar", "referencia_clasificacion"),
+    "quality_scores": ("configuration_status", "basis_publication_id"),
+}
+_DIMENSION_COLUMNS = ("plant_key", "machine_key", "model_key", "defect_key", "date_key")
+
+
+def check_row(name: str, row: dict) -> dict:
+    """One output row against its contract. The caller keeps the returned copy."""
     expected = SCHEMAS[name]
-    additions = {
-        "model_segment_catalog": ("estado_modelo", "estado_dar", "referencia_clasificacion"),
-        "quality_scores": ("configuration_status", "basis_publication_id"),
-    }
-    if name in additions:
-        rows = [dict.fromkeys(additions[name]) | row for row in rows]
-    if name in DIMENSIONAL_FACTS:
-        rows = [
-            dict.fromkeys(("plant_key", "machine_key", "model_key", "defect_key", "date_key")) | row
-            for row in rows
-        ]
+    if name in _ROW_ADDITIONS:
+        row = dict.fromkeys(_ROW_ADDITIONS[name]) | row
+    row = (
+        dict.fromkeys(_DIMENSION_COLUMNS) | row if name in DIMENSIONAL_FACTS else dict(row)
+    )
     enums = {
         "estado_produccion": {"OPEN", "CLOSED", "UNKNOWN"},
         "estado_dato": {"VALID", "PENDING", "REVIEW"},
@@ -260,40 +268,42 @@ def make_table(name: str, rows: list[dict]) -> pa.Table:
         "eventos",
         *(f"rech{i}" for i in range(1, 11)),
     }
-    for row in rows:
-        if set(row) != set(expected.names):
-            raise IntegrityError(f"{name}: columns differ: {set(row) ^ set(expected.names)}")
-        for field in expected:
-            value = row[field.name]
-            allowed = (
-                {"CONFIRMED", "PENDING", "REVIEW"}
-                if name == "dim_model" and field.name == "estado"
-                else enums.get(field.name)
-            )
-            if value is not None and allowed is not None and value not in allowed:
-                raise IntegrityError(f"{name}.{field.name}: unknown controlled value")
-            if value is not None and field.name in amounts and value < 0:
-                raise IntegrityError(f"{name}.{field.name}: negative quantity")
-            if value is None and not field.nullable:
-                raise IntegrityError(f"{name}.{field.name} cannot be null")
-            if isinstance(value, float) and not math.isfinite(value):
-                raise IntegrityError(f"{name}.{field.name} is not finite")
-            if pa.types.is_integer(field.type) and value is not None and type(value) is not int:
-                raise IntegrityError(f"{name}.{field.name} must be an exact integer")
-        if (
-            name == "productions"
-            and row["estado_produccion"] == "CLOSED"
-            and row["fecha_fin_zf"] is None
-        ):
-            raise IntegrityError("A closed production requires an accredited ZF end")
-        if name == "production_capacity" and row["estado_capacidad"] == "CONFIRMED":
-            n, g = row["numero_secciones"], row["numero_gotas"]
-            if n is None or g is None or n <= 0 or g <= 0 or n * g != row["cavidades_asignadas"]:
-                raise IntegrityError(
-                    "Confirmed capacity requires positive consistent sections/gobs"
-                )
-    table = pa.Table.from_pylist(rows, schema=expected)
-    keys = [tuple(row[k] for k in KEYS[name]) for row in rows]
+    if set(row) != set(expected.names):
+        raise IntegrityError(f"{name}: columns differ: {set(row) ^ set(expected.names)}")
+    for field in expected:
+        value = row[field.name]
+        allowed = (
+            {"CONFIRMED", "PENDING", "REVIEW"}
+            if name == "dim_model" and field.name == "estado"
+            else enums.get(field.name)
+        )
+        if value is not None and allowed is not None and value not in allowed:
+            raise IntegrityError(f"{name}.{field.name}: unknown controlled value")
+        if value is not None and field.name in amounts and value < 0:
+            raise IntegrityError(f"{name}.{field.name}: negative quantity")
+        if value is None and not field.nullable:
+            raise IntegrityError(f"{name}.{field.name} cannot be null")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise IntegrityError(f"{name}.{field.name} is not finite")
+        if pa.types.is_integer(field.type) and value is not None and type(value) is not int:
+            raise IntegrityError(f"{name}.{field.name} must be an exact integer")
+    if (
+        name == "productions"
+        and row["estado_produccion"] == "CLOSED"
+        and row["fecha_fin_zf"] is None
+    ):
+        raise IntegrityError("A closed production requires an accredited ZF end")
+    if name == "production_capacity" and row["estado_capacidad"] == "CONFIRMED":
+        n, g = row["numero_secciones"], row["numero_gotas"]
+        if n is None or g is None or n <= 0 or g <= 0 or n * g != row["cavidades_asignadas"]:
+            raise IntegrityError("Confirmed capacity requires positive consistent sections/gobs")
+    return row
+
+
+def make_table(name: str, rows: list[dict]) -> pa.Table:
+    prepared = [check_row(name, row) for row in rows]
+    table = pa.Table.from_pylist(prepared, schema=SCHEMAS[name])
+    keys = [tuple(row[k] for k in KEYS[name]) for row in prepared]
     if len(set(keys)) != len(keys):
         raise IntegrityError(f"{name}: duplicate logical key")
     return table
