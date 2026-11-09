@@ -1,0 +1,12 @@
+{
+  "schema_id": "gold-settings-v1",
+  "input_root": "../var/gold_validation/fenix-replay",
+  "output_root": "../var/gold_validation/gold-application-v3-release",
+  "environment": "test",
+  "plant": "AIALA",
+  "score_config": "../config/customer_score.json",
+  "catalog_bundle": "../var/gold_validation/catalogs-segments-provisional.json",
+  "poll_seconds": 30,
+  "max_rows_per_source": 250000,
+  "max_total_rows": 1000000
+}

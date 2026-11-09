@@ -1,0 +1,61 @@
+groups:
+  - name: calidad-gold
+    rules:
+      - alert: CalidadGoldUnavailable
+        expr: calidad_gold_status_available == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "No hay estado operativo del publicador Gold"
+      - alert: CalidadGoldStale
+        expr: time() - calidad_gold_last_success_timestamp_seconds > 1200
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Gold no confirma una publicación o comprobación correcta desde hace 20 minutos"
+      - alert: CalidadGoldFailed
+        expr: calidad_gold_last_attempt_success == 0
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "El último intento de publicación Gold ha fallado"
+      - alert: CalidadGoldSourceStale
+        expr: >-
+          calidad_gold_source_publication_timestamp_seconds > 0
+          and time() - calidad_gold_source_publication_timestamp_seconds > 1800
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Silver no publica desde hace 30 minutos: la ingesta de origen está parada"
+      - alert: CalidadGoldSourceFamilyBehind
+        expr: calidad_gold_source_discovery_lag_seconds > 1800
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "La familia {{ $labels.family }} lleva 30 minutos sin descubrimiento correcto"
+      - alert: CalidadGoldBackupStale
+        expr: time() - calidad_gold_backup_success_timestamp_seconds > 93600
+        for: 1h
+        labels: {severity: critical}
+        annotations:
+          summary: "Sin backup Gold verificado en 26 horas"
+      - alert: CalidadGoldRestoreDrillStale
+        expr: time() - calidad_gold_restore_drill_success_timestamp_seconds > 691200
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "Ningún backup Gold se ha restaurado con éxito en 8 días"
+      - alert: CalidadGoldMaintenanceStale
+        expr: >-
+          calidad_gold_maintenance_success_timestamp_seconds > 0
+          and time() - calidad_gold_maintenance_success_timestamp_seconds > 172800
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "Sin mantenimiento Delta correcto en 48 horas: la lectura se irá degradando"
+      - alert: CalidadGoldDataPending
+        expr: calidad_gold_pending_scopes > 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Gold mantiene ventanas con dependencias de datos pendientes"

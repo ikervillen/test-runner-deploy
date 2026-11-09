@@ -1,0 +1,12 @@
+{
+  "schema_id": "gold-settings-v1",
+  "input_root": "/silver",
+  "output_root": "/gold",
+  "environment": "development",
+  "plant": "AIALA",
+  "score_config": "/config/customer_score.json",
+  "catalog_bundle": "/config/catalogs.json",
+  "poll_seconds": 30,
+  "max_rows_per_source": 250000,
+  "max_total_rows": 1000000
+}

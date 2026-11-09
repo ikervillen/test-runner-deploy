@@ -1,0 +1,40 @@
+{
+  "name": "calidad-produccion-frontend",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "format": "prettier --write src",
+    "format:check": "prettier --check src"
+  },
+  "dependencies": {
+    "plotly.js-basic-dist-min": "^2.35.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-plotly.js": "^2.6.0"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.1.0",
+    "@types/plotly.js": "^2.12.29",
+    "@types/react": "^18.2.48",
+    "@types/react-dom": "^18.2.18",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.17",
+    "jsdom": "^25.0.1",
+    "postcss": "^8.4.33",
+    "prettier": "^3.5.3",
+    "tailwindcss": "^3.4.1",
+    "terser": "^5.36.0",
+    "typescript": "^5.3.3",
+    "vite": "^7.3.1",
+    "vitest": "^3.0.5"
+  }
+}

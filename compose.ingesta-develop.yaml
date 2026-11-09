@@ -1,0 +1,20 @@
+# Add after compose.gold.yaml and compose.airflow.yaml on the ingestion host.
+# The producer owns this volume. Gold sees its confirmed publication read-only.
+x-ingesta-develop: &silver
+  type: volume
+  source: ingesta-develop
+  target: /silver
+  read_only: true
+
+services:
+  airflow-scheduler:
+    volumes:
+      - *silver
+  publisher:
+    volumes:
+      - *silver
+
+volumes:
+  ingesta-develop:
+    external: true
+    name: ${INGESTA_DEVELOP_VOLUME:?Set the volume from the active develop release descriptor}

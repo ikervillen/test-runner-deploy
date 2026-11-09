@@ -1,0 +1,6 @@
+#!/bin/sh
+# Runs the calidad_serie Gold CLI from its own locked virtualenv, isolated from
+# Airflow's packages. Same entry point as the gold/Dockerfile image.
+set -eu
+export PYTHONPATH=/opt/calidad/backend
+exec /opt/calidad/.venv/bin/python -m app.gold "$@"

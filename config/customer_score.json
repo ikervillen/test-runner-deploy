@@ -1,0 +1,111 @@
+{
+  "version": 1,
+  "score": {
+    "scale_min": 0,
+    "scale_max": 10,
+    "primary_metric": "total_penalty",
+    "secondary_metric": "normalized_score",
+    "sort_by": "total_penalty_desc",
+    "show_main_cause": true,
+    "main_cause": {
+      "include_ties": true,
+      "tie_relative_margin": 0.1,
+      "max_causes": 2
+    },
+    "interpretation": {
+      "basis": "total_penalty",
+      "good_max": 40,
+      "observed_max": 80,
+      "bad_max": 120
+    }
+  },
+  "weights": {
+    "mia_defect": 1,
+    "categories": {
+      "Critico": 10,
+      "Grave": 5,
+      "Mayor": 3,
+      "Menor": 2,
+      "Leve": 2
+    },
+    "dar": 8,
+    "zc": 2
+  },
+  "mia": {
+    "enabled": true,
+    "defect_codes": [],
+    "historical_scope": {
+      "mode": "all_available",
+      "exclude_current_production": false,
+      "min_samples": 3
+    },
+    "sigma_curve": {
+      "points": [
+        { "z": 0, "score": 0 },
+        { "z": 1, "score": 1 },
+        { "z": 2, "score": 5 },
+        { "z": 2.72, "score": 10 }
+      ],
+      "cap_score": 10
+    },
+    "zero_sigma_policy": {
+      "mode": "fixed_score_if_above_mean",
+      "fixed_score": 5
+    },
+    "absolute_rate_factor": {
+      "enabled": true,
+      "min_relevant_percent": 0.4,
+      "full_weight_span_percent": 2.0
+    }
+  },
+  "aql": {
+    "enabled": true,
+    "category_limits_percent": {
+      "Critico": 0.05,
+      "Grave": 0.1,
+      "Mayor": 0.4,
+      "Menor": 1.0,
+      "Leve": 4.0
+    },
+    "missing_limit_policy": "exclude_component",
+    "zero_or_near_zero_aql_policy": {
+      "enabled": true,
+      "low_presence_threshold_percent": 0.01,
+      "clear_presence_threshold_percent": 0.05,
+      "low_presence_score": 5,
+      "clear_presence_score": 10
+    },
+    "minute_cavity": {
+      "active_cavities_mode": "infer_from_data",
+      "fallback_active_cavities": null
+    }
+  },
+  "dar": {
+    "enabled": true,
+    "source": "avisos_rechazos_parquet",
+    "definition": "segment_very_critical_alert_rejection_codes",
+    "segment": "Vino Ligero",
+    "code_cutover_date": "2026-01-01",
+    "aql_percent": 0,
+    "progressive_thresholds_percent": {
+      "enabled": true,
+      "score_5": 0.1,
+      "score_10": 0.4
+    }
+  },
+  "zc": {
+    "enabled": true,
+    "source": "Rendimiento_ZC.xlsx",
+    "target_percent": {
+      "default": 95,
+      "by_line": {}
+    },
+    "penalty_divisor_points": 2,
+    "aggregation": "weighted_by_theoretical_total"
+  },
+  "warnings": {
+    "fail_on_missing_config": false,
+    "fail_on_missing_aql": false,
+    "show_unclassified_defects": true
+  }
+}

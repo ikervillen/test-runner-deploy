@@ -1,0 +1,88 @@
+"""Runs the DAGs through Airflow's real task runner against a recording CLI stub."""
+
+import stat
+import subprocess
+import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+from airflow.dag_processing.dagbag import DagBag
+from conftest import DAGS
+from gold_tasks import GOLD_STORE_POOL
+
+AIRFLOW = str(Path(sys.executable).with_name("airflow"))
+SLOT = datetime(2026, 11, 6, 14, 40, tzinfo=UTC)
+
+
+@pytest.fixture(scope="module")
+def dags():
+    subprocess.run([AIRFLOW, "db", "migrate"], check=True, capture_output=True)
+    subprocess.run(
+        [AIRFLOW, "pools", "set", GOLD_STORE_POOL, "1", "test"], check=True, capture_output=True
+    )
+    return DagBag(dag_folder=str(DAGS), known_pools={"default_pool", GOLD_STORE_POOL}).dags
+
+
+@pytest.fixture
+def recorded(tmp_path, monkeypatch) -> Path:
+    """Stub CLI: records its arguments, exits with $GOLD_STUB_EXIT (default 0)."""
+    record = tmp_path / "calls.txt"
+    stub = tmp_path / "bin" / "calidad-gold"
+    stub.parent.mkdir()
+    stub.write_text(
+        f'#!/bin/sh\necho "$*" >> "{record}"\nexit "${{GOLD_STUB_EXIT:-0}}"\n', encoding="utf-8"
+    )
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", f"{stub.parent}:{Path(sys.executable).parent}:/usr/bin:/bin")
+    return record
+
+
+@pytest.mark.parametrize(
+    ("dag_id", "run_after", "expected"),
+    [
+        (
+            "gold_publish",
+            SLOT,
+            ["publish --settings /config/settings.json --at 2026-11-06T15:40:00"],
+        ),
+        (
+            "gold_nightly",
+            datetime(2026, 11, 7, 1, 30, tzinfo=UTC),
+            [
+                "backup --source /gold --destination /backup/20261107T013000Z-try1",
+                "maintain --root /gold --keep-days 30",
+            ],
+        ),
+        (
+            "gold_restore_drill",
+            datetime(2026, 11, 8, 3, 30, tzinfo=UTC),
+            ["restore-drill --root /gold --scratch /backup/.restore-drill"],
+        ),
+    ],
+)
+def test_run_invokes_the_cli_with_its_own_scheduled_moment(
+    dags, recorded, dag_id, run_after, expected
+):
+    run = dags[dag_id].test(logical_date=run_after, run_after=run_after)
+    assert run.state == "success"
+    assert recorded.read_text(encoding="utf-8").splitlines() == expected
+
+
+@pytest.mark.parametrize(
+    ("code", "attempts", "slot"),
+    [
+        ("65", 1, SLOT + timedelta(minutes=10)),
+        ("75", 4, SLOT + timedelta(minutes=20)),
+    ],
+)
+def test_data_errors_fail_at_once_and_busy_stores_retry(
+    dags, recorded, monkeypatch, code, attempts, slot
+):
+    task = dags["gold_publish"].get_task("publish")
+    monkeypatch.setattr(task, "retry_delay", timedelta(0))
+    monkeypatch.setattr(task, "retry_exponential_backoff", False)
+    monkeypatch.setenv("GOLD_STUB_EXIT", code)
+    run = dags["gold_publish"].test(logical_date=slot, run_after=slot)
+    assert run.get_task_instance("publish").state == "failed"
+    assert len(recorded.read_text(encoding="utf-8").splitlines()) == attempts

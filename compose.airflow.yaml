@@ -1,0 +1,153 @@
+# Airflow orchestration of the Gold publisher, layered on compose.gold.yaml:
+#
+#   docker compose -f compose.gold.yaml -f compose.airflow.yaml \
+#     --env-file .env --env-file .env.airflow up -d --build
+#
+# The `watch` publisher moves to the `watch` profile, so exactly one writer
+# (Airflow) owns the Gold store. Rollback: drop this file from the command and
+# `watch` starts again. See docs/ORQUESTACION_AIRFLOW.md.
+#
+# LocalExecutor: tasks run inside the scheduler container, so only it mounts
+# Silver, Gold, configuration and the backup destination.
+
+x-airflow-env: &airflow-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://airflow:${AIRFLOW_DB_PASSWORD:?Set AIRFLOW_DB_PASSWORD}@airflow-postgres/airflow
+  AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?Set AIRFLOW_FERNET_KEY}
+  AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?Set AIRFLOW_JWT_SECRET}
+  AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+  AIRFLOW__CORE__DEFAULT_TIMEZONE: ${GOLD_PLANT_TIMEZONE:-Europe/Madrid}
+  AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+  GOLD_PLANT_TIMEZONE: ${GOLD_PLANT_TIMEZONE:-Europe/Madrid}
+  GOLD_PUBLICATION_RETENTION_DAYS: ${GOLD_PUBLICATION_RETENTION_DAYS:-30}
+
+x-airflow: &airflow
+  build:
+    context: .
+    dockerfile: orchestration/airflow/Dockerfile
+  image: calidad-serie-airflow:${AIRFLOW_IMAGE_TAG:-local}
+  user: "${AIRFLOW_UID:-10001}:0"
+  environment: *airflow-env
+  volumes:
+    - airflow-logs:/opt/airflow/logs
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: local
+    options: {max-size: 10m, max-file: "3"}
+  depends_on:
+    airflow-postgres: {condition: service_healthy}
+    airflow-init: {condition: service_completed_successfully}
+
+services:
+  publisher:
+    profiles: ["watch"]
+
+  airflow-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:?Set AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${AIRFLOW_DB_MEMORY_LIMIT:-512m}
+    cpus: ${AIRFLOW_DB_CPU_LIMIT:-0.5}
+    logging:
+      driver: local
+      options: {max-size: 10m, max-file: "3"}
+
+  # One-shot: migrate the metadata DB, create the admin user and the pool that
+  # serialises every writer of the Gold store (publication and backup).
+  airflow-init:
+    <<: *airflow
+    user: "0:0"
+    restart: "no"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        chown -R "${AIRFLOW_UID:-10001}:0" /opt/airflow/logs
+        exec /entrypoint airflow pools set gold_store 1 "Single writer of the Gold store"
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?Set AIRFLOW_ADMIN_PASSWORD}
+    depends_on:
+      airflow-postgres: {condition: service_healthy}
+
+  airflow-apiserver:
+    <<: *airflow
+    command: api-server
+    ports: ["127.0.0.1:${AIRFLOW_PORT:-8085}:8080"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    mem_limit: ${AIRFLOW_APISERVER_MEMORY_LIMIT:-1g}
+    cpus: ${AIRFLOW_APISERVER_CPU_LIMIT:-1.0}
+
+  airflow-scheduler:
+    <<: *airflow
+    command: scheduler
+    environment:
+      <<: *airflow-env
+      RAYON_NUM_THREADS: "2"
+      TOKIO_WORKER_THREADS: "2"
+      OMP_NUM_THREADS: "1"
+    volumes:
+      - airflow-logs:/opt/airflow/logs
+      - type: bind
+        source: ${HOST_CONFIRMED_SILVER_ROOT:?Set confirmed Silver publication root}
+        target: /silver
+        read_only: true
+      - type: bind
+        source: ${HOST_GOLD_ROOT:?Set independent writable Gold root}
+        target: /gold
+      - type: bind
+        source: ${HOST_GOLD_CONFIG_ROOT:?Set Gold configuration directory}
+        target: /config
+        read_only: true
+      - type: bind
+        source: ${HOST_GOLD_BACKUP_ROOT:?Set independent, already mounted backup destination}
+        target: /backup
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    # Publication runs here: Airflow's own footprint plus the publisher's 2g budget.
+    mem_limit: ${AIRFLOW_SCHEDULER_MEMORY_LIMIT:-3g}
+    cpus: ${AIRFLOW_SCHEDULER_CPU_LIMIT:-2.5}
+    stop_grace_period: 5m
+
+  airflow-dag-processor:
+    <<: *airflow
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    mem_limit: ${AIRFLOW_DAG_PROCESSOR_MEMORY_LIMIT:-1g}
+    cpus: ${AIRFLOW_DAG_PROCESSOR_CPU_LIMIT:-0.5}
+
+volumes:
+  airflow-db:
+  airflow-logs:

@@ -1,0 +1,97 @@
+[project]
+name = "calidad-produccion"
+version = "0.2.0"
+description = "Visualizador histórico local de calidad de producción"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "openpyxl>=3.1,<4",
+  "polars>=1.20,<2",
+  "prometheus-client>=0.21,<1",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "structlog>=24.4,<26",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+gold = [
+  "deltalake==1.6.6",
+  "pyarrow>=21,<24",
+  "portalocker>=3.2,<4",
+  "ijson>=3.3,<4",
+]
+
+[dependency-groups]
+dev = [
+  "black>=24.10,<26",
+  "httpx>=0.28,<1",
+  "mypy>=1.14,<2",
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<8",
+  "ruff>=0.9,<1",
+]
+
+[tool.uv]
+package = false
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["backend"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["B008"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["backend/app"]
+mypy_path = ["backend"]
+plugins = ["pydantic.mypy"]
+exclude = ["backend/tests"]
+# Ships py.typed but leaves a few helpers unannotated (multiprocess collector).
+untyped_calls_exclude = ["prometheus_client"]
+
+[[tool.mypy.overrides]]
+module = [
+  "openpyxl", "openpyxl.*",
+  "pyarrow", "pyarrow.*",
+  "ijson",
+  "ingesta_delta_lake", "ingesta_delta_lake.*",
+]
+ignore_missing_imports = true
+
+# Gold is checked gradually: signatures, imports and typed functions are verified, but
+# bodies of untyped functions over row dictionaries are not yet analysed. Tightening this
+# override (check_untyped_defs, then disallow_untyped_defs) is the typing roadmap; do not widen it.
+[[tool.mypy.overrides]]
+module = ["app.gold", "app.gold.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
+disallow_any_generics = false
+check_untyped_defs = false
+warn_return_any = false
+no_implicit_reexport = false
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+pythonpath = ["backend"]
+addopts = "--strict-markers --cov=backend/app --cov-report=term-missing"
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 80
