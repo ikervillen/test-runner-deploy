@@ -406,6 +406,10 @@ def common_args(record):
         "INGESTA_WORKERS": str(resources["workers"]),
         "INGESTA_SUPERVISION_EXPORT": "1",
     }
+    if record.get("gold_revision"):
+        if record["channel"] != "develop":
+            raise ValueError("La exportación Gold se habilita únicamente en develop")
+        environment["INGESTA_GOLD_EXPORT"] = "1"
     args = [
         "--network",
         "none",
@@ -547,6 +551,11 @@ class Deployment:
                 or image not in meta.get("RepoDigests", [])
             ):
                 raise RuntimeError("La identidad/procedencia de imagen no coincide con la release")
+            gold_revision = labels.get("es.fenix.ingesta.gold.revision")
+            if gold_revision is not None and (
+                self.channel != "develop" or not re.fullmatch(r"[0-9a-f]{40}", gold_revision)
+            ):
+                raise RuntimeError("La imagen Gold exige develop y un commit Gold completo")
             manifest = json.loads(
                 self.docker.call(
                     "run",
@@ -578,6 +587,8 @@ class Deployment:
                 "token": token,
                 "container": self.site["namespace"] + "-" + self.channel + "-" + token[:12],
             }
+            if gold_revision:
+                record["gold_revision"] = gold_revision
             old = self.active()
             if old and (
                 old["volume"] != record["volume"]
@@ -613,6 +624,7 @@ class Deployment:
                 "interval_seconds",
                 "resources",
                 "review_volumes",
+                "gold_revision",
             )
             if old and all(old.get(k) == record.get(k) for k in keys):
                 if record.get("review_volumes"):
@@ -634,6 +646,7 @@ class Deployment:
                     "no-new-privileges",
                     "--tmpfs",
                     "/tmp:rw,nosuid,size=512m",
+                    *(["--env", "INGESTA_GOLD_EXPORT=1"] if gold_revision else []),
                     image,
                     "self-test",
                 )
