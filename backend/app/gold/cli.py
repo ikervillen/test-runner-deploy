@@ -28,20 +28,20 @@ def main(argv=None):
     verify.add_argument("--reference", type=Path, required=True)
     parity = commands.add_parser("verify-mia-parity")
     parity.add_argument("--reference", type=Path, required=True)
-    for name in ("build", "watch", "publish"):
+    for name in ("build", "watch", "publish", "coverage"):
         build = commands.add_parser(name)
         build.add_argument("--settings", type=Path, required=True)
         if name == "build":
             build.add_argument("--recalculate-closed", action="append", default=[])
             build.add_argument("--reason")
             build.add_argument(
-                "--cutoff", required=True, help="Effective local industrial cutoff, ISO format"
+                "--cutoff", required=True, help="Local ceiling for every production, ISO format"
             )
-        if name == "publish":
+        if name in ("publish", "coverage"):
             build.add_argument(
                 "--at",
                 required=True,
-                help="Scheduled local wall-clock moment, ISO format; one watch iteration",
+                help="Scheduled local wall-clock moment, ISO format; the ceiling of the attempt",
             )
     inspect = commands.add_parser("inspect")
     inspect.add_argument("--root", type=Path, required=True)
@@ -231,15 +231,23 @@ def main(argv=None):
                     **peak_memory(),
                 }
             else:
-                from .schedule import industrial_cutoff, require_continuous_source
+                from .schedule import attempt_cutoff, require_continuous_source
 
                 require_continuous_source(configured("input_root"))
-                if args.command == "publish":
-                    result = execute(industrial_cutoff(datetime.fromisoformat(args.at)))
+                if args.command == "coverage":
+                    from .readiness import report
+
+                    result = report(
+                        configured("input_root"),
+                        configured("output_root"),
+                        attempt_cutoff(datetime.fromisoformat(args.at)),
+                    )
+                elif args.command == "publish":
+                    result = execute(attempt_cutoff(datetime.fromisoformat(args.at)))
                 else:
                     while True:
                         try:
-                            result = execute(industrial_cutoff(datetime.now()))
+                            result = execute(attempt_cutoff(datetime.now()))
                             if result["status"] != "UNCHANGED":
                                 print(json.dumps(result, ensure_ascii=False), flush=True)
                         except Exception as exc:

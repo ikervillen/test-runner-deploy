@@ -21,6 +21,7 @@ from app.infrastructure.operations import ScoreQueryExecutor
 from app.schemas.api import CatalogResponse
 from app.schemas.customer_quality import CustomerQualityRequest, CustomerQualityResponse
 
+from .coverage import coverage_status
 from .service import GoldService
 
 
@@ -102,6 +103,7 @@ def create_gold_app(settings: Settings) -> FastAPI:
                 "pending_reasons": dict(
                     Counter(r["reason_code"] for r in rows if r["reason_code"])
                 ),
+                "coverage": coverage_status(rows),
             }
 
         return await asyncio.to_thread(read)

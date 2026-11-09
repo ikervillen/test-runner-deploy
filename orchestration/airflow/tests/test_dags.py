@@ -41,6 +41,7 @@ def test_every_gold_writer_shares_the_single_slot_pool(dagbag):
         for task in dag.tasks
     }
     assert pools == {
+        ("gold_publish", "coverage_ready"): "default_pool",
         ("gold_publish", "publish"): GOLD_STORE_POOL,
         ("gold_nightly", "backup"): GOLD_STORE_POOL,
         ("gold_nightly", "maintain"): GOLD_STORE_POOL,
@@ -59,3 +60,13 @@ def test_publication_retries_finish_before_the_next_slot_is_late(dagbag):
     assert task.retries == 3
     assert task.retry_exponential_backoff
     assert task.max_retry_delay <= timedelta(minutes=5)
+
+
+def test_blocked_cutoffs_wait_at_most_eight_minutes_and_then_publish_anyway(dagbag):
+    dag = dagbag.dags["gold_publish"]
+    sensor = dag.get_task("coverage_ready")
+    publish = dag.get_task("publish")
+    assert (sensor.poke_interval, sensor.timeout) == (60, 480)
+    assert (sensor.mode, sensor.soft_fail, sensor.retries) == ("reschedule", True, 0)
+    assert publish.upstream_task_ids == {"coverage_ready"}
+    assert publish.trigger_rule == "none_failed"

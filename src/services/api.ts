@@ -3,6 +3,7 @@ import type {
   Catalog,
   CustomerQualityQuery,
   CustomerQualityResponse,
+  GoldStatus,
   ProductionQualityScoreQuery,
   ProductionQualityScoreResponse,
 } from "@/types/api";
@@ -26,6 +27,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   getCatalog: () => request<Catalog>("/api/catalog"),
+  getGoldStatus: () => request<GoldStatus>("/api/gold/status"),
   queryCustomerQuality: (payload: CustomerQualityQuery) =>
     request<CustomerQualityResponse>("/api/customer-quality/query", {
       method: "POST",

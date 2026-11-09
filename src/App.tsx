@@ -2,13 +2,17 @@ import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 
 import { Header } from "@/components/Header";
-import { ProductionQualityScorePanel } from "@/components/quality-score";
+import {
+  CoverageNotice,
+  ProductionQualityScorePanel,
+} from "@/components/quality-score";
 import { api } from "@/services/api";
 import type {
   Catalog,
   CustomerQualityLabel,
   CustomerQualityResponse,
   FilterSelection,
+  GoldCoverage,
   ProductionCatalog,
   ProductionQualityScoreResponse,
   ScoreConfigOverride,
@@ -81,6 +85,7 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refreshWarning, setRefreshWarning] = useState<string | null>(null);
+  const [coverage, setCoverage] = useState<GoldCoverage[]>([]);
 
   useEffect(() => {
     void api
@@ -138,12 +143,12 @@ export default function App() {
   useEffect(() => {
     if (catalog?.source !== "gold") return;
     let active = true;
-    const timer = setInterval(() => {
-      void api
-        .getCatalog()
-        .then((next) => {
+    const refresh = () =>
+      void Promise.all([api.getCatalog(), api.getGoldStatus()])
+        .then(([next, status]) => {
           if (active) {
             setCatalog(next);
+            setCoverage(status.coverage ?? []);
             setRefreshWarning(null);
           }
         })
@@ -153,7 +158,8 @@ export default function App() {
               "No se ha podido comprobar una nueva publicación. Se conserva la última vista disponible.",
             );
         });
-    }, 30000);
+    refresh();
+    const timer = setInterval(refresh, 30000);
     return () => {
       active = false;
       clearInterval(timer);
@@ -298,6 +304,10 @@ export default function App() {
               }
               onToggleLine={toggleLine}
               onToggleProduction={toggleProduction}
+            />
+            <CoverageNotice
+              coverage={coverage}
+              productionIds={selection.production_ids}
             />
             <ProductionQualityScorePanel
               error={error}

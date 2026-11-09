@@ -1,7 +1,8 @@
 """Commands the Gold DAGs run. Pure functions, no Airflow imports, unit-tested.
 
-Industrial rules (cutoff lag, ten-minute step, continuous-source guard) live in
-the application (`app.gold.schedule`); DAGs only pass the scheduled moment.
+Industrial rules (ten-minute step, per-production coverage, continuous-source guard)
+live in the application (`app.gold.schedule`, `app.gold.coverage`); DAGs only pass
+the scheduled moment, which is the ceiling of the attempt.
 """
 
 from __future__ import annotations
@@ -32,6 +33,11 @@ def local_moment(moment: datetime, zone: tzinfo = PLANT_TIMEZONE) -> str:
 
 def publish_command(run_after: datetime) -> list[str]:
     return [GOLD_CLI, "publish", "--settings", SETTINGS, "--at", local_moment(run_after)]
+
+
+def coverage_command(run_after: datetime) -> list[str]:
+    """Read-only: can any production advance its cutoff with what Silver has published?"""
+    return [GOLD_CLI, "coverage", "--settings", SETTINGS, "--at", local_moment(run_after)]
 
 
 def backup_command(run_after: datetime, try_number: int) -> list[str]:

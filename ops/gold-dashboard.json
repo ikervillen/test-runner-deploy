@@ -208,6 +208,44 @@
         },
         "overrides": []
       }
+    },
+    {
+      "id": 8,
+      "title": "Cobertura: producciones bloqueadas y retraso máximo del corte",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 28,
+        "w": 24,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "fenix-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "Retraso máximo del corte (s)",
+          "expr": "calidad_gold_coverage_max_lag_seconds"
+        },
+        {
+          "refId": "B",
+          "legendFormat": "Producciones bloqueadas",
+          "expr": "calidad_gold_coverage_blocked_productions"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byFrameRefID", "options": "B"},
+            "properties": [{"id": "unit", "value": "none"}]
+          }
+        ]
+      }
     }
   ]
 }

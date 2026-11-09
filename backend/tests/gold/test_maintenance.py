@@ -127,12 +127,27 @@ def test_source_freshness_survives_unchanged_runs_and_is_exported(tmp_path):
         "published_at": "2026-11-06T14:00:00+00:00",
         "discovery_lag_seconds": {"CONT_ZC": 1800.0, "LISTA_RECH": 0.0},
     }
-    observed(tmp_path, lambda: {"status": "PUBLISHED", "publication_id": "one", "source": source})
+    coverage = {
+        "ceiling": "2026-11-06T15:00:00",
+        "blocked_productions": 2,
+        "max_lag_seconds": 1800.0,
+    }
+    observed(
+        tmp_path,
+        lambda: {
+            "status": "PUBLISHED",
+            "publication_id": "one",
+            "source": source,
+            "coverage": coverage,
+        },
+    )
     observed(tmp_path, lambda: {"status": "UNCHANGED", "publication_id": "one"})
     text = render(tmp_path)
     published = datetime(2026, 11, 6, 14, tzinfo=UTC).timestamp()
     assert f"calidad_gold_source_publication_timestamp_seconds {published}" in text
     assert 'calidad_gold_source_discovery_lag_seconds{family="CONT_ZC"} 1800.0' in text
+    assert "calidad_gold_coverage_blocked_productions 2" in text
+    assert "calidad_gold_coverage_max_lag_seconds 1800.0" in text
 
 
 def test_json_stream_handles_objects_split_across_small_blocks():

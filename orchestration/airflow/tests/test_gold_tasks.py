@@ -4,6 +4,7 @@ import pendulum
 import pytest
 from gold_tasks import (
     backup_command,
+    coverage_command,
     local_moment,
     maintain_command,
     publish_command,
@@ -39,6 +40,11 @@ def test_publish_passes_only_the_scheduled_moment():
         "--at",
         "2026-11-06T15:40:00",
     ]
+
+
+def test_coverage_check_asks_about_the_same_moment_it_will_publish():
+    moment = datetime(2026, 11, 6, 14, 40, tzinfo=UTC)
+    assert coverage_command(moment)[1:] == ["coverage", *publish_command(moment)[2:]]
 
 
 def test_each_backup_attempt_gets_a_new_destination():

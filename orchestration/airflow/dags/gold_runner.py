@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
+from typing import Any
 
 from airflow.sdk.exceptions import AirflowFailException
 from gold_tasks import PERMANENT_EXIT_CODES
@@ -20,6 +22,18 @@ def run_gold(argv: list[str]) -> None:
         process.kill()
         process.wait()
         raise
+    _check(argv, code)
+
+
+def gold_report(argv: list[str]) -> dict[str, Any]:
+    """Runs a read-only CLI command and returns its JSON; diagnostics still reach the log."""
+    completed = subprocess.run(argv, stdout=subprocess.PIPE, text=True)
+    print(completed.stdout, end="", flush=True)
+    _check(argv, completed.returncode)
+    return json.loads(completed.stdout)
+
+
+def _check(argv: list[str], code: int) -> None:
     if code in PERMANENT_EXIT_CODES:
         raise AirflowFailException(f"{argv[1]} rejected its input (exit {code}); not retrying")
     if code:

@@ -44,6 +44,7 @@ def _observed(output: Path, operation: Callable[[], dict[str, Any]]) -> dict[str
             pending_scopes=result.get("pending_scopes", state.get("pending_scopes", 0)),
             incremental=result.get("incremental", {}),
             source=result.get("source", state.get("source", {})),
+            coverage=result.get("coverage", state.get("coverage", {})),
         )
         return result
     finally:
@@ -107,6 +108,9 @@ def render(root: Path) -> str:
     scalars["calidad_gold_source_publication_timestamp_seconds"] = (
         datetime.fromisoformat(source["published_at"]).timestamp() if source else 0
     )
+    coverage = state.get("coverage") or {}
+    scalars["calidad_gold_coverage_blocked_productions"] = coverage.get("blocked_productions", 0)
+    scalars["calidad_gold_coverage_max_lag_seconds"] = coverage.get("max_lag_seconds", 0)
     lines = []
     for name, value in scalars.items():
         lines.extend(

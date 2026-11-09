@@ -61,7 +61,13 @@ def test_catalog_and_complete_score_use_only_pinned_gold(gold_api):
         "/api/customer-quality/query", json={"selection": payload()["selection"]}
     ).json()
     assert unknown["rows"][0]["label"] == "unknown"
-    assert client.get("/api/gold/status").status_code == 200
+    status = client.get("/api/gold/status")
+    assert status.status_code == 200
+    coverage = status.json()["coverage"]
+    assert [c["id_produccion"] for c in coverage] == [f"production-{n}" for n in range(4)]
+    assert {c["estado"] for c in coverage} == {"READY"}
+    assert coverage[3]["calculated_until"] == "2026-11-01T13:00:00"
+    assert coverage[3]["missing"] == []
 
 
 def test_custom_configuration_and_machine_filter_recalculate_without_writes(gold_api):

@@ -58,7 +58,9 @@ como destino del publicador o lector final sin el código compatible correspondi
 - Los filtros físicos afectan a MIA y se comunican como tales; A/R y ZC mantienen
   el ámbito de producción. Los filtros sin dimensión acreditada no se inventan.
 - `/api/customer-quality/query`: sin fuente actualizada, etiqueta `unknown`.
-- `/api/gold/status`: publicación y motivos de disponibilidad.
+- `/api/gold/status`: publicación, motivos de disponibilidad y, por producción
+  (`coverage`), hasta qué corte está calculada y qué familias de Silver faltan.
+  La interfaz lo muestra para las producciones seleccionadas que van por detrás.
 - `/api/ready`: integridad/compatibilidad del almacén, no aprobación industrial del score.
 
 Una revisión histórica persistida exige ámbito y motivo:
@@ -139,6 +141,18 @@ latido de la ingesta y `calidad_gold_source_discovery_lag_seconds{family}` el
 retraso de cada familia respecto a la más reciente. `CalidadGoldSourceStale` y
 `CalidadGoldSourceFamilyBehind` avisan a los 30 minutos; ajustar el umbral al
 ciclo real de la ingesta. Sin ellas, una ingesta parada se veía como `UNCHANGED`.
+
+Corte por cobertura (`DECISION_CORTE_POR_COBERTURA.md`): la hora de
+publicación es solo el techo; cada producción se calcula hasta el último corte
+de 10 minutos que todas sus familias acreditan. `python -m app.gold coverage
+--settings SETTINGS.json --at HORA_LOCAL` informa, sin escribir, de si Gold
+puede avanzar (`READY`), de si Silver cambió sin que ninguna producción avance
+(`BLOCKED`) o de si no hay nada nuevo (`NOTHING_NEW`), con el detalle por
+producción. `calidad_gold_coverage_blocked_productions` y
+`calidad_gold_coverage_max_lag_seconds` alimentan `CalidadGoldCoverageBehind`
+(30 min, aviso) y `CalidadGoldCoverageStalled` (60 min, crítico). Una ventana
+sin cobertura durante 24 horas pasa de `WAITING_DEPENDENCY` a `INCOMPLETE` y
+conserva en `reason_code` la familia que falta.
 
 `python -m app.gold inventory --root GOLD` inventaría versiones, archivos, tamaños
 y particiones. MIA utiliza un índice de periodo por

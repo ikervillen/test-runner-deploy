@@ -211,6 +211,23 @@ export interface ProductionQualityScoreResponse {
   };
 }
 
+/** How far Gold has calculated one production and which Silver families block it. */
+export interface GoldCoverage {
+  id_produccion: string;
+  origin: string | null;
+  estado: "READY" | "WAITING_DEPENDENCY" | "INCOMPLETE" | string;
+  calculated_until: string | null;
+  missing: string[];
+}
+
+export interface GoldStatus {
+  publication_id: string;
+  created_at: string;
+  states: Record<string, number>;
+  pending_reasons: Record<string, number>;
+  coverage: GoldCoverage[];
+}
+
 export interface ApiErrorResponse {
   error?: { code?: string; message?: string; request_id?: string };
 }

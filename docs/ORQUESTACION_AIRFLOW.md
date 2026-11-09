@@ -8,16 +8,27 @@ Airflow 3.4 sustituye al bucle `watch` como único escritor del almacén Gold.
 | | `watch` | Airflow |
 |---|---|---|
 | Disparo | Bucle cada `poll_seconds` | DAG `gold_publish` cada 10 min en hora de planta |
-| Corte | `industrial_cutoff(datetime.now())` | `industrial_cutoff(hora programada de la ejecución)` |
+| Techo del corte | `attempt_cutoff(datetime.now())` | `attempt_cutoff(hora programada de la ejecución)` |
+| Comprobación previa | No | Sensor `coverage_ready`: espera hasta 8 min si ninguna producción puede avanzar |
 | Reintentos | Siguiente vuelta del bucle | 3 con espera exponencial (máx. 5 min), solo en fallos transitorios |
 | Historial | `runs/*.json` en Gold | Además, cada ejecución con logs en la UI |
 | Repetir un corte | No | *Clear* de la ejecución: mismo corte, resultado `UNCHANGED` si nada cambió |
 | Backup y mantenimiento | Job externo `ops/backup-gold.ps1` | DAG `gold_nightly` 02:30: backup verificado y después compactación y VACUUM |
 | Ensayo de restauración | No | DAG `gold_restore_drill`, domingos 04:30 |
 
-La regla industrial (una hora de retraso, escalón de 10 minutos, fuente
-continua obligatoria) vive en `app.gold.schedule` y la comparten `watch` y
-`publish`. Los DAG solo pasan la hora programada.
+La regla industrial (escalón de 10 minutos, fuente continua obligatoria,
+corte por producción según la cobertura acreditada) vive en `app.gold.schedule`
+y `app.gold.coverage` y la comparten `watch` y `publish`. Los DAG solo pasan la
+hora programada, que es el techo del intento: cada producción se calcula hasta
+el último corte que Silver acredita (`docs/DECISION_CORTE_POR_COBERTURA.md`).
+
+`gold_publish` tiene dos tareas. `coverage_ready` ejecuta el comando de solo
+lectura `coverage` cada minuto, fuera del pool, hasta que alguna producción
+pueda avanzar o no haya nada nuevo; si todo el corte sigue bloqueado a los 8
+minutos, la espera se salta (`soft_fail`) y `publish` se ejecuta igualmente
+(`trigger_rule=none_failed`) para que el estado bloqueado quede registrado y
+las alertas `CalidadGoldCoverageBehind` (30 min) y `CalidadGoldCoverageStalled`
+(60 min) tengan datos.
 
 ## Arquitectura
 
@@ -134,7 +145,8 @@ antes de activar.
 - `orchestration/airflow/tests` (CI, job `airflow-dags`): importación de los
   DAG, pools conocidos, planificación en hora de planta, backup antes del
   mantenimiento y ejecución real con el *task runner* de Airflow contra un CLI
-  simulado, incluido que la salida 65 no se reintenta y la 75 sí.
+  simulado, incluido que la salida 65 no se reintenta, la 75 sí, y que un corte
+  bloqueado publica tras agotar la espera.
 - `compose-contract`: la combinación de ficheros es válida y `publisher` queda
   fuera.
 - `container-build`: construye la imagen.

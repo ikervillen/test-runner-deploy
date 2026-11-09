@@ -14,18 +14,18 @@ from .test_pipeline import calculation as calculation
 @pytest.mark.parametrize(
     ("moment", "cutoff"),
     [
-        (datetime(2026, 11, 6, 15, 40), datetime(2026, 11, 6, 14, 40)),
-        (datetime(2026, 11, 6, 15, 49, 59, 999), datetime(2026, 11, 6, 14, 40)),
-        (datetime(2026, 11, 6, 0, 5), datetime(2026, 11, 5, 23, 0)),
+        (datetime(2026, 11, 6, 15, 40), datetime(2026, 11, 6, 15, 40)),
+        (datetime(2026, 11, 6, 15, 49, 59, 999), datetime(2026, 11, 6, 15, 40)),
+        (datetime(2026, 11, 6, 0, 5), datetime(2026, 11, 6, 0, 0)),
     ],
 )
-def test_cutoff_is_one_hour_back_floored_to_ten_minutes(moment, cutoff):
-    assert schedule.industrial_cutoff(moment) == cutoff
+def test_attempt_ceiling_is_floored_to_ten_minutes_without_lag(moment, cutoff):
+    assert schedule.attempt_cutoff(moment) == cutoff
 
 
-def test_cutoff_rejects_aware_moments():
+def test_attempt_ceiling_rejects_aware_moments():
     with pytest.raises(IntegrityError, match="local industrial moment"):
-        schedule.industrial_cutoff(datetime(2026, 11, 6, 15, 40, tzinfo=UTC))
+        schedule.attempt_cutoff(datetime(2026, 11, 6, 15, 40, tzinfo=UTC))
 
 
 def test_publish_runs_one_idempotent_iteration(calculation, tmp_path, capsys, monkeypatch):
@@ -54,9 +54,24 @@ def test_publish_runs_one_idempotent_iteration(calculation, tmp_path, capsys, mo
         assert main(["publish", "--settings", str(settings_path), "--at", at.isoformat()]) == 0
         return json.loads(capsys.readouterr().out)
 
-    scheduled = CUTOFF + timedelta(hours=1)
-    first = publish(scheduled)
-    repeated = publish(scheduled + timedelta(minutes=9))
+    def coverage(at: datetime) -> dict:
+        assert main(["coverage", "--settings", str(settings_path), "--at", at.isoformat()]) == 0
+        return json.loads(capsys.readouterr().out)
+
+    before = coverage(CUTOFF)
+    first = publish(CUTOFF)
+    repeated = publish(CUTOFF + timedelta(minutes=9))
+    after = coverage(CUTOFF)
     assert (first["status"], repeated["status"]) == ("PUBLISHED", "UNCHANGED")
     assert first["source"] == repeated["source"]
     assert first["source"]["publication_id"] == snap.publication_id
+    assert first["coverage"] == {
+        "ceiling": CUTOFF.isoformat(),
+        "blocked_productions": 0,
+        "max_lag_seconds": 0,
+    }
+    assert (before["status"], before["gold_input_publication_id"]) == ("READY", None)
+    assert (after["status"], after["gold_input_publication_id"]) == (
+        "NOTHING_NEW",
+        snap.publication_id,
+    )

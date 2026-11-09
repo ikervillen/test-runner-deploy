@@ -53,6 +53,18 @@ groups:
         labels: {severity: warning}
         annotations:
           summary: "Sin mantenimiento Delta correcto en 48 horas: la lectura se irá degradando"
+      - alert: CalidadGoldCoverageBehind
+        expr: calidad_gold_coverage_max_lag_seconds > 1800
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Alguna producción lleva 30 minutos sin poder avanzar su corte: faltan fuentes en Silver"
+      - alert: CalidadGoldCoverageStalled
+        expr: calidad_gold_coverage_max_lag_seconds > 3600
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Alguna producción lleva 60 minutos bloqueada; Gold conserva su último resultado completo"
       - alert: CalidadGoldDataPending
         expr: calidad_gold_pending_scopes > 0
         for: 15m

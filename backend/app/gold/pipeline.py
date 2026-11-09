@@ -12,7 +12,16 @@ from typing import Any
 
 import portalocker
 
-from . import boundaries, catalogs, context, contracts, dimensional, facts, references
+from . import (
+    boundaries,
+    catalogs,
+    context,
+    contracts,
+    coverage,
+    dimensional,
+    facts,
+    references,
+)
 from .attribution import Attribution
 from .common import (
     IntegrityError,
@@ -23,6 +32,7 @@ from .common import (
     read_json,
     utc_now,
 )
+from .coverage import summary as coverage_summary
 from .fingerprint import source_fingerprint
 from .freshness import source_freshness
 from .incremental import Prepared
@@ -462,6 +472,11 @@ def build(
             r["id_produccion"]: r for r in old_tables.get("production_calculation_state", [])
         }
         previous_scores = {r["id_resultado"]: r for r in old_tables.get("quality_scores", [])}
+        previous_coverage = coverage.published_until(
+            _previous_tables(previous, max_rows_per_source, ("publication_scope_status",)).get(
+                "publication_scope_status", []
+            )
+        )
         prepared = Prepared(prods, tables, capacities, by_zc, previous_states, old_tables)
     with clock.stage("references"):
         rates = _closed_rates(snapshot, prods, prepared, cutoff, pending)
@@ -491,6 +506,19 @@ def build(
             )
             for key, name in zip(("sets", "members", "values"), REFERENCE_TABLES, strict=True):
                 tables.setdefault(name, []).extend(ref[key])
+            # The data decide how far this production is calculated; the moment is a ceiling.
+            scope_row, production_cutoff = coverage.production_scope(
+                p,
+                snapshot.manifest["coverage"],
+                ceiling=cutoff,
+                previous=previous_coverage.get(identity),
+                families=LIVE_FAMILIES,
+                evidence=snapshot.publication_id,
+                seen=last_discovery,
+            )
+            scope_rows.append(scope_row)
+            if production_cutoff is None:
+                continue
             scope_rows.extend(
                 _score_production(
                     p,
@@ -503,7 +531,7 @@ def build(
                     ref=ref,
                     config=config,
                     config_id=config_id,
-                    cutoff=cutoff,
+                    cutoff=production_cutoff,
                     calculation_time=calculation_time,
                     pending=pending,
                     preserve_closed=preserve_closed,
@@ -658,6 +686,7 @@ def _run(
             "pending_scopes": sum(r["estado"] != "READY" for r in coverage),
             "incremental": statistics,
             "source": source,
+            "coverage": coverage_summary(coverage, cutoff),
         }
 
 

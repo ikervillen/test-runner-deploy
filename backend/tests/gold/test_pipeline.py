@@ -376,7 +376,10 @@ def test_uncovered_inputs_and_resource_budget_never_produce_complete_scores(calc
         uncovered, bundle=bundle(), config=config, cutoff=CUTOFF, calculation_time=CUTOFF
     )
     assert tables["quality_scores"] == []
-    assert any("SOURCE_COVERAGE_PENDING" in (r["reason_code"] or "") for r in status)
+    blocked = [r for r in status if r["source"] == "coverage"]
+    assert len(blocked) == 4
+    assert all(r["estado"] == "WAITING_DEPENDENCY" and r["period_end"] is None for r in blocked)
+    assert blocked[0]["reason_code"] == "COVERAGE:CONT_ZC,LISTA_AR,LISTA_DEFECTOS,LISTA_RECH"
     with pytest.raises(IntegrityError, match="budget"):
         build(
             snap,
@@ -386,6 +389,71 @@ def test_uncovered_inputs_and_resource_budget_never_produce_complete_scores(calc
             calculation_time=CUTOFF,
             max_total_rows=1,
         )
+
+
+def covered(snap, until):
+    rows = [
+        {
+            "source": name,
+            "origin": "AV23",
+            "estado": "READY",
+            "covered_from": START - timedelta(hours=1),
+            "covered_until": until,
+        }
+        for name in ("LISTA_DEFECTOS", "LISTA_RECH", "LISTA_AR", "CONT_ZC")
+    ]
+    if until is None:
+        rows = [r for r in rows if r["source"] != "CONT_ZC"]
+    return Snapshot(snap.root, {**snap.manifest, "coverage": rows})
+
+
+def test_each_production_is_calculated_as_far_as_its_sources_accredit(calculation, tmp_path):
+    snap, config = calculation
+    root = tmp_path / "gold"
+    publisher = Publisher(root, environment="test", plant="AV")
+
+    def publish(until, previous):
+        tables, status = build(
+            covered(snap, until),
+            bundle=bundle(),
+            config=config,
+            cutoff=CUTOFF,
+            calculation_time=CUTOFF,
+            previous=previous,
+        )
+        # A real producer gives each coverage change its own Silver publication id.
+        publisher.publish(
+            covered(snap, until),
+            tables,
+            config_id=f"silver-{until}",
+            cutoff=CUTOFF.isoformat(),
+            coverage=[],
+        )
+        by_production = {r["id_produccion"]: r for r in status if r["source"] == "coverage"}
+        windows = [
+            r["period_end"]
+            for r in status
+            if r["source"] == "quality_scores" and r["id_produccion"] == "production-3"
+        ]
+        return by_production, max(windows)
+
+    half_past_twelve = START + timedelta(hours=6, minutes=34)
+    status, corte = publish(half_past_twelve, None)
+    assert status["production-2"]["estado"] == "READY"
+    assert status["production-3"]["estado"] == "WAITING_DEPENDENCY"
+    assert status["production-3"]["reason_code"] == "COVERAGE:INTERVAL"
+    assert status["production-3"]["period_end"] == START + timedelta(hours=6, minutes=30)
+    assert corte == START + timedelta(hours=6, minutes=30)
+
+    status, corte = publish(None, Snapshot.open(root))
+    assert status["production-3"]["reason_code"] == "COVERAGE:CONT_ZC"
+    assert status["production-3"]["period_end"] == START + timedelta(hours=6, minutes=30)
+    assert corte == START + timedelta(hours=6, minutes=30)
+
+    status, corte = publish(CUTOFF, Snapshot.open(root))
+    assert status["production-3"]["estado"] == "READY"
+    assert status["production-3"]["period_end"] == START + timedelta(hours=7)
+    assert corte == START + timedelta(hours=7)
 
 
 @pytest.mark.parametrize(
