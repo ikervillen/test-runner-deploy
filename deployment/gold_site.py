@@ -24,9 +24,12 @@ root = Path('/lake')
 gold = root / 'gold'
 paths = ('settings.json', 'catalogs.json', 'customer_score.json',
          'config/settings.json', 'config/catalogs.json', 'config/customer_score.json')
+pointer = gold / 'current.json'
 print(json.dumps({
     'gold_exists': gold.is_dir(),
-    'gold_publication': (gold / 'current.json').is_file(),
+    'gold_publication': pointer.is_file(),
+    'gold_publication_id': json.loads(pointer.read_text(encoding='utf-8'))['publication_id']
+                           if pointer.is_file() else None,
     'gold_config_files': [name for name in paths if (gold / name).is_file()],
     'silver_publication': (root / 'current.json').is_file(),
 }))

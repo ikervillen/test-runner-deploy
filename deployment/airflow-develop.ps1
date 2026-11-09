@@ -1,19 +1,25 @@
 param(
     [Parameter(Mandatory = $true)][string]$Site,
-    [Parameter(Mandatory = $true)][string]$GoldContext
+    [Parameter(Mandatory = $true)][string]$GoldContext,
+    [switch]$Activate
 )
 $ErrorActionPreference = 'Stop'
 $siteConfig = Get-Content -LiteralPath $Site -Raw | ConvertFrom-Json
 $context = $siteConfig.docker_context
 $root = (Resolve-Path -LiteralPath $GoldContext).Path
-$expectedRevision = 'aed67ba50aee8fd7251db412610c11a1ce179f73'
-if ((Get-Content -LiteralPath (Join-Path $root 'GOLD_REVISION') -Raw).Trim() -ne $expectedRevision) {
+$expectedRevision = $env:GOLD_SOURCE_COMMIT
+if ($expectedRevision -notmatch '^[a-f0-9]{40}$' -or
+    (Get-Content -LiteralPath (Join-Path $root 'GOLD_REVISION') -Raw).Trim() -ne $expectedRevision) {
     throw 'El contexto no corresponde a la revisión Gold esperada.'
 }
 
 # Recheck the volume identity and prepare the Airflow-owned volumes.
-python -m deployment.gold_site --site $Site
+$probe = python -m deployment.gold_site --site $Site | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0) { throw 'No se ha validado el volumen de develop.' }
+$probe | ConvertTo-Json -Compress
+if ($Activate -and -not $probe.silver_publication) {
+    throw 'El worker de develop aún no ha confirmado su primera publicación Silver.'
+}
 
 $env:INGESTA_DEVELOP_VOLUME = $siteConfig.environments.develop.volume
 $env:DOCKER_CONTEXT = $context
@@ -70,3 +76,64 @@ if ($LASTEXITCODE -ne 0) { throw 'Airflow no alcanzó su estado de arranque.' }
 if ($LASTEXITCODE -ne 0) { throw 'No se pudo inspeccionar la pila.' }
 python -m deployment.gold_site --site $Site --configure-from $root
 if ($LASTEXITCODE -ne 0) { throw 'Airflow arrancó, pero falta inicializar la configuración Gold.' }
+if (-not $Activate) { return }
+
+# Check Silver through the same mount and engine used by the DAG.
+& $composeExe @stack run --rm --no-deps --entrypoint /opt/calidad/.venv/bin/python `
+    -e PYTHONPATH=/opt/calidad/backend airflow-scheduler -c `
+    "from pathlib import Path; from app.gold.schedule import require_continuous_source; require_continuous_source(Path('/silver'))"
+if ($LASTEXITCODE -ne 0) { throw 'Silver aún no cumple el contrato de publicación continua.' }
+
+$running = @(& docker --context $context ps --quiet --filter "volume=$env:INGESTA_DEVELOP_VOLUME")
+if ($LASTEXITCODE -ne 0) { throw 'No se pudo comprobar la exclusividad del escritor Gold.' }
+$publishers = @()
+foreach ($id in $running) {
+    $container = (& docker --context $context container inspect $id | ConvertFrom-Json)[0]
+    if ($LASTEXITCODE -ne 0) { throw 'No se pudo comprobar un contenedor del volumen.' }
+    if (-not ($container.Mounts | Where-Object { $_.Destination -eq '/gold' -and $_.RW })) { continue }
+    $project = $container.Config.Labels.'com.docker.compose.project'
+    $service = $container.Config.Labels.'com.docker.compose.service'
+    if ($project -ne 'calidad-serie-develop' -or $service -notin @('publisher', 'airflow-scheduler')) {
+        throw "Otro escritor monta Gold: $id."
+    }
+    if ($service -eq 'publisher') { $publishers += $id }
+}
+foreach ($id in $publishers) {
+    & docker --context $context update --restart=no $id | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'No se pudo desactivar el reinicio de watch.' }
+    & docker --context $context kill --signal=SIGTERM $id | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'No se pudo detener watch de forma ordenada.' }
+    $stoppedBy = (Get-Date).AddMinutes(5)
+    do {
+        $state = & docker --context $context container inspect --format '{{.State.Running}}' $id
+        if ($LASTEXITCODE -ne 0) { throw 'No se pudo confirmar que watch se haya detenido.' }
+        if ($state -eq 'false') { break }
+        Start-Sleep -Seconds 5
+    } while ((Get-Date) -lt $stoppedBy)
+    if ($state -ne 'false') { throw 'Watch sigue activo. Airflow no tomará el volumen.' }
+}
+
+& $composeExe @stack up -d --no-build --wait --wait-timeout 180 airflow-scheduler
+if ($LASTEXITCODE -ne 0) { throw 'El scheduler no alcanzó un estado sano.' }
+
+$publishBy = (Get-Date).AddMinutes(15)
+do {
+    $published = python -m deployment.gold_site --site $Site | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0) { throw 'No se pudo comprobar la publicación Gold.' }
+    if ($published.gold_publication_id -and $published.gold_publication_id -ne $probe.gold_publication_id) { break }
+    Start-Sleep -Seconds 20
+} while ((Get-Date) -lt $publishBy)
+if (-not $published.gold_publication_id -or $published.gold_publication_id -eq $probe.gold_publication_id) {
+    throw 'Airflow aún no ha promovido una publicación Gold nueva.'
+}
+
+& $composeExe @stack run --rm --no-deps --entrypoint calidad-gold airflow-scheduler validate-gold --root /gold
+if ($LASTEXITCODE -ne 0) { throw 'La publicación no supera el contrato Gold.' }
+& $composeExe @stack up -d --no-build --wait --wait-timeout 180 backend frontend
+if ($LASTEXITCODE -ne 0) { throw 'La aplicación no alcanzó un estado sano.' }
+$frontendPort = if ($env:FRONTEND_PORT) { $env:FRONTEND_PORT } else { '5174' }
+$catalog = Invoke-RestMethod -Uri "http://127.0.0.1:$frontendPort/api/catalog" -TimeoutSec 20
+if ($catalog.source -ne 'gold' -or -not $catalog.publication_id) {
+    throw 'La aplicación no está leyendo el catálogo Gold.'
+}
+Write-Output "Aplicación Gold verificada. Publicación: $($catalog.publication_id)"

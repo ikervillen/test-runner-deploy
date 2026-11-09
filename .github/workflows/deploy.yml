@@ -7,7 +7,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [validate, diagnose, gold-prepare, gold-airflow, docker-inventory, docker-cleanup, rollback, inspect, compact, trial, reformulate, rebuild-index, compact-associations, release-tested-onprem]
+        options: [validate, diagnose, gold-prepare, gold-airflow, gold-activate, docker-inventory, docker-cleanup, rollback, inspect, compact, trial, reformulate, rebuild-index, compact-associations, release-tested-onprem]
         default: validate
         description: 'validate: CI/imagen; diagnose: Docker/montaje; docker-inventory: recursos de develop; rollback: release previa'
       validated_run:
@@ -23,8 +23,8 @@ permissions:
   contents: read
 
 env:
-  GOLD_CONTEXT_COMMIT: 34dd9de6f399e1b08fcc028de70626b17d711f08
-  GOLD_SOURCE_COMMIT: aed67ba50aee8fd7251db412610c11a1ce179f73
+  GOLD_CONTEXT_COMMIT: 22ea4874d751e3fe20012be895acb757560d8612
+  GOLD_SOURCE_COMMIT: 29622d5f54302ba44c9bf5cc7641f175b3d59483
 
 jobs:
   control-maintenance:
@@ -284,10 +284,13 @@ jobs:
           python -m deployment.gold_site --site $site
 
   gold-airflow:
-    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'gold-airflow' && github.ref == 'refs/heads/develop'
+    if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["gold-airflow","gold-activate"]'), inputs.operation) && github.ref == 'refs/heads/develop'
     runs-on: ${{ fromJSON(vars.INGESTA_RUNNER_LABELS || '["self-hosted","Windows","X64"]') }}
     environment: develop
-    timeout-minutes: 35
+    concurrency:
+      group: gold-develop-${{ github.repository }}
+      cancel-in-progress: false
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -307,6 +310,7 @@ jobs:
           AIRFLOW_ADMIN_PASSWORD: ${{ secrets.GOLD_AIRFLOW_ADMIN_PASSWORD }}
           GOLD_CATALOGS_GZIP_B64: ${{ secrets.GOLD_CATALOGS_GZIP_B64 }}
           GOLD_CONTEXT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOLD_OPERATION: ${{ inputs.operation }}
           DOCKER_BUILDKIT: '1'
         run: |
           $site = ./scripts/prepare_site.ps1 -Repository $env:GITHUB_REPOSITORY `
@@ -315,7 +319,7 @@ jobs:
           $contextPath = Join-Path $env:RUNNER_TEMP "gold-${{ github.run_id }}-${{ github.run_attempt }}"
           python -m deployment.gold_context $contextPath
           if ($LASTEXITCODE -ne 0) { throw 'No se pudo obtener el contexto fijado.' }
-          ./deployment/airflow-develop.ps1 -Site $site -GoldContext $contextPath
+          ./deployment/airflow-develop.ps1 -Site $site -GoldContext $contextPath -Activate:($env:GOLD_OPERATION -eq 'gold-activate')
 
   diagnose:
     if: github.event_name == 'workflow_dispatch' && inputs.operation == 'diagnose'
