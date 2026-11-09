@@ -11,12 +11,17 @@ from datetime import datetime
 from pathlib import Path
 
 from .coverage import SCOPE_PREFIX, production_scope, published_until
+from .live_scope import LiveScope
 from .pipeline import LIVE_FAMILIES
 from .publications import Snapshot, envelope
 
 
-def report(input_root: Path, output_root: Path, ceiling: datetime) -> dict:
+def report(
+    input_root: Path, output_root: Path, ceiling: datetime, *, scope: LiveScope | None = None
+) -> dict:
     silver = Snapshot.open(input_root)
+    if scope:
+        silver = scope.coverage_view(silver)
     if not (output_root / "current.json").exists():
         return _result("READY", ceiling, silver.publication_id, None, [])
     gold = Snapshot.open(output_root, require_gold_contract=True)

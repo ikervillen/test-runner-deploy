@@ -36,6 +36,7 @@ from .coverage import summary as coverage_summary
 from .fingerprint import source_fingerprint
 from .freshness import source_freshness
 from .incremental import Prepared
+from .live_scope import LiveScope
 from .metrics import Window, ar_bases, live_windows, production_windows, zc_bases
 from .publications import Publisher, Snapshot
 from .schemas import KEYS, make_table
@@ -138,10 +139,18 @@ class _Stopwatch:
 class _SourceReader:
     """Bounded reads of one input publication; the total budget covers every table."""
 
-    def __init__(self, snapshot: Snapshot, *, max_rows_per_source: int, max_total_rows: int):
+    def __init__(
+        self,
+        snapshot: Snapshot,
+        *,
+        max_rows_per_source: int,
+        max_total_rows: int,
+        scope: LiveScope | None = None,
+    ):
         self.snapshot = snapshot
         self.max_rows_per_source = max_rows_per_source
         self.max_total_rows = max_total_rows
+        self.scope = scope
         self.seen_rows = 0
         self._cache: dict[str, list[dict]] = {}
         self._names = {r["name"] for r in snapshot.manifest["tables"]}
@@ -155,12 +164,27 @@ class _SourceReader:
         if name not in self._cache:
             if name not in self._names and optional:
                 return []
-            self._cache[name] = self.snapshot.rows(name, max_rows=self.max_rows_per_source)
+            if self.scope and name in LIVE_FAMILIES:
+                self._cache[name] = [
+                    row for batch in self.batches(name) for row in batch.to_pylist()
+                ]
+                return self._cache[name]
+            if self.scope and name == "observation_assignments":
+                self._cache[name] = self.scope.assignments(
+                    self.snapshot, self.max_rows_per_source, self.max_total_rows
+                )
+            else:
+                self._cache[name] = self.snapshot.rows(name, max_rows=self.max_rows_per_source)
             self.count(len(self._cache[name]))
         return self._cache[name]
 
     def batches(self, name: str):
-        for batch in self.snapshot.batches(name, max_rows=self.max_rows_per_source):
+        batches = (
+            self.scope.batches(self.snapshot, name, self.max_rows_per_source)
+            if self.scope and name in LIVE_FAMILIES
+            else self.snapshot.batches(name, max_rows=self.max_rows_per_source)
+        )
+        for batch in batches:
             self.count(batch.num_rows)
             yield batch
 
@@ -445,13 +469,21 @@ def build(
     previous: Snapshot | None = None,
     statistics: dict | None = None,
     recalculate_closed_ids: set[str] | None = None,
+    scope: LiveScope | None = None,
 ) -> tuple[dict[str, list[dict]], list[dict]]:
     """A bounded local scope. Larger snapshots must be split, never silently truncated."""
     validate_config(config)
     recalculate_closed_ids = recalculate_closed_ids or set()
+    if scope:
+        if cutoff <= scope.start:
+            raise IntegrityError("Gold cutoff must follow the scoped start")
+        snapshot = scope.coverage_view(snapshot)
     clock = _Stopwatch()
     reader = _SourceReader(
-        snapshot, max_rows_per_source=max_rows_per_source, max_total_rows=max_total_rows
+        snapshot,
+        max_rows_per_source=max_rows_per_source,
+        max_total_rows=max_total_rows,
+        scope=scope,
     )
     last_discovery = _last_discovery(snapshot)
 
@@ -579,6 +611,7 @@ def _run(
     failpoint=None,
     recalculate_closed_ids=None,
     recalculation_reason=None,
+    scope: LiveScope | None = None,
 ) -> dict:
     input_root, output_root = input_root.resolve(strict=True), output_root.resolve()
     if (
@@ -597,13 +630,28 @@ def _run(
     ):
         raise IntegrityError("Historical recalculation requires explicit productions and a reason")
     with portalocker.Lock(output_root / "pipeline.lock", timeout=0):
+        scope_path = output_root / "source-scope.json"
+        scope_config = None
+        if scope:
+            scope_config = {"start": scope.start.isoformat()}
+            if scope.end is not None:
+                scope_config["end"] = scope.end.isoformat()
+        if scope_path.exists():
+            if read_json(scope_path) != scope_config:
+                raise IntegrityError("Use an independent Gold store when changing the source scope")
+        elif scope_config:
+            if (output_root / "current.json").exists():
+                raise IntegrityError("Use an independent Gold store when enabling a source scope")
+            immutable_json(scope_path, scope_config)
         snap = Snapshot.open(input_root)
         code_id = digest([source_fingerprint(__name__), ("python", platform.python_version())])
         immutable_json(
             output_root / "configs" / f"{digest([config, bundle])}.json",
             {"schema_id": "quality-effective-config-v1", "score": config, "catalogs": bundle},
         )
-        work_id = digest([snap.publication_id, bundle, config, cutoff, code_id, recalculation])
+        work_id = digest(
+            [snap.publication_id, bundle, config, cutoff, code_id, recalculation, scope_config]
+        )
         state_path = output_root / "runs" / f"{work_id}.json"
         if state_path.exists():
             state = read_json(state_path)
@@ -643,9 +691,10 @@ def _run(
             max_total_rows=max_total_rows,
             statistics=statistics,
             recalculate_closed_ids=set(recalculate_closed_ids or []),
+            scope=scope,
         )
         # Bounded first snapshot; the writer also supports explicit per-scope replacement.
-        publication_config = digest([bundle, config, code_id, recalculation])
+        publication_config = digest([bundle, config, code_id, recalculation, scope_config])
         publication_id = digest(
             ["gold-v1", snap.publication_id, publication_config, cutoff.isoformat(), {}]
         )

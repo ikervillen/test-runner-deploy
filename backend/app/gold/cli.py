@@ -185,8 +185,19 @@ def main(argv=None):
                 "max_rows_per_source",
                 "max_total_rows",
             }
-            if set(settings) != required or settings["schema_id"] != "gold-settings-v1":
+            if (
+                set(settings) - {"source_scope_start"} != required
+                or settings["schema_id"] != "gold-settings-v1"
+            ):
                 raise IntegrityError("Settings must match gold-settings-v1 exactly")
+            scope = None
+            if "source_scope_start" in settings:
+                from .live_scope import LiveScope
+
+                try:
+                    scope = LiveScope(datetime.fromisoformat(settings["source_scope_start"]))
+                except (TypeError, ValueError) as exc:
+                    raise IntegrityError("Gold source scope must be a local ISO datetime") from exc
             if not 1 <= settings["poll_seconds"] <= 3600:
                 raise IntegrityError("Invalid poll interval")
             for name in ("max_rows_per_source", "max_total_rows"):
@@ -214,6 +225,7 @@ def main(argv=None):
                     max_total_rows=settings["max_total_rows"],
                     recalculate_closed_ids=getattr(args, "recalculate_closed", []),
                     recalculation_reason=getattr(args, "reason", None),
+                    scope=scope,
                 )
 
             if args.command == "build":
@@ -241,6 +253,7 @@ def main(argv=None):
                         configured("input_root"),
                         configured("output_root"),
                         attempt_cutoff(datetime.fromisoformat(args.at)),
+                        scope=scope,
                     )
                 elif args.command == "publish":
                     result = execute(attempt_cutoff(datetime.fromisoformat(args.at)))

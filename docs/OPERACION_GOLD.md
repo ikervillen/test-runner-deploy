@@ -216,3 +216,16 @@ conciliar scores industriales completos; host, permisos y presupuesto real de
 contenedores; construcción de imágenes con Docker; proxy/identidad corporativos;
 destino independiente, RPO/RTO y activación de supervisión. La implementación de
 código y las pruebas locales no sustituyen esas comprobaciones.
+## Validación con un periodo acotado
+
+Para comprobar Gold con una Silver de gran tamaño, `source_scope_start` en
+`gold-settings-v1` acepta una fecha y hora industrial local en formato ISO.
+El publicador conserva la versión de Silver y lee las observaciones del periodo
+por lotes. Mantiene los avisos abiertos o que se solapan con el inicio. Las
+atribuciones se seleccionan por la identidad de esas observaciones y mantienen
+los límites de filas por fuente y totales.
+
+Configurar el periodo en un almacén Gold independiente o antes de su primera
+publicación. La configuración queda fijada en `source-scope.json` y se expone en
+`/api/gold/status`. Las ventanas que empiezan antes del ámbito requieren otra
+publicación con la cobertura correspondiente para poder evaluarse completas.

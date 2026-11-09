@@ -21,6 +21,7 @@ from app.infrastructure.operations import ScoreQueryExecutor
 from app.schemas.api import CatalogResponse
 from app.schemas.customer_quality import CustomerQualityRequest, CustomerQualityResponse
 
+from .common import read_json
 from .coverage import coverage_status
 from .service import GoldService
 
@@ -96,6 +97,7 @@ def create_gold_app(settings: Settings) -> FastAPI:
         def read() -> dict[str, Any]:
             q = service.query()
             rows = q.rows("publication_scope_status")
+            scope_path = settings.resolved_gold_root / "source-scope.json"
             return {
                 "publication_id": q.snapshot.publication_id,
                 "created_at": q.snapshot.manifest["created_at"],
@@ -104,6 +106,7 @@ def create_gold_app(settings: Settings) -> FastAPI:
                     Counter(r["reason_code"] for r in rows if r["reason_code"])
                 ),
                 "coverage": coverage_status(rows),
+                **({"source_scope": read_json(scope_path)} if scope_path.is_file() else {}),
             }
 
         return await asyncio.to_thread(read)
