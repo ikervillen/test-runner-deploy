@@ -2,6 +2,12 @@ name: Ingesta Delta Lake
 on:
   push:
     branches: [main, develop]
+    paths-ignore:
+      # Airflow and Gold orchestration. The ingestion worker image does not contain these files.
+      - .github/workflows/deploy.yml
+      - deployment/airflow-develop.ps1
+      - deployment/gold_site.py
+      - deployment/compose.gold.develop.yaml
   pull_request:
   workflow_dispatch:
     inputs:
@@ -299,10 +305,10 @@ jobs:
     concurrency:
       group: gold-develop-${{ github.repository }}
       cancel-in-progress: false
-    timeout-minutes: 75
+    timeout-minutes: 1080
     env:
-      GOLD_CONTEXT_COMMIT: dd221b9290a9b786bb6abf0866500b8b08000890
-      GOLD_SOURCE_COMMIT: 181d42890f742a88ead56042426f406196a2c458
+      GOLD_CONTEXT_COMMIT: 90123fcfe1745f4dcad4804c17b0d5b0459d0638
+      GOLD_SOURCE_COMMIT: d60d3f513f7b4cf87a1d6dca4408046fff715986
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

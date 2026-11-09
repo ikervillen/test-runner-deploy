@@ -185,7 +185,7 @@ foreach ($id in $publishers) {
 & $composeExe @stack up -d --no-build --wait --wait-timeout 300 airflow-scheduler
 if ($LASTEXITCODE -ne 0) { throw 'El scheduler no alcanzó un estado sano.' }
 
-$publishBy = (Get-Date).AddMinutes(25)
+$publishBy = (Get-Date).AddHours(16)
 do {
     $published = python -m deployment.gold_site --site $Site | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'No se pudo comprobar la publicación Gold.' }
