@@ -266,6 +266,29 @@ def calculation(tmp_path):
     return snap, config
 
 
+def test_two_workers_publish_the_same_tables_as_one(calculation, monkeypatch):
+    snap, config = calculation
+    monkeypatch.setenv("GOLD_SCORE_WORKERS", "1")
+    single, single_status = build(
+        snap, bundle=bundle(), config=config, cutoff=CUTOFF, calculation_time=CUTOFF
+    )
+    monkeypatch.setenv("GOLD_SCORE_WORKERS", "2")
+    statistics: dict = {}
+    parallel, parallel_status = build(
+        snap,
+        bundle=bundle(),
+        config=config,
+        cutoff=CUTOFF,
+        calculation_time=CUTOFF,
+        statistics=statistics,
+    )
+    assert statistics["score_workers"] == 2
+    assert parallel_status == single_status
+    assert set(parallel) == set(single)
+    for name in single:
+        assert parallel[name] == single[name]
+
+
 def test_complete_calculation_publishes_joinable_star_and_full_score(calculation, tmp_path):
     snap, config = calculation
     tables, status = build(
