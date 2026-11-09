@@ -19,7 +19,9 @@ do {
     $probe = python -m deployment.gold_site --site $Site | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'No se ha validado el volumen de develop.' }
     if (-not $Activate -or $probe.silver_publication) { break }
-    Write-Output "Esperando Silver confirmada del worker. Estado del exportador: $($probe.silver_export.status)"
+    $exportStatus = if ($probe.silver_export.status) { $probe.silver_export.status } else { 'SIN_RESULTADO' }
+    $families = @($probe.worker_heartbeat.workers | ForEach-Object { $_.family }) -join ', '
+    Write-Output "Esperando Silver confirmada. Exportador=$exportStatus; worker=$($probe.worker_heartbeat.phase); familias=$families"
     Start-Sleep -Seconds 30
 } while ((Get-Date) -lt $silverBy)
 $probe | ConvertTo-Json -Compress

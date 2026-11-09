@@ -134,6 +134,23 @@ def prepare(site, *, enable_export=False):
             PROBE,
         )
     )
+    heartbeat = docker.call(
+        "exec",
+        active["container"],
+        "python",
+        "-m",
+        "ingesta_delta_lake.runtime",
+        "health",
+        optional=True,
+        timeout=15,
+    )
+    if heartbeat:
+        report = json.loads(heartbeat)
+        probe["worker_heartbeat"] = {
+            key: report[key] for key in ("time", "phase", "family", "workers") if key in report
+        }
+    else:
+        probe["worker_heartbeat"] = {"phase": "UNAVAILABLE"}
     logs = docker.call("logs", "--tail", 300, active["container"], optional=True) or ""
     export_events = []
     for line in logs.splitlines():
