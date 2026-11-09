@@ -129,6 +129,30 @@ def deployer(site, motor, branch="main"):
     return Deployment(site, branch, motor, head=lambda *_: motor.latest)
 
 
+@pytest.mark.parametrize("branch", ["develop", "main"])
+def test_gold_image_activates_export_only_in_develop(site, motor, monkeypatch, branch):
+    controller = deployer(site, motor, branch)
+    original = motor.json
+
+    def with_gold_label(*args):
+        result = original(*args)
+        if args[:2] == ("image", "inspect"):
+            result[0]["Config"]["Labels"]["es.fenix.ingesta.gold.revision"] = "c" * 40
+        return result
+
+    monkeypatch.setattr(motor, "json", with_gold_label)
+    if branch == "main":
+        with pytest.raises(RuntimeError, match="exige develop"):
+            controller.deploy(IMAGE1, SHA1, "run")
+        assert not motor.containers
+        return
+
+    release = controller.deploy(IMAGE1, SHA1, "run")["release"]
+    assert release["gold_revision"] == "c" * 40
+    assert "INGESTA_GOLD_EXPORT=1" in common_args(release)
+    assert any("INGESTA_GOLD_EXPORT=1" in event and "self-test" in event for event in motor.events)
+
+
 def test_two_branches_have_independent_worker_volumes_and_descriptors(site, motor):
     for branch in ("main", "develop"):
         result = deployer(site, motor, branch).deploy(IMAGE1, SHA1, "https://github.com/run/1")
