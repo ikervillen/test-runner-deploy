@@ -7,7 +7,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [validate, diagnose, gold-prepare, gold-enable-export, gold-airflow, gold-activate, docker-inventory, docker-cleanup, rollback, inspect, compact, trial, reformulate, rebuild-index, compact-associations, release-tested-onprem]
+        options: [validate, diagnose, gold-prepare, gold-enable-export, gold-airflow-status, gold-airflow, gold-activate, docker-inventory, docker-cleanup, rollback, inspect, compact, trial, reformulate, rebuild-index, compact-associations, release-tested-onprem]
         default: validate
         description: 'validate: CI/imagen; diagnose: Docker/montaje; docker-inventory: recursos de develop; rollback: release previa'
       validated_run:
@@ -260,7 +260,7 @@ jobs:
           python @arguments
 
   gold-prepare:
-    if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["gold-prepare","gold-enable-export"]'), inputs.operation) && github.ref == 'refs/heads/develop'
+    if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["gold-prepare","gold-enable-export","gold-airflow-status"]'), inputs.operation) && github.ref == 'refs/heads/develop'
     runs-on: ${{ fromJSON(vars.INGESTA_RUNNER_LABELS || '["self-hosted","Windows","X64"]') }}
     environment: develop
     timeout-minutes: 10
@@ -284,6 +284,7 @@ jobs:
             -InputBind $env:INPUT_BIND -DockerContext $env:DOCKER_CONTEXT_NAME
           $arguments = @('-m', 'deployment.gold_site', '--site', $site)
           if ($env:GOLD_OPERATION -eq 'gold-enable-export') { $arguments += '--enable-export' }
+          if ($env:GOLD_OPERATION -eq 'gold-airflow-status') { $arguments += '--airflow-status' }
           python @arguments
 
   gold-airflow:

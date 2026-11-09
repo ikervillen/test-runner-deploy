@@ -5,6 +5,7 @@ import base64
 import gzip
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -234,11 +235,29 @@ def main():
     parser.add_argument("--site", type=Path, required=True)
     parser.add_argument("--configure-from", type=Path)
     parser.add_argument("--enable-export", action="store_true")
+    parser.add_argument("--airflow-status", action="store_true")
     args = parser.parse_args()
     site = load_site(args.site)
     report = prepare(site, enable_export=args.enable_export)
     if args.configure_from:
         report.update(configure(site, report, args.configure_from))
+    if args.airflow_status:
+        docker = Docker(site["docker_context"])
+        name = f"{PROJECT}-airflow-dag-processor-1"
+        report["dag_processor"] = docker.json(
+            "container", "inspect", "--format", "{{json .State}}", name
+        )
+        logs = subprocess.run(
+            ["docker", "--context", docker.context, "logs", "--tail", "30", name],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=20,
+            check=True,
+        )
+        report["dag_processor_logs"] = re.sub(
+            r"(://[^:/\s]+:)[^@\s]+@", r"\1***@", (logs.stdout + logs.stderr)[-8000:]
+        )
     print(json.dumps(report, sort_keys=True))
 
 
