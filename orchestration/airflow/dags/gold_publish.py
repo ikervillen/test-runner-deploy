@@ -18,6 +18,9 @@ from gold_tasks import GOLD_STORE_POOL, PLANT_TIMEZONE, coverage_command, publis
 
 COVERAGE_POKE = timedelta(minutes=1)
 COVERAGE_WAIT = timedelta(minutes=8)
+# The first pass reads the whole confirmed Silver history. Later passes reuse
+# closed productions. One long attempt must be able to finish overnight.
+FIRST_PASS_LIMIT = timedelta(hours=16)
 
 with DAG(
     dag_id="gold_publish",
@@ -26,7 +29,7 @@ with DAG(
     start_date=pendulum.datetime(2026, 11, 1, tz=PLANT_TIMEZONE),
     catchup=False,
     max_active_runs=1,
-    dagrun_timeout=timedelta(minutes=30),
+    dagrun_timeout=FIRST_PASS_LIMIT,
     is_paused_upon_creation=False,
     default_args={
         "owner": "data-engineering",
@@ -52,7 +55,12 @@ with DAG(
         print(f"coverage {report['status']}; blocked: {report['blocked_productions']}")
         return report["status"] != "BLOCKED"
 
-    @task(pool=GOLD_STORE_POOL, trigger_rule="none_failed")
+    @task(
+        pool=GOLD_STORE_POOL,
+        trigger_rule="none_failed",
+        execution_timeout=FIRST_PASS_LIMIT,
+        retries=0,
+    )
     def publish(dag_run=None) -> None:
         """Clearing a run republishes its own cutoff: the moment is the run's, not now."""
         run_gold(publish_command(dag_run.run_after))
