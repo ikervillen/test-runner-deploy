@@ -22,6 +22,10 @@ on:
 permissions:
   contents: read
 
+env:
+  GOLD_CONTEXT_COMMIT: 34dd9de6f399e1b08fcc028de70626b17d711f08
+  GOLD_SOURCE_COMMIT: aed67ba50aee8fd7251db412610c11a1ce179f73
+
 jobs:
   control-maintenance:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop' && contains(fromJSON('["inspect","compact","trial","reformulate","rebuild-index","compact-associations"]'), inputs.operation)
@@ -72,6 +76,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.ref == 'refs/heads/develop'
+        with:
+          ref: ${{ env.GOLD_CONTEXT_COMMIT }}
+          path: .gold-context
+          persist-credentials: false
       - name: Build the immutable candidate
         id: candidate
         shell: bash
@@ -80,10 +90,21 @@ jobs:
           image="ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA}"
           echo "CANDIDATE=$image" >> "$GITHUB_ENV"
           echo "image=$image" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/heads/develop ]]; then
+            test "$(cat .gold-context/GOLD_REVISION)" = "$GOLD_SOURCE_COMMIT"
+            echo "dockerfile=Dockerfile.gold-export" >> "$GITHUB_OUTPUT"
+            echo "contexts=quality=.gold-context" >> "$GITHUB_OUTPUT"
+            echo "INGESTA_GOLD_EXPORT=1" >> "$GITHUB_ENV"
+          else
+            echo "dockerfile=Dockerfile" >> "$GITHUB_OUTPUT"
+            echo "INGESTA_GOLD_EXPORT=0" >> "$GITHUB_ENV"
+          fi
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
+          file: ${{ steps.candidate.outputs.dockerfile }}
+          build-contexts: ${{ steps.candidate.outputs.contexts }}
           platforms: linux/amd64
           load: true
           push: false
@@ -92,6 +113,7 @@ jobs:
             REVISION=${{ github.sha }}
             SOURCE=${{ github.server_url }}/${{ github.repository }}
             BRANCH=${{ github.ref_name }}
+            GOLD_REVISION=${{ env.GOLD_SOURCE_COMMIT }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Exercise the final image without operational mounts
@@ -101,6 +123,7 @@ jobs:
           mkdir -p release
           docker run --rm --network none --read-only --cap-drop ALL \
             --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,size=512m \
+            --env INGESTA_GOLD_EXPORT \
             "$CANDIDATE" self-test | tee release/image-tests.json
           docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,size=64m \
             "$CANDIDATE" describe > release/contracts.json
@@ -269,11 +292,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: 34dd9de6f399e1b08fcc028de70626b17d711f08
-          path: .gold-context
-          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.12'
@@ -287,12 +305,16 @@ jobs:
           AIRFLOW_FERNET_KEY: ${{ secrets.GOLD_AIRFLOW_FERNET_KEY }}
           AIRFLOW_JWT_SECRET: ${{ secrets.GOLD_AIRFLOW_JWT_SECRET }}
           AIRFLOW_ADMIN_PASSWORD: ${{ secrets.GOLD_AIRFLOW_ADMIN_PASSWORD }}
+          GOLD_CONTEXT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DOCKER_BUILDKIT: '1'
         run: |
           $site = ./scripts/prepare_site.ps1 -Repository $env:GITHUB_REPOSITORY `
             -Branch develop -SitePath $env:DEPLOY_SITE `
             -InputBind $env:INPUT_BIND -DockerContext $env:DOCKER_CONTEXT_NAME
-          ./deployment/airflow-develop.ps1 -Site $site -GoldContext .gold-context
+          $contextPath = Join-Path $env:RUNNER_TEMP "gold-${{ github.run_id }}-${{ github.run_attempt }}"
+          python -m deployment.gold_context $contextPath
+          if ($LASTEXITCODE -ne 0) { throw 'No se pudo obtener el contexto fijado.' }
+          ./deployment/airflow-develop.ps1 -Site $site -GoldContext $contextPath
 
   diagnose:
     if: github.event_name == 'workflow_dispatch' && inputs.operation == 'diagnose'
@@ -371,6 +393,8 @@ jobs:
       - name: Build and exercise the exact tested source without operational mounts
         id: image
         shell: powershell
+        env:
+          GOLD_CONTEXT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
           $image = "ghcr.io/$($env:GITHUB_REPOSITORY.ToLower()):sha-$env:REVISION"
@@ -381,9 +405,12 @@ jobs:
           )
           $buildx = $buildxCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
           if (-not $buildx) { throw 'Docker Desktop BuildKit plugin is unavailable' }
-          & $buildx build --load --platform linux/amd64 --provenance=false --build-arg "REVISION=$env:REVISION" --build-arg "SOURCE=https://github.com/$env:GITHUB_REPOSITORY" --build-arg 'BRANCH=develop' -t $image .
+          $goldContext = Join-Path $env:RUNNER_TEMP "gold-${{ github.run_id }}-${{ github.run_attempt }}"
+          python -m deployment.gold_context $goldContext
+          if ($LASTEXITCODE -ne 0) { throw 'Gold context identity differs' }
+          & $buildx build --load --platform linux/amd64 --provenance=false --build-arg "REVISION=$env:REVISION" --build-arg "SOURCE=https://github.com/$env:GITHUB_REPOSITORY" --build-arg 'BRANCH=develop' --build-arg "GOLD_REVISION=$env:GOLD_SOURCE_COMMIT" --build-context "quality=$goldContext" -f Dockerfile.gold-export -t $image .
           if ($LASTEXITCODE -ne 0) { throw 'Image build failed' }
-          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,size=512m $image self-test
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,size=512m --env INGESTA_GOLD_EXPORT=1 $image self-test
           if ($LASTEXITCODE -ne 0) { throw 'Final image self-test failed' }
           $originalConfig = $env:DOCKER_CONFIG
           $buildContext = docker context show
