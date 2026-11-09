@@ -84,6 +84,32 @@ if not (gold / 'current.json').exists():
     gold.chmod(0o750)
 """
 
+READ_GOLD_TASKS = """
+import json
+from pathlib import Path
+
+paths = (Path('/logs') / 'dag_id=gold_publish').glob('run_id=*/task_id=publish/attempt=*.log')
+for path in sorted(paths, key=lambda item: item.stat().st_mtime)[-2:]:
+    with path.open('rb') as stream:
+        stream.seek(max(0, path.stat().st_size - 8192))
+        lines = stream.read().decode('utf-8', 'replace').splitlines()
+    print(json.dumps({'task': str(path.relative_to('/logs')), 'tail': lines[-18:]}))
+"""
+
+READ_SILVER_SIZE = """
+import json
+from pathlib import Path
+from app.gold.publications import Snapshot
+
+snapshot = Snapshot.open(Path('/lake'))
+names = ('observation_assignments', 'LISTA_DEFECTOS', 'LISTA_RECH', 'LISTA_AR', 'CONT_ZC')
+print(json.dumps({
+    'silver_id': snapshot.publication_id,
+    'source_mode': snapshot.manifest.get('source_mode'),
+    'rows': {name: snapshot.table(name).to_pyarrow_dataset().count_rows() for name in names},
+}))
+"""
+
 
 def compose_volume(docker, role, present):
     name = f"{PROJECT}_{role}"
@@ -253,6 +279,7 @@ def main():
     parser.add_argument("--configure-from", type=Path)
     parser.add_argument("--enable-export", action="store_true")
     parser.add_argument("--airflow-status", action="store_true")
+    parser.add_argument("--data-status", action="store_true")
     args = parser.parse_args()
     site = load_site(args.site)
     report = prepare(site, enable_export=args.enable_export)
@@ -275,6 +302,38 @@ def main():
         report["dag_processor_logs"] = re.sub(
             r"(://[^:/\s]+:)[^@\s]+@", r"\1***@", (logs.stdout + logs.stderr)[-8000:]
         )
+    if args.data_status:
+        docker = Docker(site["docker_context"])
+        report["gold_publish_logs"] = docker.call(
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--mount",
+            f"type=volume,source={report['airflow_volumes']['airflow-logs']},target=/logs,readonly",
+            "--user",
+            "10001:0",
+            UTILITY_IMAGE,
+            "python",
+            "-c",
+            READ_GOLD_TASKS,
+            timeout=60,
+        )
+        if report["silver_publication"]:
+            active = Deployment(site, "develop", docker).active()
+            report["silver_size"] = json.loads(
+                docker.call(
+                    "exec",
+                    active["container"],
+                    "python",
+                    "-c",
+                    READ_SILVER_SIZE,
+                    timeout=120,
+                )
+            )
     print(json.dumps(report, sort_keys=True))
 
 
