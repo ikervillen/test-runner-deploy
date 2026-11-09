@@ -170,7 +170,7 @@ def prepare(site, *, enable_export=False):
         )
     present = set(docker.call("volume", "ls", "--format", "{{.Name}}").splitlines())
     airflow = {role: compose_volume(docker, role, present) for role in AIRFLOW_VOLUMES}
-    return {"volume": volume, "airflow_volumes": airflow, **json.loads(probe)}
+    return {"volume": volume, "airflow_volumes": airflow, **probe}
 
 
 def configure(site, report, source):
