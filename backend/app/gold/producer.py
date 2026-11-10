@@ -209,6 +209,73 @@ def export_confirmed(
         )
 
 
+def refresh_review_coverage(config, root: Path, *, discoveries=None) -> dict:
+    """Republish READY/REVIEW from the live controls without rewriting Silver tables.
+
+    A closed case becomes visible on the next cycle. Unfinished family queues keep
+    the previous data horizon and remain pending for the full export.
+    """
+    import portalocker
+
+    from ingesta_delta_lake.association_storage import source_snapshot
+
+    from .publications import envelope
+
+    root = root.resolve(strict=True)
+    # Discovery stamps stay with the full export. This pass only moves review state.
+    _ = discoveries
+    if not (root / "current.json").exists():
+        return {"status": "NO_PUBLICATION"}
+    with portalocker.Lock(root / "gold-export.lock", timeout=0):
+        pointer, manifest = envelope(root)
+        previous = {(row.get("source"), row.get("origin")): row for row in manifest["coverage"]}
+        coverage = []
+        for family in FAMILIES:
+            _, cases, meta, _ = source_snapshot(config, family, read=False)
+            for origin, _path in config.sources:
+                relevant = [
+                    case
+                    for case in cases
+                    if not case["payload"].get("origen_fenix")
+                    or case["payload"].get("origen_fenix") == origin
+                ]
+                prior = previous.get((family, origin), {})
+                row = {
+                    "source": family,
+                    "origin": origin,
+                    "estado": "REVIEW"
+                    if relevant
+                    else "READY"
+                    if meta["version"] is not None
+                    else "WAITING_INPUT",
+                    "reason_code": "SOURCE_REVIEW" if relevant else None,
+                    "quality_hash": meta["quality_hash"],
+                    "last_successful_discovery": prior.get("last_successful_discovery"),
+                }
+                for field in ("covered_from", "covered_until"):
+                    if prior.get(field) is not None:
+                        row[field] = prior[field]
+                coverage.append(row)
+        if coverage == manifest["coverage"]:
+            return {"status": "UNCHANGED", "publication_id": pointer["publication_id"]}
+        publication_id = digest([pointer["publication_id"], coverage])
+        result = promote(
+            root,
+            manifest["tables"],
+            environment=manifest["environment"],
+            plant=manifest["plant"],
+            input_id=manifest.get("input_publication_id"),
+            operation_id=publication_id,
+            generation=pointer["generation"] + 1,
+            previous=pointer["publication_id"],
+            coverage=coverage,
+            dependencies=manifest.get("dependencies") or [],
+            source_mode=manifest.get("source_mode", "confirmed"),
+            contract=manifest.get("contract"),
+        )
+        return {"status": "COVERAGE_REFRESHED", "publication_id": result["publication_id"]}
+
+
 def _export_confirmed(config, root, *, max_ledger_rows, source_mode, discoveries):
     """Called only at the isolated producer's confirmed boundary; no live deployment."""
     from ingesta_delta_lake.association_storage import (
