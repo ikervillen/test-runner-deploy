@@ -10,6 +10,7 @@
 $ErrorActionPreference = 'Stop'
 $projectDirectory = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 
+# Embedded 3.12. setup-python writes the Windows registry and this account cannot.
 function Resolve-Python312([string]$Requested) {
     $found = Get-Command $Requested -ErrorAction SilentlyContinue
     if ($found) {
