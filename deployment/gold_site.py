@@ -192,6 +192,8 @@ def prepare(site, *, enable_export=False):
             "--read-only",
             "--cap-drop",
             "ALL",
+            "--cap-add",
+            "DAC_READ_SEARCH",
             "--mount",
             f"{mount},readonly",
             UTILITY_IMAGE,
