@@ -9,6 +9,31 @@
 )
 $ErrorActionPreference = 'Stop'
 $projectDirectory = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+
+function Resolve-Python312([string]$Requested) {
+    $found = Get-Command $Requested -ErrorAction SilentlyContinue
+    if ($found) {
+        & $found.Source -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)"
+        if ($LASTEXITCODE -eq 0) { return $found.Source }
+    }
+    $root = Join-Path ([IO.Path]::GetTempPath()) 'fenix-python-3.12.10'
+    $exe = Join-Path $root 'python.exe'
+    if (-not (Test-Path -LiteralPath $exe)) {
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        $zip = Join-Path $root 'python-embed.zip'
+        Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip' -OutFile $zip
+        Expand-Archive -LiteralPath $zip -DestinationPath $root -Force
+        Remove-Item -LiteralPath $zip -Force
+        $pth = Get-ChildItem -LiteralPath $root -Filter 'python*._pth' | Select-Object -First 1
+        $lines = @(Get-Content -LiteralPath $pth.FullName)
+        $lines += $projectDirectory
+        $lines += 'import site'
+        Set-Content -LiteralPath $pth.FullName -Value $lines -Encoding ascii
+    }
+    return $exe
+}
+
+$Python = Resolve-Python312 $Python
 if (-not $env:INGESTA_GITHUB_TOKEN -or -not $env:INGESTA_REGISTRY_USER) {
     throw 'Faltan las credenciales efimeras del job de GitHub Actions.'
 }
