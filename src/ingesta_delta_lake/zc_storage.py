@@ -114,10 +114,15 @@ class ZcStore(DeltaStore):
         if version != before_version or not rows:
             raise IntegrityError("Snapshot CONT_ZC cambiado o inserción vacía")
         keys = [zc.key(r) for r in rows]
-        if len(set(keys)) != len(keys) or set(keys) & set(existing):
+        if len(set(keys)) != len(keys):
             raise IntegrityError("La inserción duplicaría CONT_ZC")
-        values = []
+        # Same minute: the later record replaces the stored one. One commit
+        # rewrites the confirmed snapshot so the version advances exactly once.
+        merged = dict(existing)
         for row in rows:
+            merged[zc.key(row)] = {f: row[f] for f in zc.SCHEMA.names}
+        values = []
+        for row in merged.values():
             item = {f: row[f] for f in zc.SCHEMA.names}
             item["FECHA"] = datetime.fromisoformat(item["FECHA"])
             for f in zc.SPEEDS:
@@ -126,7 +131,7 @@ class ZcStore(DeltaStore):
         write_deltalake(
             table if table else str(self.path),
             pa.Table.from_pylist(values, schema=zc.SCHEMA),
-            mode="append" if table else "error",
+            mode="overwrite" if table else "error",
             commit_properties=CommitProperties(
                 custom_metadata={
                     "ingesta_operation_id": operation,

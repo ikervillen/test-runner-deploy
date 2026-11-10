@@ -371,13 +371,23 @@ def worker(interval=600):
                             result = {"status": "FAILED", "error": str(exc)}
                         record(family, result, round(time.monotonic() - started, 3))
                         service_reviews(base, stop, record)
-                if not stop.is_set() and not failed and not backlog and association_confirmed:
-                    from .gold_export import publish
+                if not stop.is_set() and not failed:
+                    # A full export waits until every family has drained its queue.
+                    # Review coverage does not: a closed case is READY on the next
+                    # cycle, while unfinished inputs stay pending and resume later.
+                    if not backlog and association_confirmed:
+                        from .gold_export import publish
 
-                    exported = publish(base, source_discoveries)
+                        exported = publish(base, source_discoveries)
+                        export_family = "GOLD_EXPORT"
+                    else:
+                        from .gold_export import refresh
+
+                        exported = refresh(base, source_discoveries)
+                        export_family = "COVERAGE_REFRESH"
                     if exported["status"] != "DISABLED":
                         print(
-                            canonical({"family": "GOLD_EXPORT", "time": now(), "result": exported}),
+                            canonical({"family": export_family, "time": now(), "result": exported}),
                             flush=True,
                         )
                 with guard:

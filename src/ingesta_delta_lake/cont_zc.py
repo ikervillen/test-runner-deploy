@@ -113,6 +113,8 @@ def parse(snapshots, encoding):
             "source_path": snap.source_path,
             "bronze_path": snap.bronze_path,
             "sha256": snap.sha256,
+            "mtime_ns": snap.mtime_ns,
+            "received_at": snap.received_at,
         }
         try:
             text = data.decode(encoding, errors="strict")
@@ -183,7 +185,26 @@ def parse(snapshots, encoding):
     return result
 
 
+def _arrival(refs):
+    """Later file, then later row. The repeated minute keeps this occurrence."""
+
+    def rank(ref):
+        return (
+            ref.get("mtime_ns") or 0,
+            str(ref.get("received_at") or ""),
+            str(ref.get("source_path") or ""),
+            ref.get("row") or 0,
+        )
+
+    return max((rank(ref) for ref in refs), default=(0, "", "", 0))
+
+
 def decide(parsed, existing, held):
+    """Same origin, machine and minute: the later record replaces the earlier one.
+
+    A repeated local minute is not a review. Invalid values and keys already held
+    for another reason still block that identity.
+    """
     groups = defaultdict(list)
     for (origin, *values), refs in parsed.entries.items():
         row = {"origen_fenix": origin, **dict(zip(FIELDS, values, strict=True))}
@@ -191,35 +212,30 @@ def decide(parsed, existing, held):
     inserts, issues, matches = [], list(parsed.issues), 0
     for identity, variants in sorted(groups.items()):
         old = existing.get(identity)
-        candidates = sorted((r for r, _ in variants), key=row_hash)
-        compared = [*candidates, *([old] if old else [])]
-        changed = [f for f in FIELDS if len({r[f] for r in compared}) > 1]
-        reason = (
-            "ROW_CONFLICT"
-            if changed
-            else "REVIEW_REQUIRED"
-            if identity in held or identity in parsed.invalid_keys
-            else None
-        )
-        refs = [ref for _, items in variants for ref in items]
-        if reason:
+        ordered = sorted(variants, key=lambda item: _arrival(item[1]))
+        winner, winner_refs = ordered[-1]
+        refs = [ref for _, items in ordered for ref in items]
+        if identity in held or identity in parsed.invalid_keys:
+            candidates = sorted((r for r, _ in variants), key=row_hash)
+            compared = [*candidates, *([old] if old else [])]
             issues.append(
                 {
-                    "reason": reason,
+                    "reason": "REVIEW_REQUIRED",
                     "record_key": digest(identity),
                     "key": identity,
                     "accepted": old,
                     "accepted_hash": row_hash(old) if old else None,
                     "candidates": candidates,
                     "candidate_hashes": [row_hash(r) for r in candidates],
-                    "changed_fields": changed,
+                    "changed_fields": [f for f in FIELDS if len({r[f] for r in compared}) > 1],
                     "evidence": refs,
                 }
             )
-        elif old is None:
-            inserts.append({**candidates[0], "record_key": digest(identity), "evidence": refs})
-        else:
+            continue
+        if old is not None and row_hash(old) == row_hash(winner):
             matches += 1
+            continue
+        inserts.append({**winner, "record_key": digest(identity), "evidence": winner_refs})
     return inserts, issues, matches
 
 

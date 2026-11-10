@@ -220,30 +220,30 @@ def test_above_100_and_falling_counters_preserved_and_flagged_not_clipped(config
         ("CONT_ZC_4", 1),
     ],
 )
-def test_any_changed_content_is_complete_persistent_conflict_not_update(
+def test_later_record_for_the_same_minute_replaces_the_earlier_one_without_review(
     config, source, field, value
 ):
     run(config)
-    accepted = next(iter(rows(config).values()))
-    before = files(config)
     source.write_text(line(**{field: value}), encoding="utf-8")
     result = run(config)
-    assert result["status"] == "PARTIAL" and result["inserted_this_attempt"] == 0
-    assert files(config) == before and next(iter(rows(config).values())) == accepted
-    case = json.loads(query(config, "SELECT payload_json FROM issues")[0][0])
-    assert case["accepted"] == accepted and field in case["changed_fields"]
-    assert all(f in case["candidates"][0] for f in zc.FIELDS) and case["evidence"][0]["raw"]
-    assert result["yield_summary"]["review_observations"] == 1
-    assert yield_report(config)["status"] == "PARTIAL"
-    assert run(config)["inserted_this_attempt"] == 0
-    assert query(config, "SELECT COUNT(*) FROM issues") == [(1,)]
+    stored = next(iter(rows(config).values()))
+    assert result["status"] == "APPLIED" and result["inserted_this_attempt"] == 1
+    assert stored[field] == value
+    assert result["open_reviews"] == 0 and result["yield_summary"]["review_observations"] == 0
+    assert query(config, "SELECT COUNT(*) FROM issues WHERE status!='RESOLVED'") == [(0,)]
+    assert yield_report(config)["source_complete"] is True
 
 
-def test_initial_ambiguity_has_no_winner_and_omitting_variant_does_not_resolve(config, source):
+def test_same_file_keeps_the_later_row_and_a_later_file_replaces_it(config, source):
     source.write_text(line() * 3 + line(RUEDA=1500), encoding="utf-8")
-    assert run(config)["status"] == "BLOCKED" and not config.table_path.exists()
+    first = run(config)
+    assert first["status"] == "APPLIED" and config.table_path.exists()
+    assert next(iter(rows(config).values()))["RUEDA"] == 1500
     source.write_text(line(), encoding="utf-8")
-    assert run(config)["status"] == "BLOCKED" and not config.table_path.exists()
+    second = run(config)
+    assert second["status"] == "APPLIED"
+    assert next(iter(rows(config).values()))["RUEDA"] == 1583
+    assert second["open_reviews"] == 0
 
 
 def test_identity_includes_machine_date_origin_even_if_values_equal(config, source):

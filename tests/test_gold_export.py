@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-from ingesta_delta_lake.gold_export import publish
+from ingesta_delta_lake.gold_export import publish, refresh
 
 
 @dataclass
@@ -63,3 +63,22 @@ def test_export_state_write_failure_does_not_abort_worker(tmp_path, monkeypatch)
         "error_type": "OSError",
         "error": "disk unavailable",
     }
+
+
+def test_coverage_refresh_runs_without_rewriting_tables(tmp_path, monkeypatch):
+    monkeypatch.setenv("INGESTA_GOLD_EXPORT", "1")
+    cfg = Config(tmp_path / "silver", tmp_path / "bronze", tmp_path / "control")
+    seen = {}
+
+    def exporter(config, root, *, discoveries):
+        seen["config"] = config
+        seen["root"] = root
+        seen["discoveries"] = discoveries
+        return {"status": "COVERAGE_REFRESHED", "publication_id": "next"}
+
+    result = refresh(cfg, {"CONT_ZC": "2026-11-10T12:00:00+00:00"}, exporter=exporter)
+    assert result["status"] == "COVERAGE_REFRESHED"
+    assert result["publication_id"] == "next"
+    assert seen["root"] == tmp_path
+    assert seen["discoveries"]["CONT_ZC"] == "2026-11-10T12:00:00+00:00"
+    assert seen["config"] is cfg

@@ -95,6 +95,12 @@ def test_recovery_retains_the_intention_and_commits_once(selected, monkeypatch, 
     export(config, False, sample(config.family, 96))
     run(config)
     export(config, True, sample(config.family, 97))
+    if config.family == "CONT_ZC":
+        # The family writer keeps the later minute itself. Replay must not write again.
+        result = run(config)
+        assert result["complete"] and data(config)[0]["RUEDA"] == 97
+        assert run(config)["delta_version"] == result["delta_version"]
+        return
     from ingesta_delta_lake import reviews
 
     original = reviews.write_deltalake
