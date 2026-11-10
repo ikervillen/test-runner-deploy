@@ -109,8 +109,8 @@ services:
       RAYON_NUM_THREADS: "2"
       TOKIO_WORKER_THREADS: "2"
       OMP_NUM_THREADS: "1"
-      # One scoring process. A second interpreter copies the calculation and
-      # does not fit beside ingestion on this machine.
+      # One scoring process inside each lane. Live and history may run together
+      # and write different hours; only the commit takes the writer lock.
       GOLD_SCORE_WORKERS: "1"
     volumes:
       - airflow-logs:/opt/airflow/logs

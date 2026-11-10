@@ -1,9 +1,9 @@
-"""Publishes Gold every ten minutes; replaces the `watch` polling loop.
+"""Safety net for the live hour, every ten minutes.
 
-The run's moment is only the ceiling: each production is calculated as far as Silver
-accredits it. When Silver has moved but no production can advance, the run waits up to
-eight minutes for the missing families before publishing anyway, so the blocked state
-(how far, what is missing) is recorded and alertable.
+The run writes the open clock hour when Silver has published a new cutoff, and
+exits before reading facts when that publication is already scored. The backlog
+of closed hours is `gold_history`. The two lanes score at the same time; only
+the commit takes the writer lock.
 """
 
 from __future__ import annotations
@@ -14,22 +14,20 @@ import pendulum
 from airflow.sdk import DAG, task
 from airflow.timetables.trigger import CronTriggerTimetable
 from gold_runner import gold_report, run_gold
-from gold_tasks import GOLD_STORE_POOL, PLANT_TIMEZONE, coverage_command, publish_command
+from gold_tasks import PLANT_TIMEZONE, coverage_command, publish_command
 
 COVERAGE_POKE = timedelta(minutes=1)
 COVERAGE_WAIT = timedelta(minutes=8)
-# The first pass reads the whole confirmed Silver history. Later passes reuse
-# closed productions. One long attempt must be able to finish overnight.
-FIRST_PASS_LIMIT = timedelta(hours=16)
+LIVE_LIMIT = timedelta(minutes=20)
 
 with DAG(
     dag_id="gold_publish",
-    description="One Gold publication per ten-minute cutoff, as far as Silver accredits",
+    description="Live Gold: the open hour, and only when Silver has moved",
     schedule=CronTriggerTimetable("*/10 * * * *", timezone=PLANT_TIMEZONE),
     start_date=pendulum.datetime(2026, 11, 1, tz=PLANT_TIMEZONE),
     catchup=False,
     max_active_runs=1,
-    dagrun_timeout=FIRST_PASS_LIMIT,
+    dagrun_timeout=timedelta(minutes=30),
     is_paused_upon_creation=False,
     default_args={
         "owner": "data-engineering",
@@ -55,14 +53,9 @@ with DAG(
         print(f"coverage {report['status']}; blocked: {report['blocked_productions']}")
         return report["status"] != "BLOCKED"
 
-    @task(
-        pool=GOLD_STORE_POOL,
-        trigger_rule="none_failed",
-        execution_timeout=FIRST_PASS_LIMIT,
-        retries=0,
-    )
+    @task(trigger_rule="none_failed", execution_timeout=LIVE_LIMIT, retries=0)
     def publish(dag_run=None) -> None:
         """Clearing a run republishes its own cutoff: the moment is the run's, not now."""
-        run_gold(publish_command(dag_run.run_after))
+        run_gold(publish_command(dag_run.run_after, "live"))
 
     coverage_ready() >> publish()

@@ -1,0 +1,77 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file:
+      - ${APP_ENV_FILE:-.env}
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8001
+      APP_DATA_ROOT: /data/AV-2024-2026_parquet
+      APP_ALERTS_REJECTIONS_ROOT: /data/avisos_rechazos_parquet
+      APP_INSPECTED_TOTALS_ROOT: /data/inspeccionadas_totales_parquet
+      APP_QUALITY_AGGREGATE_ROOT: /data/quality_aggregates
+      APP_HOT_END_YIELD_PATH: /data/Rendimiento_ZC.xlsx
+      APP_DEFECT_SEVERITY_PATH: /data/Tabla defectos con criticidades.xlsx
+      APP_ALERT_DEFECT_NORMALIZATION_PATH: /data/Programacion defectos MDL_enviado V01.xlsx
+      APP_DEFECT_CATALOG_PATH: /data/COD_DEF.xlsx
+      # One worker by default: cache and query semaphore are per worker, so
+      # extra workers multiply memory. Metrics aggregate across workers via
+      # PROMETHEUS_MULTIPROC_DIR on /tmp (see backend/entrypoint.sh).
+      APP_WEB_CONCURRENCY: ${APP_WEB_CONCURRENCY:-1}
+    volumes:
+      - type: bind
+        source: ${HOST_DATA_ROOT:?Set HOST_DATA_ROOT in the external environment file}
+        target: /data
+        read_only: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/api/ready')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 2m
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,noexec,nosuid,nodev
+    mem_limit: ${BACKEND_MEMORY_LIMIT:-2g}
+    cpus: ${BACKEND_CPU_LIMIT:-2.0}
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8001}:8001"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:size=32m,noexec,nosuid,nodev
+      - /var/run:size=8m,noexec,nosuid,nodev
+    mem_limit: ${FRONTEND_MEMORY_LIMIT:-256m}
+    cpus: ${FRONTEND_CPU_LIMIT:-0.5}
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-5174}:8080"

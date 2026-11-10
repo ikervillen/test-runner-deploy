@@ -11,6 +11,7 @@ import hashlib
 import json
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -268,6 +269,87 @@ def promote(
     return manifest
 
 
+def commit_scope(
+    replace_ids: set[str] | None,
+    hours: tuple[tuple[str, datetime], ...] | None,
+) -> dict:
+    """Identity of a commit. A full publication is the empty scope."""
+    scope: dict = {}
+    if replace_ids:
+        scope["productions"] = sorted(replace_ids)
+    if hours:
+        scope["hours"] = [
+            f"{production_id}|{start.isoformat(timespec='seconds')}"
+            for production_id, start in sorted(hours)
+        ]
+    return scope
+
+
+# Facts are not keyed by the clock hour. Their own time column limits the delete
+# to the hour being rewritten, so a previous hour stays stored.
+_FACT_TIME = {
+    "mia_rejections": "periodo_inicio",
+    "mia_inspections": "periodo_inicio",
+    "inspection_bases": "periodo_inicio",
+    "ar_intervals": "fecha_on",
+}
+
+
+def _sql_in(column: str, values: list[str]) -> str:
+    if any("'" in value or "\\" in value for value in values):
+        raise IntegrityError("Identifier cannot be used as a delete predicate")
+    quoted = ", ".join(f"'{value}'" for value in values)
+    return f't."{column}" IN ({quoted})'
+
+
+def chunk_delete_predicate(
+    name: str,
+    replace_ids: set[str] | None,
+    hours: tuple[tuple[str, datetime], ...] | None = None,
+    result_ids: tuple[str, ...] | None = None,
+) -> str | None:
+    """How a chunk removes its own stale rows and leaves every other hour stored.
+
+    An empty string deletes every unmatched row, which is the full publication.
+    None keeps unmatched rows: a fact table has no hour columns, so deleting by
+    production would remove hours this commit did not recalculate.
+    """
+    columns = set(SCHEMAS[name].names)
+    if hours and {"id_produccion", "inicio", "tipo_ventana"} <= columns:
+        grouped: dict[datetime, list[str]] = {}
+        for production_id, start in hours:
+            grouped.setdefault(start, []).append(production_id)
+        parts = []
+        for start, identities in sorted(grouped.items()):
+            stamp = start.strftime("%Y-%m-%d %H:%M:%S")
+            parts.append(
+                f'({_sql_in("id_produccion", sorted(set(identities)))} '
+                f"AND t.\"inicio\" = timestamp '{stamp}')"
+            )
+        body = parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
+        return f'{body} AND t."tipo_ventana" = \'HOUR\''
+    if hours and name in _FACT_TIME and "id_produccion" in columns:
+        column = _FACT_TIME[name]
+        parts = []
+        for production_id, start in sorted(set(hours)):
+            end = start + timedelta(hours=1)
+            opened = start.strftime("%Y-%m-%d %H:%M:%S")
+            closed = end.strftime("%Y-%m-%d %H:%M:%S")
+            parts.append(
+                f'({_sql_in("id_produccion", [production_id])} '
+                f"AND t.\"{column}\" >= timestamp '{opened}' "
+                f"AND t.\"{column}\" < timestamp '{closed}')"
+            )
+        return parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
+    if hours and result_ids and "id_resultado" in columns:
+        return _sql_in("id_resultado", sorted(set(result_ids)))
+    if not replace_ids or hours:
+        return "" if not replace_ids and not hours else None
+    if "id_produccion" not in columns:
+        return None
+    return _sql_in("id_produccion", sorted(replace_ids))
+
+
 class Publisher:
     """One active writer. Journal contains receipts/hashes, never business rows."""
 
@@ -292,6 +374,10 @@ class Publisher:
         cutoff: str,
         coverage: list[dict],
         replacement_scopes: dict[str, dict[str, list]] | None = None,
+        replace_ids: set[str] | None = None,
+        hours: tuple[tuple[str, datetime], ...] | None = None,
+        result_ids: tuple[str, ...] | None = None,
+        lock_timeout: float = 0,
     ) -> dict:
         if (
             self.root == snapshot.root
@@ -305,17 +391,36 @@ class Publisher:
         ):
             raise IntegrityError("Input environment/plant does not match Gold configuration")
         self.root.mkdir(parents=True, exist_ok=True)
-        with portalocker.Lock(self.root / "writer.lock", timeout=0):
+        with portalocker.Lock(self.root / "writer.lock", timeout=lock_timeout):
             return self._publish(
-                snapshot, tables, config_id, cutoff, coverage, replacement_scopes or {}
+                snapshot,
+                tables,
+                config_id,
+                cutoff,
+                coverage,
+                replacement_scopes or {},
+                replace_ids,
+                hours,
+                result_ids,
             )
 
-    def _publish_stream(self, snapshot, rows, config_id, cutoff, coverage):
+    def _publish_stream(
+        self,
+        snapshot,
+        rows,
+        config_id,
+        cutoff,
+        coverage,
+        replace_ids=None,
+        hours=None,
+        result_ids=None,
+    ):
         """Publish from the spill file, one batch of 1000 rows at a time."""
         from .contracts import CONTRACT_VERSION, CONTRACTS, contract_id, ordered, validate
 
         validate(rows, complete=set(rows) == set(CONTRACTS))
-        operation = digest(["gold-v1", snapshot.publication_id, config_id, cutoff, {}])
+        scope = commit_scope(replace_ids, hours)
+        operation = digest(["gold-v1", snapshot.publication_id, config_id, cutoff, scope])
         pointer_path = self.root / "current.json"
         pointer, previous = envelope(self.root) if pointer_path.exists() else (None, None)
         if previous and (
@@ -410,7 +515,7 @@ class Publisher:
         prior_refs = {r["name"]: r for r in previous["tables"]} if previous else {}
         for name in names:
             target = self.root / "tables" / name
-            scoped_hash = digest([hashes[name], {}])
+            scoped_hash = digest([hashes[name], scope])
             ref = state["receipts"].get(name)
             if ref is None:
                 current = DeltaTable(str(target)) if (target / "_delta_log").exists() else None
@@ -459,7 +564,7 @@ class Publisher:
                             f'(t."{k}" IS DISTINCT FROM s."{k}")' for k in SCHEMAS[name].names
                         )
                         before_version = current.version()
-                        (
+                        merge = (
                             current.merge(
                                 data,
                                 join,
@@ -470,9 +575,12 @@ class Publisher:
                             )
                             .when_matched_update_all(predicate=changed)
                             .when_not_matched_insert_all()
-                            .when_not_matched_by_source_delete()
-                            .execute()
                         )
+                        predicate = chunk_delete_predicate(name, replace_ids, hours, result_ids)
+                        if predicate is not None:
+                            delete = merge.when_not_matched_by_source_delete
+                            merge = delete() if predicate == "" else delete(predicate=predicate)
+                        merge.execute()
                         after = DeltaTable(str(target))
                         if after.version() == before_version:
                             if name not in prior_refs:
@@ -522,13 +630,26 @@ class Publisher:
             "tables": len(prior_refs),
         }
 
-    def _publish(self, snapshot, rows, config_id, cutoff, coverage, scopes):
+    def _publish(
+        self,
+        snapshot,
+        rows,
+        config_id,
+        cutoff,
+        coverage,
+        scopes,
+        replace_ids=None,
+        hours=None,
+        result_ids=None,
+    ):
         from .contracts import CONTRACT_VERSION, CONTRACTS, contract_id, ordered, validate
 
         if getattr(rows, "spilled", None):
             if scopes:
                 raise IntegrityError("A spilled publication has no partial replacement scope")
-            return self._publish_stream(snapshot, rows, config_id, cutoff, coverage)
+            return self._publish_stream(
+                snapshot, rows, config_id, cutoff, coverage, replace_ids, hours, result_ids
+            )
         ordered(rows)
         for name, values in rows.items():
             make_table(name, values)

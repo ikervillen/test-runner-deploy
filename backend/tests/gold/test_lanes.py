@@ -1,0 +1,99 @@
+from datetime import datetime, timedelta
+
+from app.gold.lanes import HORIZON, plan
+from app.gold.publications import chunk_delete_predicate
+
+FAMILIES = ("LISTA_DEFECTOS", "LISTA_RECH", "LISTA_AR", "CONT_ZC")
+CEILING = datetime(2026, 11, 10, 12, 20)
+
+
+def _coverage(until: datetime) -> list[dict]:
+    return [
+        {"source": family, "origin": "AV22", "estado": "READY", "covered_until": until}
+        for family in FAMILIES
+    ]
+
+
+def _production(identity: str, start: datetime, end: datetime | None = None) -> dict:
+    return {
+        "id_produccion": identity,
+        "origen_fenix": "AV22",
+        "fecha_inicio_zc": start,
+        "fecha_inicio_operativo_zc": start,
+        "fecha_fin_zf": end,
+    }
+
+
+def test_live_writes_only_the_open_hour_and_history_the_newest_hour_outside_it():
+    recent = _production("recent", datetime(2026, 11, 10, 6, 0))
+    older = _production("older", datetime(2026, 7, 3, 6, 0))
+    productions = [older, recent]
+    coverage = _coverage(CEILING)
+
+    live = plan(productions, {}, coverage, CEILING, "live")
+    assert [(c.production_id, c.start, c.cutoff) for c in live] == [
+        ("older", datetime(2026, 11, 10, 12, 0), CEILING),
+        ("recent", datetime(2026, 11, 10, 12, 0), CEILING),
+    ]
+    history = plan(productions, {}, coverage, CEILING, "history")
+    assert [(c.production_id, c.start, c.end) for c in history] == [
+        ("older", datetime(2026, 11, 10, 3, 0), datetime(2026, 11, 10, 4, 0)),
+    ]
+    assert history[0].end <= CEILING - HORIZON
+    assert plan(productions, {}, coverage, CEILING, "all") is None
+
+
+def test_live_is_idle_when_every_hour_of_the_window_is_stored():
+    production = _production("open", datetime(2026, 11, 10, 6, 0))
+    stored = {"open": {}}
+    cursor = datetime(2026, 11, 10, 6, 0)
+    while cursor <= datetime(2026, 11, 10, 12, 0):
+        end = cursor + timedelta(hours=1)
+        stored["open"][cursor] = CEILING if cursor.hour == 12 else end
+        cursor = end
+    assert plan([production], stored, _coverage(CEILING), CEILING, "live") == []
+    assert plan([production], stored, _coverage(CEILING), CEILING, "history") == []
+
+
+def test_live_fills_one_missing_hour_inside_the_window_when_the_present_is_current():
+    production = _production("open", datetime(2026, 11, 10, 6, 0))
+    stored = {"open": {datetime(2026, 11, 10, 12, 0): CEILING}}
+    missing = plan([production], stored, _coverage(CEILING), CEILING, "live")
+    assert len(missing) == 1
+    assert missing[0].start == datetime(2026, 11, 10, 11, 0)
+    assert missing[0].end > CEILING - HORIZON
+
+
+def test_an_interval_that_crosses_the_hour_belongs_to_the_chunk():
+    production = _production("open", CEILING - timedelta(minutes=30))
+    chunk = plan([production], {}, _coverage(CEILING), CEILING, "live")[0]
+    assert chunk.overlaps(chunk.start - timedelta(minutes=30), chunk.end + timedelta(minutes=5))
+    assert not chunk.overlaps(chunk.end, chunk.end + timedelta(minutes=10))
+
+
+def test_a_blocked_origin_is_not_a_chunk():
+    blocked = _production("blocked", datetime(2026, 11, 1, 6, 0))
+    coverage = [
+        {"source": family, "origin": "AV22", "estado": "WAITING_INPUT", "covered_until": None}
+        for family in FAMILIES
+    ]
+    assert plan([blocked], {}, coverage, CEILING, "history") == []
+    assert plan([blocked], {}, coverage, CEILING, "live") == []
+
+
+def test_a_hour_chunk_deletes_only_that_hour():
+    hour = datetime(2026, 11, 10, 12, 0)
+    hours = (("p1", hour),)
+    assert chunk_delete_predicate("quality_scores", None) == ""
+    assert chunk_delete_predicate("dim_date", {"p1"}, hours) is None
+    assert chunk_delete_predicate("mia_rejections", {"p1"}, hours) == (
+        '(t."id_produccion" IN (\'p1\') AND t."periodo_inicio" >= timestamp '
+        "'2026-11-10 12:00:00' AND t.\"periodo_inicio\" < timestamp '2026-11-10 13:00:00')"
+    )
+    assert chunk_delete_predicate("quality_scores", {"p1"}, hours) == (
+        '(t."id_produccion" IN (\'p1\') AND t."inicio" = timestamp \'2026-11-10 12:00:00\') '
+        'AND t."tipo_ventana" = \'HOUR\''
+    )
+    assert chunk_delete_predicate(
+        "quality_score_components", {"p1"}, hours, ("result-1",)
+    ) == 't."id_resultado" IN (\'result-1\')'

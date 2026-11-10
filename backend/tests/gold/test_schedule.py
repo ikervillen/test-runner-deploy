@@ -51,7 +51,20 @@ def test_publish_runs_one_idempotent_iteration(calculation, tmp_path, capsys, mo
     monkeypatch.setattr(schedule, "require_continuous_source", lambda root: None)
 
     def publish(at: datetime) -> dict:
-        assert main(["publish", "--settings", str(settings_path), "--at", at.isoformat()]) == 0
+        assert (
+            main(
+                [
+                    "publish",
+                    "--settings",
+                    str(settings_path),
+                    "--at",
+                    at.isoformat(),
+                    "--lane",
+                    "all",
+                ]
+            )
+            == 0
+        )
         return json.loads(capsys.readouterr().out)
 
     def coverage(at: datetime) -> dict:

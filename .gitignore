@@ -1,0 +1,42 @@
+# Dependencies and generated builds
+node_modules/
+dist/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local configuration and secrets. Keep only documented examples in Git.
+.env
+.env.*
+!.env.docker.example
+!.env.airflow.example
+backend/.env
+backend/.env.*
+!backend/env.local.example
+
+# Runtime state, logs and test output
+*.log
+*.pid
+*.tmp
+*.bak
+.coverage
+coverage/
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tmp*/
+runtime/
+var/
+
+# Operational and industrial data never belongs in the source repository.
+data/
+staging/
+artifacts/
+backups/
+AV-2024-2026_parquet/
+avisos_rechazos_parquet/
+inspeccionadas_totales_parquet/
+*.parquet
+*.xlsx
+*.xls

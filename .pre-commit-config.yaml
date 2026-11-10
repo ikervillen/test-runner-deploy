@@ -1,0 +1,80 @@
+# Local quality gates. Install once per clone:
+#   uv tool install pre-commit   (or: pip install pre-commit)
+#   pre-commit install --install-hooks
+#
+# Python tools run through `uv run` so hooks use exactly the versions pinned in
+# uv.lock; there is no second copy of ruff/mypy to drift from CI.
+minimum_pre_commit_version: "3.5.0"
+default_install_hook_types: [pre-commit, commit-msg]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: check-merge-conflict
+      - id: check-yaml
+        exclude: ^compose.*\.yaml$   # Compose interpolation is not plain YAML.
+      - id: check-toml
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        args: ["--markdown-linebreak-ext=md"]
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+      - id: forbid-new-submodules
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.0.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args:
+          - --strict
+          - feat
+          - fix
+          - refactor
+          - perf
+          - test
+          - docs
+          - build
+          - ci
+          - chore
+          - style
+
+  - repo: local
+    hooks:
+      - id: forbid-data-files
+        name: forbid committing data files
+        entry: Data files (Excel, Parquet, .env, logs) must never be committed
+        language: fail
+        files: \.(xlsx|xls|parquet|log)$|(^|/)\.env(\..*)?$
+        exclude: ^\.env\.docker\.example$
+
+      - id: ruff-check
+        name: ruff check (backend)
+        entry: uv run ruff check --fix --exit-non-zero-on-fix
+        language: system
+        types: [python]
+        files: ^backend/
+
+      - id: ruff-format
+        name: ruff format (backend)
+        entry: uv run ruff format
+        language: system
+        types: [python]
+        files: ^backend/
+
+      - id: mypy
+        name: mypy (backend/app)
+        entry: uv run mypy
+        language: system
+        pass_filenames: false
+        files: ^(backend/app/|pyproject\.toml$)
+
+      - id: prettier
+        name: prettier (frontend)
+        entry: npx --no-install prettier --write
+        language: system
+        files: ^src/.*\.(ts|tsx|css|json)$

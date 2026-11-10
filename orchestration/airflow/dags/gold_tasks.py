@@ -31,8 +31,20 @@ def local_moment(moment: datetime, zone: tzinfo = PLANT_TIMEZONE) -> str:
     return moment.astimezone(zone).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
-def publish_command(run_after: datetime) -> list[str]:
-    return [GOLD_CLI, "publish", "--settings", SETTINGS, "--at", local_moment(run_after)]
+def publish_command(run_after: datetime, lane: str = "live") -> list[str]:
+    """Live is the open hour. History is one closed hour outside the eight-hour window."""
+    if lane not in {"live", "history", "all"}:
+        raise ValueError(f"Unknown lane: {lane}")
+    return [
+        GOLD_CLI,
+        "publish",
+        "--settings",
+        SETTINGS,
+        "--at",
+        local_moment(run_after),
+        "--lane",
+        lane,
+    ]
 
 
 def coverage_command(run_after: datetime) -> list[str]:

@@ -30,21 +30,24 @@ def test_local_moment_rejects_naive_instants():
         local_moment(datetime(2026, 11, 6, 15, 40), MADRID)
 
 
-def test_publish_passes_only_the_scheduled_moment():
-    command = publish_command(datetime(2026, 11, 6, 14, 40, tzinfo=UTC))
-    assert command == [
+def test_publish_passes_the_scheduled_moment_and_its_lane():
+    moment = datetime(2026, 11, 6, 14, 40, tzinfo=UTC)
+    assert publish_command(moment) == [
         "calidad-gold",
         "publish",
         "--settings",
         "/config/settings.json",
         "--at",
         "2026-11-06T15:40:00",
+        "--lane",
+        "live",
     ]
+    assert publish_command(moment, "history")[-1] == "history"
 
 
 def test_coverage_check_asks_about_the_same_moment_it_will_publish():
     moment = datetime(2026, 11, 6, 14, 40, tzinfo=UTC)
-    assert coverage_command(moment)[1:] == ["coverage", *publish_command(moment)[2:]]
+    assert coverage_command(moment)[2:6] == publish_command(moment)[2:6]
 
 
 def test_each_backup_attempt_gets_a_new_destination():

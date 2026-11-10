@@ -7,7 +7,7 @@ Airflow 3.4 sustituye al bucle `watch` como único escritor del almacén Gold.
 
 | | `watch` | Airflow |
 |---|---|---|
-| Disparo | Bucle cada `poll_seconds` | DAG `gold_publish` cada 10 min en hora de planta |
+| Disparo | Bucle cada `poll_seconds`, carril `live` | `gold_publish` cada 10 min, solo si Silver avanzó; `gold_history` en el minuto 0 y en el 30 |
 | Techo del corte | `attempt_cutoff(datetime.now())` | `attempt_cutoff(hora programada de la ejecución)` |
 | Comprobación previa | No | Sensor `coverage_ready`: espera hasta 8 min si ninguna producción puede avanzar |
 | Reintentos | Siguiente vuelta del bucle | 3 con espera exponencial (máx. 5 min), solo en fallos transitorios |
@@ -22,13 +22,30 @@ y `app.gold.coverage` y la comparten `watch` y `publish`. Los DAG solo pasan la
 hora programada, que es el techo del intento: cada producción se calcula hasta
 el último corte que Silver acredita (`docs/DECISION_CORTE_POR_COBERTURA.md`).
 
-`gold_publish` tiene dos tareas. `coverage_ready` ejecuta el comando de solo
-lectura `coverage` cada minuto, fuera del pool, hasta que alguna producción
-pueda avanzar o no haya nada nuevo; si todo el corte sigue bloqueado a los 8
-minutos, la espera se salta (`soft_fail`) y `publish` se ejecuta igualmente
-(`trigger_rule=none_failed`) para que el estado bloqueado quede registrado y
-las alertas `CalidadGoldCoverageBehind` (30 min) y `CalidadGoldCoverageStalled`
-(60 min) tengan datos.
+Hay una sola definición de score, partida por producción y por hora de reloj.
+La ventana de ocho horas es la lectura de esas ocho franjas. El turno de las
+06:00, 14:00 y 22:00 es otra ventana y no se recalcula al cerrar cada hora.
+
+`gold_publish` es el carril en vivo. Cuando Silver cierra una publicación y el
+corte acreditado avanza, reescribe solo la hora abierta. El cron de diez
+minutos es la red de seguridad: si esa publicación ya está calculada, sale sin
+leer el histórico de hechos. Si la hora abierta ya está al día y dentro de las
+ocho horas falta alguna, rellena una sola. `coverage_ready` ejecuta `coverage`
+cada minuto, fuera del pool de mantenimiento, hasta que alguna producción
+pueda avanzar o no haya nada nuevo; si todo sigue bloqueado a los 8 minutos,
+la espera se salta y `publish` se ejecuta igualmente para dejar el bloqueo
+registrado. Límite de 20 minutos.
+
+`gold_history` mira la cola cada media hora. Si no hay ninguna hora cerrada
+fuera de la ventana de ocho horas, sale. Si la hay, escribe una: la más
+reciente de la producción más reciente. Una hora ya guardada no se vuelve a
+calcular cuando envejece y cambia de dueño. Si el trozo falla, el siguiente
+intento repite solo esa hora. Los totales de producción, de turno y las tasas
+de referencia se leen de las horas ya guardadas; no forman parte del
+micro-lote en vivo. En este servidor los trozos históricos van de uno en uno.
+El cálculo de los dos carriles no comparte el hueco `gold_store`: solo el
+commit, de unos segundos, espera al otro escritor. Backup y mantenimiento
+siguen en ese hueco.
 
 ## Arquitectura
 
@@ -36,7 +53,8 @@ las alertas `CalidadGoldCoverageBehind` (30 min) y `CalidadGoldCoverageStalled`
 
 - `airflow-postgres`: base de metadatos de Airflow (volumen `airflow-db`).
 - `airflow-init`: tarea única; migra la base, crea el administrador y el pool
-  `gold_store` (1 hueco) que serializa publicación, backup y mantenimiento.
+  `gold_store` (1 hueco) que serializa backup y mantenimiento. La publicación
+  en vivo y la histórica calculan a la vez y solo serializan el commit.
 - `airflow-scheduler`: planifica y **ejecuta** las tareas (LocalExecutor). Es el
   único que monta `/silver` (ro), `/gold`, `/config` (ro) y `/backup`.
 - `airflow-dag-processor`: lee los DAG incluidos en la imagen.
@@ -81,8 +99,9 @@ publicaciones que siguen siendo base de scores históricos.
    docker compose -f compose.gold.yaml -f compose.airflow.yaml --env-file .env --env-file .env.airflow up -d --build
    ```
 
-`gold_publish` y `gold_restore_drill` se crean activos. `gold_nightly` se crea
-en pausa para habilitarlo después de validar el backup y la política de retención.
+`gold_publish`, `gold_history` y `gold_restore_drill` se crean activos.
+`gold_nightly` se crea en pausa para habilitarlo después de validar el backup
+y la política de retención.
 
 ## Operación
 
@@ -102,9 +121,12 @@ El CLI Gold termina con un código de salida que indica si reintentar sirve
   vigente; Gold conserva la publicación anterior. Las alertas de
   `ops/gold-alerts.yaml` leen el estado de Gold, no del orquestador.
 - **Repetir un corte concreto:** *Clear* sobre la ejecución en la UI.
-- **Recálculo histórico:** sigue siendo `python -m app.gold build
+- **Cola histórica:** `gold_history`, una hora cerrada por ejecución. No lanzar
+  `publish` sin `--lane` (el valor por defecto es `live`) ni un `build` completo
+  para vaciar esa cola.
+- **Recálculo de producciones ya cerradas:** sigue siendo `python -m app.gold build
   --recalculate-closed ... --reason ...`, manual y fuera de Airflow.
-- **Pausar la publicación:** pausar `gold_publish` en la UI.
+- **Pausar la publicación:** pausar `gold_publish` y `gold_history` en la UI.
 
 ## Volver a `watch`
 

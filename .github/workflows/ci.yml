@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.6"
+      - run: uv sync --locked --dev --extra gold --python 3.11
+      - run: uv run ruff check backend orchestration
+      - run: uv run ruff format --check backend orchestration
+      # Scope and strictness live in [tool.mypy] (pyproject.toml); no path overrides here.
+      - run: uv run mypy
+      - run: uv run --extra gold pytest backend/tests -q --junitxml=test-results.xml --cov-report=xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-validation
+          path: |
+            test-results.xml
+            coverage.xml
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm test
+      - run: npm run build
+      - run: npm audit --omit=dev --audit-level=high
+
+  airflow-dags:
+    runs-on: ubuntu-latest
+    env:
+      AIRFLOW_VERSION: "3.4.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # Same minor version as orchestration/airflow/Dockerfile.
+          python-version: "3.11"
+      - run: >
+          pip install "apache-airflow==${AIRFLOW_VERSION}" pytest
+          --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-3.11.txt"
+      - run: pytest -q
+        working-directory: orchestration/airflow
+
+  compose-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          HOST_DATA_ROOT=/srv/calidad-serie-data \
+          APP_ENV_FILE=.env.docker.example \
+          docker compose config --quiet
+      - name: Gold stack orchestrated by Airflow
+        env:
+          HOST_CONFIRMED_SILVER_ROOT: /srv/silver
+          HOST_GOLD_ROOT: /srv/gold
+          HOST_GOLD_CONFIG_ROOT: /srv/gold-config
+          HOST_GOLD_BACKUP_ROOT: /srv/gold-backup
+          APP_ENV_FILE: .env.docker.example
+          AIRFLOW_DB_PASSWORD: ci
+          AIRFLOW_JWT_SECRET: ci
+          AIRFLOW_FERNET_KEY: ci
+          AIRFLOW_ADMIN_PASSWORD: ci
+        run: |
+          docker compose -f compose.gold.yaml -f compose.airflow.yaml config --quiet
+          services=$(docker compose -f compose.gold.yaml -f compose.airflow.yaml config --services)
+          if echo "$services" | grep -qx publisher; then
+            echo "watch publisher must stay disabled while Airflow owns the Gold store" >&2
+            exit 1
+          fi
+
+  container-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --tag calidad-serie-backend:ci --file backend/Dockerfile .
+      - run: docker build --tag calidad-serie-publisher:ci --file gold/Dockerfile .
+      - run: docker build --tag calidad-serie-frontend:ci --file Dockerfile.frontend .
+      - run: docker build --tag calidad-serie-airflow:ci --file orchestration/airflow/Dockerfile .

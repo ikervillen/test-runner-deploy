@@ -1,0 +1,7 @@
+# Review ownership (GitHub CODEOWNERS). The last matching rule wins.
+#
+# Single-maintainer repository today: one owner for everything. When a second
+# engineer joins, add narrower rules below the catch-all for the area they own
+# (e.g. "/src/  @frontend-dev") instead of widening this one.
+
+*   @ikervillen

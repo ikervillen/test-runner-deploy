@@ -14,7 +14,7 @@ from gold_tasks import GOLD_STORE_POOL
 AIRFLOW = str(Path(sys.executable).with_name("airflow"))
 SLOT = datetime(2026, 11, 6, 14, 40, tzinfo=UTC)
 COVERAGE = "coverage --settings /config/settings.json --at 2026-11-06T15:40:00"
-PUBLISH = "publish --settings /config/settings.json --at 2026-11-06T15:40:00"
+PUBLISH = "publish --settings /config/settings.json --at 2026-11-06T15:40:00 --lane live"
 
 
 @pytest.fixture(scope="module")
@@ -57,6 +57,11 @@ def calls(recorded: Path) -> list[str]:
     ("dag_id", "run_after", "expected"),
     [
         ("gold_publish", SLOT, [COVERAGE, PUBLISH]),
+        (
+            "gold_history",
+            SLOT,
+            ["publish --settings /config/settings.json --at 2026-11-06T15:40:00 --lane history"],
+        ),
         (
             "gold_nightly",
             datetime(2026, 11, 7, 1, 30, tzinfo=UTC),

@@ -37,6 +37,13 @@ def main(argv=None):
             build.add_argument(
                 "--cutoff", required=True, help="Local ceiling for every production, ISO format"
             )
+        if name in ("publish", "watch"):
+            build.add_argument(
+                "--lane",
+                choices=("live", "history", "all"),
+                default="live",
+                help="live: open hour; history: one closed hour; all: manual full build",
+            )
         if name in ("publish", "coverage"):
             build.add_argument(
                 "--at",
@@ -214,6 +221,7 @@ def main(argv=None):
                     max_total_rows=settings["max_total_rows"],
                     recalculate_closed_ids=getattr(args, "recalculate_closed", []),
                     recalculation_reason=getattr(args, "reason", None),
+                    lane=getattr(args, "lane", "all"),
                 )
 
             if args.command == "build":

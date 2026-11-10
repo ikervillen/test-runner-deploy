@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "default_profile_id": "vino_ligero_v1",
+  "profiles": [
+    {
+      "id": "vino_ligero_v1",
+      "segment_id": "vino_ligero",
+      "segment_label": "Vino Ligero",
+      "version": 1,
+      "groups": [
+        {"id": "ovalizacion", "label": "Ovalizacion", "normalized_codes": [53, 221]},
+        {"id": "verticalidad", "label": "Verticalidad", "normalized_codes": [414]},
+        {"id": "rechupe_45mm", "label": "Corcho: Rechupe int. 45 mm", "normalized_codes": [115]},
+        {"id": "line_over", "label": "Rosca: Line over", "normalized_codes": [27]}
+      ]
+    },
+    {
+      "id": "vino_premium_v1",
+      "segment_id": "vino_premium",
+      "segment_label": "Vino premium",
+      "version": 1,
+      "groups": [
+        {"id": "ovalizacion", "label": "Ovalizacion", "normalized_codes": [53, 221]},
+        {"id": "verticalidad", "label": "Verticalidad", "normalized_codes": [414]},
+        {"id": "rechupe_45mm", "label": "Rechupe int. 45 mm", "normalized_codes": [115]}
+      ]
+    }
+  ]
+}

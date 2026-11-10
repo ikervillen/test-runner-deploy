@@ -15,13 +15,19 @@ def dagbag() -> DagBag:
 
 def test_dags_import_cleanly(dagbag):
     assert dagbag.import_errors == {}
-    assert set(dagbag.dag_ids) == {"gold_publish", "gold_nightly", "gold_restore_drill"}
+    assert set(dagbag.dag_ids) == {
+        "gold_publish",
+        "gold_history",
+        "gold_nightly",
+        "gold_restore_drill",
+    }
 
 
 @pytest.mark.parametrize(
     ("dag_id", "cron"),
     [
         ("gold_publish", "*/10 * * * *"),
+        ("gold_history", "0,30 * * * *"),
         ("gold_nightly", "30 2 * * *"),
         ("gold_restore_drill", "30 4 * * 0"),
     ],
@@ -34,7 +40,7 @@ def test_dags_run_in_plant_time_one_at_a_time(dagbag, dag_id, cron):
     assert (dag.catchup, dag.max_active_runs) == (False, 1)
 
 
-def test_every_gold_writer_shares_the_single_slot_pool(dagbag):
+def test_scoring_stays_off_the_maintenance_slot(dagbag):
     pools = {
         (dag_id, task.task_id): task.pool
         for dag_id, dag in dagbag.dags.items()
@@ -42,7 +48,8 @@ def test_every_gold_writer_shares_the_single_slot_pool(dagbag):
     }
     assert pools == {
         ("gold_publish", "coverage_ready"): "default_pool",
-        ("gold_publish", "publish"): GOLD_STORE_POOL,
+        ("gold_publish", "publish"): "default_pool",
+        ("gold_history", "publish_history"): "default_pool",
         ("gold_nightly", "backup"): GOLD_STORE_POOL,
         ("gold_nightly", "maintain"): GOLD_STORE_POOL,
         ("gold_restore_drill", "restore_drill"): "default_pool",
@@ -55,11 +62,20 @@ def test_maintenance_only_follows_a_verified_backup(dagbag):
     assert maintain.trigger_rule == "all_success"
 
 
-def test_publication_retries_finish_before_the_next_slot_is_late(dagbag):
-    task = dagbag.dags["gold_publish"].get_task("publish")
-    assert task.retries == 3
-    assert task.retry_exponential_backoff
-    assert task.max_retry_delay <= timedelta(minutes=5)
+def test_live_stays_short_and_history_is_one_chunk(dagbag):
+    live = dagbag.dags["gold_publish"]
+    history = dagbag.dags["gold_history"]
+    publish = live.get_task("publish")
+    backlog = history.get_task("publish_history")
+    sensor = live.get_task("coverage_ready")
+    assert live.dagrun_timeout == timedelta(minutes=30)
+    assert publish.execution_timeout == timedelta(minutes=20)
+    assert publish.retries == 0
+    assert publish.pool == backlog.pool == "default_pool"
+    assert backlog.execution_timeout == timedelta(minutes=45)
+    assert backlog.retries == 2
+    assert sensor.execution_timeout == timedelta(minutes=20)
+    assert sensor.retries == 0
 
 
 def test_blocked_cutoffs_wait_at_most_eight_minutes_and_then_publish_anyway(dagbag):
