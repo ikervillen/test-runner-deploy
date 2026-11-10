@@ -291,6 +291,11 @@ def test_structure_encoding_and_csv_errors_are_explicit(tmp_path, text):
     assert result.issues[0]["reason"] in {"STRUCTURE", "ENCODING", "CSV"}
 
 
+def test_null_only_file_is_discarded_without_review(tmp_path):
+    result = parsed(tmp_path, b"\x00" * 80)
+    assert result.issues == [] and not result.entries
+
+
 def test_optional_separator_and_duplicate_files_audit_only_once(config, source, tmp_path):
     assert len(parsed(tmp_path, line().rstrip("\n")[:-1] + "\n").entries) == 1
     source.write_text(line() * 5, encoding="utf-8")

@@ -35,6 +35,11 @@ def now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def blank_input(data: bytes) -> bool:
+    """Empty or NUL-only file. It carries no row and must not open a review."""
+    return not data.strip(b"\x00\t\r\n ")
+
+
 def parse_int64(token: str) -> int:
     """Entero decimal exacto; sin float ni conversión de códigos a categorías."""
     if not re.fullmatch(r"[+-]?[0-9]+", token.strip()):

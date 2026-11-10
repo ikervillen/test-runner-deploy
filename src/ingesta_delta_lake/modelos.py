@@ -8,7 +8,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .common import IntegrityError, digest
+from .common import IntegrityError, blank_input, digest
 from .sources import Snapshot
 
 CONTRACT = "sip_modelo_aiala_v1"
@@ -35,6 +35,8 @@ def parse(snapshots: list[Snapshot], encoding: str) -> Parsed:
             "source_path": snapshot.source_path,
             "bronze_path": snapshot.bronze_path,
         }
+        if blank_input(data):
+            continue
         try:
             text = data.decode(encoding, errors="strict")
         except UnicodeError as exc:

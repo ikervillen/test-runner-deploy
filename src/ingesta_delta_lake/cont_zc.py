@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
-from .common import IntegrityError, digest, parse_int64
+from .common import IntegrityError, blank_input, digest, parse_int64
 from .mp9 import timestamp
 
 CONTRACT = "cont_zc_v1"
@@ -116,6 +116,8 @@ def parse(snapshots, encoding):
             "mtime_ns": snap.mtime_ns,
             "received_at": snap.received_at,
         }
+        if blank_input(data):
+            continue
         try:
             text = data.decode(encoding, errors="strict")
         except UnicodeError as exc:

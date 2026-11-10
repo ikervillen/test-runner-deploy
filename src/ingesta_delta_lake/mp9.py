@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
-from .common import IntegrityError, digest, parse_int64
+from .common import IntegrityError, blank_input, digest, parse_int64
 from .sources import Snapshot
 
 CONTRACT = "mp9_cambio_modelo_v2"
@@ -106,6 +106,8 @@ def parse(snapshots: list[Snapshot], encoding: str) -> Parsed:
             "source_path": snap.source_path,
             "bronze_path": snap.bronze_path,
         }
+        if blank_input(data):
+            continue
         try:
             text = data.decode(encoding, errors="strict")
         except UnicodeError as exc:
