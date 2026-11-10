@@ -243,12 +243,8 @@ def refresh_review_coverage(config, root: Path, *, discoveries=None) -> dict:
                 row = {
                     "source": family,
                     "origin": origin,
-                    "estado": "REVIEW"
-                    if relevant
-                    else "READY"
-                    if meta["version"] is not None
-                    else "WAITING_INPUT",
-                    "reason_code": "SOURCE_REVIEW" if relevant else None,
+                    "estado": "READY" if meta["version"] is not None else "WAITING_INPUT",
+                    "reason_code": "MANUAL_REVIEW" if relevant else None,
                     "quality_hash": meta["quality_hash"],
                     "last_successful_discovery": prior.get("last_successful_discovery"),
                 }
@@ -338,12 +334,8 @@ def _export_confirmed(config, root, *, max_ledger_rows, source_mode, discoveries
                 {
                     "source": family,
                     "origin": origin,
-                    "estado": "REVIEW"
-                    if relevant
-                    else "READY"
-                    if meta["version"] is not None
-                    else "WAITING_INPUT",
-                    "reason_code": "SOURCE_REVIEW" if relevant else None,
+                    "estado": "READY" if meta["version"] is not None else "WAITING_INPUT",
+                    "reason_code": "MANUAL_REVIEW" if relevant else None,
                     "quality_hash": meta["quality_hash"],
                     "last_successful_discovery": discoveries.get(family),
                 }
