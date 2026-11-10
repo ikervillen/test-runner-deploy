@@ -35,6 +35,27 @@ def test_origin_cursor_and_budget_survive_new_attempts(config, family):
     assert final["remaining_versions"] == 0 and final["published_rows"] == 20
 
 
+def test_a_file_that_just_arrived_is_written_before_the_backlog(config):
+    folder = config.sources[0][1]
+    cfg = replace(
+        config,
+        family="LISTA_DEFECTOS",
+        timestamp_policy="local_naive_test_v1",
+        mia_batches_per_turn=1,
+    )
+    for i in range(10):
+        (folder / f"14102026_{90000 + i}_LISTA_DEFECTOS.csv").write_text(
+            csv_row("LISTA_DEFECTOS", i), encoding="utf-8"
+        )
+    assert run(cfg)["status"] == "BACKLOG_PENDING"
+    (folder / "14102026_100000_LISTA_DEFECTOS.csv").write_text(
+        csv_row("LISTA_DEFECTOS", 99), encoding="utf-8"
+    )
+    nxt = run(cfg)
+    assert (nxt["processed_versions"], nxt["remaining_versions"]) == (1, 2)
+    assert nxt["status"] == "PARTIAL_BACKLOG"
+
+
 def test_dictionary_alias_replay_has_no_stability_wait_but_detects_same_stat_overwrite(
     config, source, monkeypatch
 ):

@@ -26,6 +26,8 @@ def test_registry_stdin_is_bom_free_and_encoding_is_restored(tmp_path, login_exi
         "    (root/'stdin.bin').write_bytes(sys.stdin.buffer.read())\n"
         "    (root/'docker-args.json').write_text(json.dumps(sys.argv[2:]))\n"
         "    sys.exit(int(os.environ['REGISTRY_PROBE_EXIT']))\n"
+        "if len(sys.argv)>2 and sys.argv[2]=='-c':\n"
+        "    sys.exit(0)\n"
         "if Path(sys.argv[2]).name=='registry.py':\n"
         "    sys.exit(subprocess.call([sys.executable,*sys.argv[2:]]))\n"
         "(root/'manager-called.json').write_text(json.dumps(sys.argv[2:]))\n",

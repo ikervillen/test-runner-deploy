@@ -35,6 +35,30 @@ def chunks(snapshots):
         yield batch
 
 
+def _known_versions(control, captured):
+    """Versions already queued before this scan. A file seen now for the first time is live."""
+    database = getattr(captured, "db", None)
+    if database is not None:
+        return {
+            (origin, sha)
+            for origin, sha in database.execute("SELECT origin, sha256 FROM input_versions")
+        }
+    return set(captured)
+
+
+def _restore_origin(control, origin):
+    """A live file must not move the backlog's origin cursor."""
+    with control.db:
+        if origin is None:
+            control.db.execute("DELETE FROM settings WHERE key='last_mia_origin'")
+        else:
+            control.db.execute(
+                "INSERT INTO settings VALUES('last_mia_origin',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (origin,),
+            )
+
+
 def turns(pending, last_origin):
     """FIFO within each origin; rotate origins only between durable batches."""
     queues = {}
@@ -83,6 +107,7 @@ def process(
     # never prevent reconciliation of an already prepared/committed operation.
     recovered, recovery_count = reconcile_pending(config, control, store_class)
     captured = control.captured_inputs()
+    known_before = _known_versions(control, captured)
     snapshots, verified = [], set()
     with input_scan(config, control) as due:
         if due:
@@ -136,52 +161,65 @@ def process(
     wrote = recovery_count > 0
     stopped = False
     yielded = False
-    selected = (
-        turns(pending, control.setting("last_mia_origin") or "")
-        if config.mia_batches_per_turn
-        else chunks(pending)
-    )
+    fresh = [item for item in pending if (item.origin, item.sha256) not in known_before]
+    backlog = [item for item in pending if (item.origin, item.sha256) in known_before]
+    saved_origin = control.setting("last_mia_origin")
+
+    def ordered(items):
+        if not items:
+            return
+        yield from (
+            turns(items, saved_origin or "") if config.mia_batches_per_turn else chunks(items)
+        )
+
+    phases = [ordered(fresh), ordered(backlog)] if pending else [iter([[]])]
     # An empty batch still reconciles old uncertain commits and reports current coverage.
-    for batch in selected if pending else [[]]:
-        if result is not None and stop_requested is not None and stop_requested():
-            stopped = True
+    # Files that arrived this scan are written before any older backlog batch.
+    for phase_index, selected in enumerate(phases):
+        for batch in selected:
+            if result is not None and stop_requested is not None and stop_requested():
+                stopped = True
+                break
+            if config.mia_batches_per_turn and batch_count >= config.mia_batches_per_turn:
+                yielded = True
+                break
+            started = time.monotonic()
+            result = process_batch(
+                config,
+                control,
+                attempt,
+                snapshots=batch,
+                model=model,
+                store_class=store_class,
+                operation_kind=operation_kind,
+            )
+            control.acknowledge_inputs(result["batch_id"], batch)
+            recovered.extend(result["recovered_operations"])
+            batch_count += bool(batch)
+            wrote = wrote or result["status"] == "APPLIED"
+            completed += len(batch)
+            print(
+                canonical(
+                    {
+                        "event": "INPUT_BATCH_CONFIRMED",
+                        "family": config.family,
+                        "batch_id": result["batch_id"],
+                        "processed_versions": completed,
+                        "remaining_versions": len(pending) - completed,
+                        "input_bytes": sum(s.size for s in batch),
+                        "delta_version": result["delta_version"],
+                        "seconds": round(time.monotonic() - started, 3),
+                    }
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+            for key in cumulative:
+                totals[key] = totals.get(key, 0) + result[key]
+        if phase_index == 0 and fresh and backlog:
+            _restore_origin(control, saved_origin)
+        if stopped or yielded:
             break
-        if config.mia_batches_per_turn and batch_count >= config.mia_batches_per_turn:
-            yielded = True
-            break
-        started = time.monotonic()
-        result = process_batch(
-            config,
-            control,
-            attempt,
-            snapshots=batch,
-            model=model,
-            store_class=store_class,
-            operation_kind=operation_kind,
-        )
-        control.acknowledge_inputs(result["batch_id"], batch)
-        recovered.extend(result["recovered_operations"])
-        batch_count += bool(batch)
-        wrote = wrote or result["status"] == "APPLIED"
-        completed += len(batch)
-        print(
-            canonical(
-                {
-                    "event": "INPUT_BATCH_CONFIRMED",
-                    "family": config.family,
-                    "batch_id": result["batch_id"],
-                    "processed_versions": completed,
-                    "remaining_versions": len(pending) - completed,
-                    "input_bytes": sum(s.size for s in batch),
-                    "delta_version": result["delta_version"],
-                    "seconds": round(time.monotonic() - started, 3),
-                }
-            ),
-            file=sys.stderr,
-            flush=True,
-        )
-        for key in cumulative:
-            totals[key] = totals.get(key, 0) + result[key]
     status = result["status"]
     if result["complete"]:
         status = "APPLIED" if wrote else "NO_CHANGE" if snapshots else "NO_INPUTS"
