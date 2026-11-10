@@ -5,7 +5,6 @@ from dataclasses import replace
 
 import pytest
 from deltalake import DeltaTable
-from test_cont_zc import line as zc_line
 from test_lista_ar import line as ar_line
 from test_lista_defectos import line as mia_line
 from test_lista_rech import line as rech_line
@@ -29,9 +28,9 @@ from ingesta_delta_lake.review_adapters import (
 from ingesta_delta_lake.reviews import apply_command, atomic
 from ingesta_delta_lake.service import run
 from ingesta_delta_lake.topology_storage import TopologyControl
-from ingesta_delta_lake.zc_storage import ZcControl
 
 
+# A later CONT_ZC row for the same minute replaces the stored one, so it is not a review.
 @pytest.fixture(
     params=[
         "SIP_MODELO",
@@ -42,7 +41,6 @@ from ingesta_delta_lake.zc_storage import ZcControl
         "LISTA_DEFECTOS",
         "LISTA_RECH",
         "LISTA_AR",
-        "CONT_ZC",
         "SIP_MAQUINA_MOLDEO",
         "SIP_LINEA_ZF",
     ]
@@ -83,8 +81,6 @@ def conflict(config, request):
             ar_line(off="14/10/2026 11:00:00"),
             ArControl,
         )
-    elif family == "CONT_ZC":
-        first, second, control_type = zc_line(), zc_line(RUEDA=1550), ZcControl
     elif family in {"SIP_MAQUINA_MOLDEO", "SIP_LINEA_ZF"}:
         config = replace(config, topology_enabled=True, line_code_by_origin=(("AV21", 21),))
         if family == "SIP_LINEA_ZF":
