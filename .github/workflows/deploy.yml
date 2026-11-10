@@ -307,9 +307,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: '3.12'
       - name: Build Gold and start the Airflow control plane
         shell: powershell
         env:
@@ -326,11 +323,27 @@ jobs:
           GOLD_EXISTING_IMAGES: ${{ inputs.gold_images }}
           DOCKER_BUILDKIT: '1'
         run: |
+          $ErrorActionPreference = 'Stop'
+          $pythonRoot = Join-Path ([IO.Path]::GetTempPath()) 'fenix-python-3.12.10'
+          $python = Join-Path $pythonRoot 'python.exe'
+          if (-not (Test-Path -LiteralPath $python)) {
+            New-Item -ItemType Directory -Force -Path $pythonRoot | Out-Null
+            $zip = Join-Path $pythonRoot 'python-embed.zip'
+            Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip' -OutFile $zip
+            Expand-Archive -LiteralPath $zip -DestinationPath $pythonRoot -Force
+            Remove-Item -LiteralPath $zip -Force
+            $pth = Get-ChildItem -LiteralPath $pythonRoot -Filter 'python*._pth' | Select-Object -First 1
+            $lines = @(Get-Content -LiteralPath $pth.FullName)
+            $lines += (Get-Location).Path
+            $lines += 'import site'
+            Set-Content -LiteralPath $pth.FullName -Value $lines -Encoding ascii
+          }
           $site = ./scripts/prepare_site.ps1 -Repository $env:GITHUB_REPOSITORY `
             -Branch develop -SitePath $env:DEPLOY_SITE `
             -InputBind $env:INPUT_BIND -DockerContext $env:DOCKER_CONTEXT_NAME
           $contextPath = Join-Path $env:RUNNER_TEMP "gold-${{ github.run_id }}-${{ github.run_attempt }}"
-          python -m deployment.gold_context $contextPath
+          $env:PATH = "$pythonRoot;$env:PATH"
+          & $python -m deployment.gold_context $contextPath
           if ($LASTEXITCODE -ne 0) { throw 'No se pudo obtener el contexto fijado.' }
           ./deployment/airflow-develop.ps1 -Site $site -GoldContext $contextPath `
             -Activate:($env:GOLD_OPERATION -eq 'gold-activate') -VerifyOnly:($env:GOLD_OPERATION -eq 'gold-verify')
