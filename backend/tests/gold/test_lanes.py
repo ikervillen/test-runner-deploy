@@ -71,6 +71,28 @@ def test_an_interval_that_crosses_the_hour_belongs_to_the_chunk():
     assert not chunk.overlaps(chunk.end, chunk.end + timedelta(minutes=10))
 
 
+def test_a_closed_hour_reopens_only_when_a_stop_crosses_it():
+    production = _production("open", datetime(2026, 11, 10, 6, 0))
+    closed = datetime(2026, 11, 10, 9, 0)
+    stored = {
+        "open": {
+            datetime(2026, 11, 10, 12, 0): CEILING,
+            closed: closed + timedelta(hours=1),
+        }
+    }
+    untouched = plan([production], stored, _coverage(CEILING), CEILING, "live")
+    assert all(chunk.start != closed for chunk in untouched)
+    reopened = plan(
+        [production],
+        stored,
+        _coverage(CEILING),
+        CEILING,
+        "live",
+        reopen={("open", closed)},
+    )
+    assert [chunk.start for chunk in reopened] == [closed]
+
+
 def test_a_blocked_origin_is_not_a_chunk():
     blocked = _production("blocked", datetime(2026, 11, 1, 6, 0))
     coverage = [
@@ -91,9 +113,10 @@ def test_a_hour_chunk_deletes_only_that_hour():
         "'2026-11-10 12:00:00' AND t.\"periodo_inicio\" < timestamp '2026-11-10 13:00:00')"
     )
     assert chunk_delete_predicate("quality_scores", {"p1"}, hours) == (
-        '(t."id_produccion" IN (\'p1\') AND t."inicio" = timestamp \'2026-11-10 12:00:00\') '
-        'AND t."tipo_ventana" = \'HOUR\''
+        "(t.\"id_produccion\" IN ('p1') AND t.\"inicio\" = timestamp '2026-11-10 12:00:00') "
+        "AND t.\"tipo_ventana\" = 'HOUR'"
     )
-    assert chunk_delete_predicate(
-        "quality_score_components", {"p1"}, hours, ("result-1",)
-    ) == 't."id_resultado" IN (\'result-1\')'
+    assert (
+        chunk_delete_predicate("quality_score_components", {"p1"}, hours, ("result-1",))
+        == "t.\"id_resultado\" IN ('result-1')"
+    )

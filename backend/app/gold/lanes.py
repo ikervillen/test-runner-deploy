@@ -48,28 +48,46 @@ def plan(
     lane: str,
     *,
     families: frozenset[str] | None = None,
+    reopen: set[tuple[str, datetime]] | None = None,
 ) -> list[HourChunk] | None:
     """Hour chunks this run may write. None means the manual full build."""
     if lane == "all":
         return None
     if lane not in {"live", "history"}:
         raise ValueError(f"Unknown lane: {lane}")
+    reopen = reopen or set()
     accredited = {
         production["id_produccion"]: _accredited(production, coverage_rows, ceiling, families)
         for production in productions
     }
     if lane == "live":
-        return _live(productions, stored_hours, accredited, ceiling)
-    return _history(productions, stored_hours, accredited, ceiling)
+        return _live(productions, stored_hours, accredited, ceiling, reopen)
+    return _history(productions, stored_hours, accredited, ceiling, reopen)
 
 
-def _live(productions, stored_hours, accredited, ceiling) -> list[HourChunk]:
+def _live(productions, stored_hours, accredited, ceiling, reopen) -> list[HourChunk]:
     open_hours = []
+    seen = set()
     for production in productions:
         cutoff = accredited.get(production["id_produccion"])
         chunk = _open_chunk(production, cutoff, ceiling)
-        if chunk is not None and _stale(stored_hours, chunk):
+        if chunk is not None and _due(stored_hours, chunk, reopen):
             open_hours.append(chunk)
+            seen.add((chunk.production_id, chunk.start))
+    for production in productions:
+        cutoff = accredited.get(production["id_produccion"])
+        if cutoff is None:
+            continue
+        identity = production["id_produccion"]
+        for start in stored_hours.get(identity, {}):
+            key = (identity, start)
+            if key not in reopen or key in seen:
+                continue
+            end = start + timedelta(hours=1)
+            chunk = _clip(production, start, end, min(end, cutoff))
+            if chunk is not None and _in_horizon(chunk, ceiling):
+                open_hours.append(chunk)
+                seen.add(key)
     if open_hours:
         return open_hours
     for production in sorted(productions, key=_started, reverse=True):
@@ -81,18 +99,33 @@ def _live(productions, stored_hours, accredited, ceiling) -> list[HourChunk]:
         while cursor + timedelta(hours=1) > ceiling - HORIZON:
             end = cursor + timedelta(hours=1)
             chunk = _clip(production, cursor, end, min(end, cutoff))
-            if (
-                chunk is not None
-                and _in_horizon(chunk, ceiling)
-                and _stale(stored_hours, chunk)
-            ):
+            if chunk is not None and _in_horizon(chunk, ceiling) and _stale(stored_hours, chunk):
                 return [chunk]
             cursor -= timedelta(hours=1)
     return []
 
 
-def _history(productions, stored_hours, accredited, ceiling) -> list[HourChunk]:
+def _history(productions, stored_hours, accredited, ceiling, reopen) -> list[HourChunk]:
     boundary = ceiling - HORIZON
+    chosen = None
+    for production in productions:
+        cutoff = accredited.get(production["id_produccion"])
+        if cutoff is None:
+            continue
+        identity = production["id_produccion"]
+        for start in stored_hours.get(identity, {}):
+            if (identity, start) not in reopen:
+                continue
+            end = start + timedelta(hours=1)
+            chunk = _clip(production, start, end, min(end, cutoff, boundary))
+            if (
+                chunk is not None
+                and chunk.end <= boundary
+                and (chosen is None or chunk.start > chosen.start)
+            ):
+                chosen = chunk
+    if chosen is not None:
+        return [chosen]
     for production in sorted(productions, key=_started, reverse=True):
         cutoff = accredited.get(production["id_produccion"])
         if cutoff is None or _started(production) == datetime.min:
@@ -172,6 +205,10 @@ def _floor_hour(moment: datetime) -> datetime:
 
 def _in_horizon(chunk: HourChunk, ceiling: datetime) -> bool:
     return chunk.start < ceiling and chunk.end > ceiling - HORIZON
+
+
+def _due(stored_hours, chunk: HourChunk, reopen) -> bool:
+    return (chunk.production_id, chunk.start) in reopen or _stale(stored_hours, chunk)
 
 
 def _stale(stored_hours, chunk: HourChunk) -> bool:

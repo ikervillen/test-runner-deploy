@@ -5,13 +5,22 @@ from datetime import datetime
 import pytest
 
 from app.gold.common import IntegrityError
-from app.gold.producer import _iso, _time, auxiliary
+from app.gold.producer import _apply_horizon, _iso, _time, auxiliary
 
 
 def write_csv(directory, name, content):
     path = directory / name
     path.write_bytes(content.encode("cp1252"))
     return path
+
+
+def test_an_empty_observation_advances_only_its_family():
+    row = {"covered_until": datetime(2026, 11, 12, 9, 0)}
+    _apply_horizon(row, "LISTA_DEFECTOS", "AV21", {"AV21": "2026-11-12T09:10:00"})
+    assert row["covered_until"] == datetime(2026, 11, 12, 9, 10)
+    untouched = {"covered_until": None}
+    _apply_horizon(untouched, "LISTA_AR", "AV21", {"AV21": "2026-11-12T09:10:00"})
+    assert untouched["covered_until"] is None
 
 
 def test_auxiliary_capture_keeps_nulls_and_late_closures_without_reopening(tmp_path):

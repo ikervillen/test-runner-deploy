@@ -9,7 +9,7 @@ import tempfile
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager, nullcontext
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -781,6 +781,100 @@ def _naive(value) -> datetime | None:
     return value
 
 
+def _ar_version(snapshot) -> int | None:
+    for table in snapshot.manifest.get("tables", []):
+        if table.get("name") == "LISTA_AR":
+            return table.get("delta_version")
+    return None
+
+
+def _hour_key(production_id: str, start: datetime) -> str:
+    return f"{production_id}|{start.isoformat()}"
+
+
+def _recorded_ar(previous) -> dict:
+    if previous is None:
+        return {}
+    path = previous.root / "lanes" / "ar-hours.json"
+    if not path.exists():
+        return {}
+    hours = read_json(path).get("hours", {})
+    return hours if isinstance(hours, dict) else {}
+
+
+def _stops_to_reopen(snapshot, previous, productions, stored_hours, ar_version):
+    """Stored hours a newly arrived stop crosses. Unchanged AR versions are not reread."""
+    if ar_version is None:
+        return set(), []
+    recorded = _recorded_ar(previous)
+    pending = []
+    for production_id, hours in stored_hours.items():
+        for start in hours:
+            key = _hour_key(production_id, start)
+            if recorded.get(key) != ar_version:
+                pending.append((production_id, start, key))
+    if not pending:
+        return set(), []
+    try:
+        intervals = _ar_intervals(snapshot)
+    except IntegrityError:
+        return set(), []
+    by_id = {production["id_produccion"]: production for production in productions}
+    overlapped = set()
+    for production_id, start, _key in pending:
+        production = by_id.get(production_id)
+        if production is None:
+            continue
+        origin = production.get("origen_fenix")
+        end = start + timedelta(hours=1)
+        for row_start, row_end, row_origin in intervals:
+            if row_origin != origin or row_start is None:
+                continue
+            finish = row_end if row_end is not None else end
+            if row_start < end and finish > start:
+                overlapped.add((production_id, start))
+                break
+    reopen = {
+        (production_id, start)
+        for production_id, start, _key in pending
+        if (production_id, start) in overlapped
+    }
+    # Hours the stop does not cross are remembered. The crossed ones stay open
+    # until the lane that owns them writes them.
+    return reopen, [
+        key for production_id, start, key in pending if (production_id, start) not in reopen
+    ]
+
+
+def _ar_intervals(snapshot):
+    rows = snapshot.rows(
+        "LISTA_AR",
+        columns=["origen_fenix", "FECHA_ON", "FECHA_OFF"],
+        max_rows=1_000_000,
+    )
+    intervals = []
+    for row in rows:
+        start = context.stamp(row["FECHA_ON"])
+        if start is None:
+            continue
+        intervals.append((start, context.stamp(row["FECHA_OFF"]), row["origen_fenix"]))
+    return intervals
+
+
+def _remember_ar(output_root: Path, statistics: dict) -> None:
+    version = statistics.get("ar_version")
+    keys = statistics.get("ar_recorded") or []
+    if version is None or not keys:
+        return
+    path = output_root / "lanes" / "ar-hours.json"
+    current = read_json(path).get("hours", {}) if path.exists() else {}
+    if not isinstance(current, dict):
+        current = {}
+    for key in keys:
+        current[key] = version
+    atomic_json(path, {"hours": current})
+
+
 def _stored_hours(previous, max_rows: int) -> dict[str, dict[datetime, datetime]]:
     """Clock hours already stored, keyed by production and hour start."""
     if previous is None:
@@ -908,6 +1002,8 @@ def build(
     }
     previous_coverage = _previous_coverage(previous, max_total_rows)
     stored_hours = {} if lane == "all" else _stored_hours(previous, max_total_rows)
+    ar_version = None if lane == "all" else _ar_version(snapshot)
+    reopen, checked = _stops_to_reopen(snapshot, previous, prods, stored_hours, ar_version)
     hour_plan = (
         None
         if lane == "all"
@@ -918,8 +1014,14 @@ def build(
             cutoff,
             lane,
             families=LIVE_FAMILIES,
+            reopen=reopen,
         )
     )
+    recorded = list(checked)
+    if hour_plan:
+        recorded.extend(_hour_key(chunk.production_id, chunk.start) for chunk in hour_plan)
+    score_stats["ar_version"] = ar_version
+    score_stats["ar_recorded"] = recorded
     chosen = None if hour_plan is None else {chunk.production_id for chunk in hour_plan}
     selected = prods if chosen is None else [p for p in prods if p["id_produccion"] in chosen]
     score_stats["productions_by_origin"] = {
@@ -1106,8 +1208,10 @@ def build(
         )
         if lane == "live" and hour_plan:
             projected = {pid: dict(starts) for pid, starts in stored_hours.items()}
+            done = set()
             for chunk in hour_plan:
                 projected.setdefault(chunk.production_id, {})[chunk.start] = chunk.cutoff
+                done.add((chunk.production_id, chunk.start))
             score_stats["horizon_complete"] = not lanes.plan(
                 prods,
                 projected,
@@ -1115,6 +1219,7 @@ def build(
                 cutoff,
                 "live",
                 families=LIVE_FAMILIES,
+                reopen=reopen - done,
             )
         published.update(tables)
         for name in store.families():
@@ -1312,11 +1417,14 @@ def _run(
         if tables is None:
             state.update(status="IDLE", lane=lane)
             atomic_json(state_path, state)
+            _remember_ar(output_root, statistics)
+            published_id = previous.publication_id if previous is not None else None
             if lane == "live" and statistics.get("horizon_complete"):
-                _remember_live(output_root, snap.publication_id, None)
+                _remember_live(output_root, snap.publication_id, published_id)
             return {
                 "status": "UNCHANGED",
                 "lane": lane,
+                "publication_id": published_id,
                 "source": source,
                 "incremental": statistics,
                 "chunk_productions": [],
@@ -1378,6 +1486,7 @@ def _run(
                 state.update(status="ACKNOWLEDGED", publication_id=result["publication_id"])
                 state["incremental"] = statistics
                 atomic_json(state_path, state)
+                _remember_ar(output_root, statistics)
                 if lane == "live" and statistics.get("horizon_complete"):
                     _remember_live(output_root, snap.publication_id, result["publication_id"])
                 spilled = getattr(tables, "spilled", ())

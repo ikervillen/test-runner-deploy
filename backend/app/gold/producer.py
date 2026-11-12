@@ -209,20 +209,42 @@ def export_confirmed(
         )
 
 
+HORIZON_FAMILIES = frozenset({"LISTA_DEFECTOS", "LISTA_RECH", "CONT_ZC"})
+
+
+def _later(left, right):
+    values = []
+    for item in (left, right):
+        if item is None or item == "":
+            continue
+        values.append(item if isinstance(item, datetime) else datetime.fromisoformat(str(item)))
+    return max(values) if values else None
+
+
+def _apply_horizon(row: dict, family: str, origin: str, observed: dict | None) -> None:
+    """An accepted file moves only its own family. LISTA_AR stays an open range."""
+    if family not in HORIZON_FAMILIES:
+        return
+    later = _later(row.get("covered_until"), (observed or {}).get(origin))
+    if later is not None:
+        row["covered_until"] = later
+
+
 def refresh_review_coverage(config, root: Path, *, discoveries=None) -> dict:
     """Republish READY/REVIEW from the live controls without rewriting Silver tables.
 
-    A closed case becomes visible on the next cycle. Unfinished family queues keep
-    the previous data horizon and remain pending for the full export.
+    A closed case becomes visible on the next cycle. Each operational family
+    advances to the observations it has already accepted, even when another
+    family still has a backlog. LISTA_AR does not pull the cutoff.
     """
     import portalocker
-
     from ingesta_delta_lake.association_storage import source_snapshot
 
     from .publications import envelope
 
     root = root.resolve(strict=True)
-    # Discovery stamps stay with the full export. This pass only moves review state.
+    # Discovery stamps stay with the full export. Accepted observation times move
+    # with the family that wrote them, without waiting for another family's queue.
     _ = discoveries
     if not (root / "current.json").exists():
         return {"status": "NO_PUBLICATION"}
@@ -251,6 +273,7 @@ def refresh_review_coverage(config, root: Path, *, discoveries=None) -> dict:
                 for field in ("covered_from", "covered_until"):
                     if prior.get(field) is not None:
                         row[field] = prior[field]
+                _apply_horizon(row, family, origin, meta.get("observed_until"))
                 coverage.append(row)
         if coverage == manifest["coverage"]:
             return {"status": "UNCHANGED", "publication_id": pointer["publication_id"]}
@@ -345,6 +368,7 @@ def _export_confirmed(config, root, *, max_ledger_rows, source_mode, discoveries
 
                 coverage[-1]["covered_from"] = observed_ranges[origin][0] - timedelta(minutes=10)
                 coverage[-1]["covered_until"] = observed_ranges[origin][1]
+            _apply_horizon(coverage[-1], family, origin, meta.get("observed_until"))
     if max_ledger_rows is not None and observation_rows > max_ledger_rows:
         raise IntegrityError("Local producer budget exceeded before loading attribution artifacts")
     cfg = replace(config, family="ASIGNACION_PRODUCCION_RAMAL")
