@@ -115,6 +115,7 @@ def source_snapshot(config, family, read=True, *, expected=None):
                 ]
             else:
                 rows = list(data.values())
+
         def _mark(name):
             try:
                 value = json.loads(settings[name]) if settings.get(name) else {}
