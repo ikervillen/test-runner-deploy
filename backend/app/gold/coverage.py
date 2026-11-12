@@ -32,10 +32,21 @@ def floor_step(moment: datetime) -> datetime:
     return moment.replace(minute=minute, second=0, microsecond=0)
 
 
+LIVE_SLOT_FAMILIES = frozenset({"LISTA_DEFECTOS", "LISTA_RECH", "CONT_ZC"})
+
+
 def accredited(
-    coverage: list[dict], origin: str | None, families=REQUIRED_FAMILIES
+    coverage: list[dict],
+    origin: str | None,
+    families=REQUIRED_FAMILIES,
+    until_field: str = "covered_until",
 ) -> Accreditation:
-    """Latest moment every family covers for the origin; a family without a range is open."""
+    """Latest moment every family covers for the origin.
+
+    `covered_until` is the history cursor. A family without it is open.
+    `live_until` is the newest ten-minute slot. For the three operational
+    families, a missing live slot means the line is not ready.
+    """
     bounds: dict[str, datetime | None] = {}
     missing = []
     for family in sorted(families):
@@ -49,7 +60,11 @@ def accredited(
         if not ready:
             missing.append(family)
             continue
-        untils = [stamp(r["covered_until"]) for r in ready if r.get("covered_until") is not None]
+        untils = [stamp(r[until_field]) for r in ready if r.get(until_field) is not None]
+        live_required = until_field == "live_until" and family in LIVE_SLOT_FAMILIES
+        if live_required and len(untils) != len(ready):
+            missing.append(family)
+            continue
         bounds[family] = max(untils) if len(untils) == len(ready) else None
     if missing:
         return Accreditation(None, tuple(missing), False)
@@ -92,10 +107,11 @@ def production_scope(
     families=REQUIRED_FAMILIES,
     evidence: str,
     seen: datetime | None,
+    until_field: str = "covered_until",
 ) -> tuple[dict, datetime | None]:
     """One availability row per production: calculated until when, and what is missing."""
     identity = production["id_produccion"]
-    accreditation = accredited(coverage, production["origen_fenix"], families)
+    accreditation = accredited(coverage, production["origen_fenix"], families, until_field)
     target = min(ceiling, production["fecha_fin_zf"] or ceiling)
     cutoff = effective_cutoff(ceiling, accreditation, previous)
     cutoff = min(cutoff, target) if cutoff is not None else None

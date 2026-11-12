@@ -222,12 +222,21 @@ def _later(left, right):
 
 
 def _apply_horizon(row: dict, family: str, origin: str, observed: dict | None) -> None:
-    """An accepted file moves only its own family. LISTA_AR stays an open range."""
+    """History cursor. An accepted backlog row moves only its own family."""
     if family not in HORIZON_FAMILIES:
         return
     later = _later(row.get("covered_until"), (observed or {}).get(origin))
     if later is not None:
         row["covered_until"] = later
+
+
+def _apply_live(row: dict, family: str, origin: str, live: dict | None) -> None:
+    """Live cursor. The newest ten-minute slot, independent of the backlog fecha."""
+    if family not in HORIZON_FAMILIES:
+        return
+    stamp = (live or {}).get(origin)
+    if stamp is not None:
+        row["live_until"] = stamp
 
 
 def refresh_review_coverage(config, root: Path, *, discoveries=None) -> dict:
@@ -274,6 +283,7 @@ def refresh_review_coverage(config, root: Path, *, discoveries=None) -> dict:
                     if prior.get(field) is not None:
                         row[field] = prior[field]
                 _apply_horizon(row, family, origin, meta.get("observed_until"))
+                _apply_live(row, family, origin, meta.get("live_until"))
                 coverage.append(row)
         if coverage == manifest["coverage"]:
             return {"status": "UNCHANGED", "publication_id": pointer["publication_id"]}
@@ -369,6 +379,7 @@ def _export_confirmed(config, root, *, max_ledger_rows, source_mode, discoveries
                 coverage[-1]["covered_from"] = observed_ranges[origin][0] - timedelta(minutes=10)
                 coverage[-1]["covered_until"] = observed_ranges[origin][1]
             _apply_horizon(coverage[-1], family, origin, meta.get("observed_until"))
+            _apply_live(coverage[-1], family, origin, meta.get("live_until"))
     if max_ledger_rows is not None and observation_rows > max_ledger_rows:
         raise IntegrityError("Local producer budget exceeded before loading attribution artifacts")
     cfg = replace(config, family="ASIGNACION_PRODUCCION_RAMAL")

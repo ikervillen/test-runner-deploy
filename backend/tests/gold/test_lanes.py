@@ -9,7 +9,13 @@ CEILING = datetime(2026, 11, 10, 12, 20)
 
 def _coverage(until: datetime) -> list[dict]:
     return [
-        {"source": family, "origin": "AV22", "estado": "READY", "covered_until": until}
+        {
+            "source": family,
+            "origin": "AV22",
+            "estado": "READY",
+            "covered_until": until,
+            "live_until": None if family == "LISTA_AR" else until,
+        }
         for family in FAMILIES
     ]
 

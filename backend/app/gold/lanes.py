@@ -68,6 +68,12 @@ def plan(
         for production in productions
     }
     if lane == "live":
+        accredited = {
+            production["id_produccion"]: _accredited(
+                production, coverage_rows, ceiling, families, "live_until"
+            )
+            for production in productions
+        }
         return _live(
             productions, stored_hours, accredited, ceiling, reopen, since, copied_until or {}
         )
@@ -226,8 +232,9 @@ def _stale(stored_hours, chunk: HourChunk) -> bool:
     return have is None or have < chunk.cutoff
 
 
-def _accredited(production, coverage_rows, ceiling, families):
+def _accredited(production, coverage_rows, ceiling, families, until_field="covered_until"):
     options = {"families": families} if families is not None else {}
+    options["until_field"] = until_field
     _row, cutoff = production_scope(
         production,
         coverage_rows,
