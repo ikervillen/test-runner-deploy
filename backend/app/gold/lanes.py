@@ -1,10 +1,9 @@
 """Hour partitions for the live window and the historical backlog.
 
-Live writes the open clock hour of each production whose accredited cutoff just
-moved, and only when that hour sits inside the last eight hours. History writes
-one closed hour that is already outside that window. A closed hour is not
-rewritten when it leaves the window: it simply stops belonging to live. Totals
-that span several hours are a later read of these stored hours.
+Live copies the new ten-minute slot into the open hour and does not score it.
+The score is written once, when that clock hour closes. History writes one
+closed hour that is already outside the last eight hours. A late stop reopens
+only the hour it overlaps. Totals that span several hours are a later read.
 """
 
 from __future__ import annotations
@@ -20,19 +19,25 @@ HORIZON = timedelta(hours=8)
 
 @dataclass(frozen=True)
 class HourChunk:
-    """One clock hour of one production. `cutoff` is the accredited instant inside it."""
+    """One clock hour of one production. `cutoff` is the accredited instant inside it.
+
+    `facts_only` copies rows and does not score. `read_from` is the slot start;
+    rows at or before it were already copied.
+    """
 
     production_id: str
     start: datetime
     end: datetime
     cutoff: datetime
+    facts_only: bool = False
+    read_from: datetime | None = None
 
     def overlaps(self, row_start: datetime, row_end: datetime | None) -> bool:
-        """An interval that crosses the hour is kept whole; the score clips it."""
+        """An interval that crosses the requested window is kept whole."""
         if row_start is None:
             return False
         end = row_end if row_end is not None else self.cutoff
-        return row_start < self.cutoff and end > self.start
+        return row_start < self.cutoff and end > (self.read_from or self.start)
 
 
 def expected_hours(production: dict, until: datetime) -> list[HourChunk]:
@@ -49,6 +54,8 @@ def plan(
     *,
     families: frozenset[str] | None = None,
     reopen: set[tuple[str, datetime]] | None = None,
+    since: datetime | None = None,
+    copied_until: dict[str, datetime] | None = None,
 ) -> list[HourChunk] | None:
     """Hour chunks this run may write. None means the manual full build."""
     if lane == "all":
@@ -61,22 +68,19 @@ def plan(
         for production in productions
     }
     if lane == "live":
-        return _live(productions, stored_hours, accredited, ceiling, reopen)
+        return _live(
+            productions, stored_hours, accredited, ceiling, reopen, since, copied_until or {}
+        )
     return _history(productions, stored_hours, accredited, ceiling, reopen)
 
 
-def _live(productions, stored_hours, accredited, ceiling, reopen) -> list[HourChunk]:
-    open_hours = []
+def _live(productions, stored_hours, accredited, ceiling, reopen, since, copied) -> list[HourChunk]:
+    """Copy the new slot, or score the hour that just closed. Never walk older hours."""
+    chunks = []
     seen = set()
     for production in productions:
         cutoff = accredited.get(production["id_produccion"])
-        chunk = _open_chunk(production, cutoff, ceiling)
-        if chunk is not None and _due(stored_hours, chunk, reopen):
-            open_hours.append(chunk)
-            seen.add((chunk.production_id, chunk.start))
-    for production in productions:
-        cutoff = accredited.get(production["id_produccion"])
-        if cutoff is None:
+        if cutoff is None or (since is not None and cutoff <= since):
             continue
         identity = production["id_produccion"]
         for start in stored_hours.get(identity, {}):
@@ -85,24 +89,34 @@ def _live(productions, stored_hours, accredited, ceiling, reopen) -> list[HourCh
                 continue
             end = start + timedelta(hours=1)
             chunk = _clip(production, start, end, min(end, cutoff))
-            if chunk is not None and _in_horizon(chunk, ceiling):
-                open_hours.append(chunk)
+            if chunk is not None and _in_horizon(chunk, ceiling) and end > (since or start):
+                chunks.append(chunk)
                 seen.add(key)
-    if open_hours:
-        return open_hours
-    for production in sorted(productions, key=_started, reverse=True):
-        cutoff = accredited.get(production["id_produccion"])
-        opened = _open_chunk(production, cutoff, ceiling)
-        if cutoff is None or opened is None:
+        start, end = _hour_holding(cutoff)
+        if (identity, start) in seen:
             continue
-        cursor = opened.start - timedelta(hours=1)
-        while cursor + timedelta(hours=1) > ceiling - HORIZON:
-            end = cursor + timedelta(hours=1)
-            chunk = _clip(production, cursor, end, min(end, cutoff))
+        if cutoff == end:
+            chunk = _clip(production, start, end, cutoff)
             if chunk is not None and _in_horizon(chunk, ceiling) and _stale(stored_hours, chunk):
-                return [chunk]
-            cursor -= timedelta(hours=1)
-    return []
+                left = max(start, since) if since is not None else start
+                chunks.append(
+                    HourChunk(
+                        identity,
+                        start,
+                        end,
+                        cutoff,
+                        read_from=None if left == start else left,
+                    )
+                )
+            continue
+        copied_at = copied.get(identity)
+        left = max(start, copied_at or start, since or start)
+        if left >= cutoff:
+            continue
+        chunk = _clip(production, start, end, cutoff)
+        if chunk is not None and _in_horizon(chunk, ceiling):
+            chunks.append(HourChunk(identity, start, end, cutoff, facts_only=True, read_from=left))
+    return chunks
 
 
 def _history(productions, stored_hours, accredited, ceiling, reopen) -> list[HourChunk]:
@@ -205,10 +219,6 @@ def _floor_hour(moment: datetime) -> datetime:
 
 def _in_horizon(chunk: HourChunk, ceiling: datetime) -> bool:
     return chunk.start < ceiling and chunk.end > ceiling - HORIZON
-
-
-def _due(stored_hours, chunk: HourChunk, reopen) -> bool:
-    return (chunk.production_id, chunk.start) in reopen or _stale(stored_hours, chunk)
 
 
 def _stale(stored_hours, chunk: HourChunk) -> bool:

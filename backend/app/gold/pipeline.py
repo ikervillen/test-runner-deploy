@@ -171,8 +171,13 @@ class _SourceReader:
             self.count(len(self._cache[name]))
         return self._cache[name]
 
-    def batches(self, name: str):
-        for batch in self.snapshot.batches(name, max_rows=self.max_total_rows):
+    def batches(self, name: str, expression=None):
+        for batch in self.snapshot.batches(
+            name,
+            max_rows=self.max_total_rows,
+            expression=expression,
+            pushdown=expression is not None,
+        ):
             self.count(batch.num_rows)
             yield batch
 
@@ -240,8 +245,42 @@ def _in_chunk(spans, production_id: str, start, end) -> bool:
     return any(chunk.overlaps(start, end) for chunk in spans.get(production_id, ()))
 
 
+def _fact_window(spans):
+    """The only Silver interval this chunk needs. None means the whole table."""
+    if not spans:
+        return None
+    chunks = [chunk for group in spans.values() for chunk in group]
+    if not chunks:
+        return None
+    return (
+        min(chunk.read_from or chunk.start for chunk in chunks),
+        max(chunk.cutoff for chunk in chunks),
+    )
+
+
+def _time_expression(family: str, window):
+    import pyarrow.dataset as ds
+
+    if window is None:
+        return None
+    left, right = window
+    if family == "LISTA_AR":
+        return (ds.field("FECHA_ON") < right) & (
+            ds.field("FECHA_OFF").is_null() | (ds.field("FECHA_OFF") > left)
+        )
+    return (ds.field("FECHA") > left) & (ds.field("FECHA") <= right)
+
+
 def _spill_facts(
-    reader, tables, attribution, pending, store: FactStore, by_zc, only_ids=None, spans=None
+    reader,
+    tables,
+    attribution,
+    pending,
+    store: FactStore,
+    by_zc,
+    link_rules,
+    only_ids=None,
+    spans=None,
 ):
     """Write accepted facts for this chunk. The scan keeps one Arrow batch, not the history."""
     assigned = {r["id_asignacion"]: r["id_produccion"] for r in tables["production_assignments"]}
@@ -249,8 +288,9 @@ def _spill_facts(
     def wanted(production_id: str) -> bool:
         return only_ids is None or production_id in only_ids
 
+    window = _fact_window(spans)
     for target, family in (("mia_rejections", "LISTA_DEFECTOS"), ("mia_inspections", "LISTA_RECH")):
-        for batch in reader.batches(family):
+        for batch in reader.batches(family, _time_expression(family, window)):
             rows, issues = facts.mia(family, batch.to_pylist(), attribution)
             for row in rows:
                 if not wanted(row["id_produccion"]) or not _in_chunk(
@@ -266,7 +306,7 @@ def _spill_facts(
                     key=tuple(row[k] for k in KEYS[target]),
                 )
             pending.extend(issues)
-    for batch in reader.batches("LISTA_AR"):
+    for batch in reader.batches("LISTA_AR", _time_expression("LISTA_AR", window)):
         rows, issues = facts.ar(
             batch.to_pylist(),
             attribution,
@@ -294,7 +334,7 @@ def _spill_facts(
     for production_id, observations in by_zc.items():
         for observation_id in observations:
             linked[observation_id].append(production_id)
-    for batch in reader.batches("CONT_ZC"):
+    for batch in reader.batches("CONT_ZC", _time_expression("CONT_ZC", window)):
         for row in facts.zc(batch.to_pylist()):
             observation_id = row["id_observacion"]
             owners = [
@@ -314,26 +354,32 @@ def _spill_facts(
             )
             for production_id in owners:
                 store.add("zc_for_production", production_id, observation_id, row)
+                store.add(
+                    "zc_production_links",
+                    production_id,
+                    observation_id,
+                    {
+                        "id_produccion": production_id,
+                        "id_observacion": observation_id,
+                        "regla_atribucion": link_rules[observation_id],
+                    },
+                    key=(production_id, observation_id),
+                )
     store.ready()
 
 
 def _zc_links(decisions, tables):
     """Producer-accepted counter links; never inferred from code coincidence."""
     by_zc = defaultdict(set)
+    rules = {}
     tables.setdefault("zc_production_links", [])
     for d in decisions:
         if d["source_family"] != "CONT_ZC" or d["status"] not in ZC_LINK_STATUSES:
             continue
+        rules[d["source_id"]] = d["rule"]
         for identity in d["productions"]:
             by_zc[identity].add(d["source_id"])
-            tables["zc_production_links"].append(
-                {
-                    "id_produccion": identity,
-                    "id_observacion": d["source_id"],
-                    "regla_atribucion": d["rule"],
-                }
-            )
-    return by_zc
+    return by_zc, rules
 
 
 def _previous_tables(previous, max_rows_per_source, names):
@@ -973,6 +1019,8 @@ def build(
     statistics: dict | None = None,
     recalculate_closed_ids: set[str] | None = None,
     lane: str = "all",
+    since: datetime | None = None,
+    copied_until: dict[str, datetime] | None = None,
 ) -> tuple[dict[str, list[dict]] | None, list[dict]]:
     """Score one lane. `all` is the manual full build; live and history score a chunk."""
     validate_config(config)
@@ -1015,6 +1063,8 @@ def build(
             lane,
             families=LIVE_FAMILIES,
             reopen=reopen,
+            since=since,
+            copied_until=copied_until,
         )
     )
     recorded = list(checked)
@@ -1042,18 +1092,13 @@ def build(
     handed = False
     try:
         with clock.stage("facts"):
-            by_zc = _zc_links(decisions, tables)
-            links = tables.pop("zc_production_links", [])
+            by_zc, link_rules = _zc_links(decisions, tables)
+            tables.pop("zc_production_links", None)
             spans = None
             if hour_plan is not None:
                 spans = defaultdict(list)
                 for chunk in hour_plan:
                     spans[chunk.production_id].append(chunk)
-            for row in links:
-                if chosen is not None and row["id_produccion"] not in chosen:
-                    continue
-                _store_row(store, "zc_production_links", row["id_produccion"], row)
-            del links
             _spill_facts(
                 reader,
                 tables,
@@ -1061,6 +1106,7 @@ def build(
                 pending,
                 store,
                 by_zc,
+                link_rules,
                 only_ids=chosen,
                 spans=spans,
             )
@@ -1069,8 +1115,22 @@ def build(
         with clock.stage("previous"):
             _carry_references(previous, store, max_total_rows)
         scoring = {p["id_produccion"] for p in selected}
-        with clock.stage("references"):
-            rates = {}
+        facts_only = bool(hour_plan) and all(chunk.facts_only for chunk in hour_plan)
+        if facts_only:
+            selected = []
+        else:
+            selected = [
+                production
+                for production in selected
+                if hour_plan is None
+                or any(
+                    not chunk.facts_only and chunk.production_id == production["id_produccion"]
+                    for chunk in hour_plan
+                )
+            ]
+            scoring = {production["id_produccion"] for production in selected}
+        rates = {}
+        if not facts_only:
             for production in prods:
                 # One hour is not a production rate. Peers come from stored slices.
                 if hour_plan is not None or production["id_produccion"] not in scoring:
@@ -1141,7 +1201,7 @@ def build(
                         chunk.cutoff,
                     )
                     for chunk in hour_plan
-                    if chunk.production_id == production["id_produccion"]
+                    if chunk.production_id == production["id_produccion"] and not chunk.facts_only
                 ]
             return payload
 
@@ -1192,26 +1252,41 @@ def build(
         store.dedupe()
         scope_rows.extend(_pending_scope_rows(pending, snapshot, last_discovery))
         published = SpilledTables(store, spill_dir)
-        published.replace_ids = None if chosen is None else scoring
+        score_chunks = [chunk for chunk in hour_plan or [] if not chunk.facts_only]
+        published.replace_ids = None if chosen is None or facts_only else scoring
         published.hours = (
             None
-            if hour_plan is None
-            else tuple((chunk.production_id, chunk.start) for chunk in hour_plan)
+            if not score_chunks
+            else tuple((chunk.production_id, chunk.start) for chunk in score_chunks)
         )
-        published.result_ids = (
+        published.fact_bounds = (
             None
             if hour_plan is None
             else tuple(
-                Window(chunk.production_id, "HOUR", chunk.start, chunk.end, chunk.cutoff).identity
+                (chunk.production_id, chunk.read_from or chunk.start, chunk.cutoff)
                 for chunk in hour_plan
+            )
+        )
+        published.result_ids = (
+            None
+            if not score_chunks
+            else tuple(
+                Window(chunk.production_id, "HOUR", chunk.start, chunk.end, chunk.cutoff).identity
+                for chunk in score_chunks
             )
         )
         if lane == "live" and hour_plan:
             projected = {pid: dict(starts) for pid, starts in stored_hours.items()}
             done = set()
+            copied_now = dict(copied_until or {})
             for chunk in hour_plan:
-                projected.setdefault(chunk.production_id, {})[chunk.start] = chunk.cutoff
+                if not chunk.facts_only:
+                    projected.setdefault(chunk.production_id, {})[chunk.start] = chunk.cutoff
+                copied_now[chunk.production_id] = chunk.cutoff
                 done.add((chunk.production_id, chunk.start))
+            score_stats["copied"] = {
+                identity: moment.isoformat() for identity, moment in copied_now.items()
+            }
             score_stats["horizon_complete"] = not lanes.plan(
                 prods,
                 projected,
@@ -1220,6 +1295,8 @@ def build(
                 "live",
                 families=LIVE_FAMILIES,
                 reopen=reopen - done,
+                since=since,
+                copied_until=copied_now,
             )
         published.update(tables)
         for name in store.families():
@@ -1268,6 +1345,28 @@ def build(
 def _live_receipt(output_root: Path) -> dict | None:
     path = output_root / "lanes" / "live.json"
     return read_json(path) if path.exists() else None
+
+
+def _mark_live_since(output_root: Path, cutoff: datetime) -> tuple[datetime, bool]:
+    """The first live run after deployment remembers its cutoff and copies nothing older."""
+    path = output_root / "lanes" / "since.json"
+    if path.exists():
+        return datetime.fromisoformat(read_json(path)["since"]), False
+    atomic_json(path, {"since": cutoff.isoformat()})
+    return cutoff, True
+
+
+def _read_copied(output_root: Path) -> dict[str, datetime]:
+    path = output_root / "lanes" / "copied.json"
+    if not path.exists():
+        return {}
+    return {key: datetime.fromisoformat(value) for key, value in read_json(path).items()}
+
+
+def _remember_copied(output_root: Path, statistics: dict) -> None:
+    copied = statistics.get("copied")
+    if copied:
+        atomic_json(output_root / "lanes" / "copied.json", copied)
 
 
 def _remember_live(output_root: Path, silver_id: str, publication_id: str | None) -> None:
@@ -1400,6 +1499,17 @@ def _run(
             }
         calculation_time = datetime.fromisoformat(state["calculation_time"]).replace(tzinfo=None)
         previous = Snapshot.open(output_root) if (output_root / "current.json").exists() else None
+        since = copied_until = None
+        if lane == "live":
+            since, fresh = _mark_live_since(output_root, cutoff)
+            if fresh:
+                return {
+                    "status": "UNCHANGED",
+                    "lane": lane,
+                    "publication_id": previous.publication_id if previous is not None else None,
+                    "source": source,
+                }
+            copied_until = _read_copied(output_root)
         statistics: dict[str, Any] = {}
         tables, coverage = build(
             snap,
@@ -1413,11 +1523,14 @@ def _run(
             statistics=statistics,
             recalculate_closed_ids=set(recalculate_closed_ids or []),
             lane=lane,
+            since=since,
+            copied_until=copied_until,
         )
         if tables is None:
             state.update(status="IDLE", lane=lane)
             atomic_json(state_path, state)
             _remember_ar(output_root, statistics)
+            _remember_copied(output_root, statistics)
             published_id = previous.publication_id if previous is not None else None
             if lane == "live" and statistics.get("horizon_complete"):
                 _remember_live(output_root, snap.publication_id, published_id)
@@ -1464,6 +1577,7 @@ def _run(
                     replace_ids=replace_ids,
                     hours=hours,
                     result_ids=result_ids,
+                    fact_bounds=getattr(tables, "fact_bounds", None),
                     lock_timeout=0 if lane == "all" else COMMIT_WAIT_SECONDS,
                     coverage=[
                         {
@@ -1487,6 +1601,7 @@ def _run(
                 state["incremental"] = statistics
                 atomic_json(state_path, state)
                 _remember_ar(output_root, statistics)
+                _remember_copied(output_root, statistics)
                 if lane == "live" and statistics.get("horizon_complete"):
                     _remember_live(output_root, snap.publication_id, result["publication_id"])
                 spilled = getattr(tables, "spilled", ())

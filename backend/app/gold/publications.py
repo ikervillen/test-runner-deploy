@@ -152,14 +152,18 @@ class Snapshot:
         max_rows: int = 250_000,
         file_pruning_predicate=None,
         on_scan=None,
+        pushdown: bool = False,
     ) -> Iterator[pa.RecordBatch]:
         count = 0
         # The predicate prunes by partition value and by file statistics before decoding.
+        # Timestamp pushdown skips the rest of a table. String filters stay after the
+        # read: Arrow 23 has no kernel for string_view comparisons written by Delta MERGE.
         scanner = (
             self.table(name)
             .to_pyarrow_dataset(file_pruning_predicate=file_pruning_predicate)
             .scanner(
                 columns=columns if expression is None else None,
+                filter=expression if pushdown else None,
                 batch_size=batch_size,
                 # Single-threaded on purpose: batch order feeds float sums and input hashes,
                 # and parity with the frozen legacy reference depends on that order.
@@ -167,17 +171,18 @@ class Snapshot:
             )
         )
         for batch in scanner.to_batches():
+            # Arrow 23 cannot prune every statistics kind written by Delta MERGE.
+            if expression is not None:
+                batch = batch.filter(expression)
+                if columns is not None:
+                    batch = batch.select(columns)
+            if batch.num_rows == 0:
+                continue
             count += batch.num_rows
             if on_scan is not None:
                 on_scan(batch.num_rows)
             if count > max_rows:
                 raise IntegrityError(f"{name}: per-scope row budget exceeded; split the scope")
-            # Arrow 23 cannot prune string_view statistics written by Delta MERGE.
-            # Delta prunes eligible files; filter bounded, schema-cast batches here.
-            if expression is not None:
-                batch = batch.filter(expression)
-                if columns is not None:
-                    batch = batch.select(columns)
             yield batch
 
     def rows(self, name: str, **kwargs) -> list[dict]:
@@ -307,6 +312,7 @@ def chunk_delete_predicate(
     replace_ids: set[str] | None,
     hours: tuple[tuple[str, datetime], ...] | None = None,
     result_ids: tuple[str, ...] | None = None,
+    bounds: tuple[tuple[str, datetime, datetime], ...] | None = None,
 ) -> str | None:
     """How a chunk removes its own stale rows and leaves every other hour stored.
 
@@ -315,6 +321,20 @@ def chunk_delete_predicate(
     production would remove hours this commit did not recalculate.
     """
     columns = set(SCHEMAS[name].names)
+    if bounds and name in _FACT_TIME and "id_produccion" in columns:
+        column = _FACT_TIME[name]
+        parts = []
+        for production_id, left, right in bounds:
+            opened = left.strftime("%Y-%m-%d %H:%M:%S")
+            closed = right.strftime("%Y-%m-%d %H:%M:%S")
+            parts.append(
+                f"({_sql_in('id_produccion', [production_id])} "
+                f"AND t.\"{column}\" >= timestamp '{opened}' "
+                f"AND t.\"{column}\" < timestamp '{closed}')"
+            )
+        return parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
+    if bounds and not hours:
+        return None
     if hours and {"id_produccion", "inicio", "tipo_ventana"} <= columns:
         grouped: dict[datetime, list[str]] = {}
         for production_id, start in hours:
@@ -323,11 +343,11 @@ def chunk_delete_predicate(
         for start, identities in sorted(grouped.items()):
             stamp = start.strftime("%Y-%m-%d %H:%M:%S")
             parts.append(
-                f'({_sql_in("id_produccion", sorted(set(identities)))} '
+                f"({_sql_in('id_produccion', sorted(set(identities)))} "
                 f"AND t.\"inicio\" = timestamp '{stamp}')"
             )
         body = parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
-        return f'{body} AND t."tipo_ventana" = \'HOUR\''
+        return f"{body} AND t.\"tipo_ventana\" = 'HOUR'"
     if hours and name in _FACT_TIME and "id_produccion" in columns:
         column = _FACT_TIME[name]
         parts = []
@@ -336,7 +356,7 @@ def chunk_delete_predicate(
             opened = start.strftime("%Y-%m-%d %H:%M:%S")
             closed = end.strftime("%Y-%m-%d %H:%M:%S")
             parts.append(
-                f'({_sql_in("id_produccion", [production_id])} '
+                f"({_sql_in('id_produccion', [production_id])} "
                 f"AND t.\"{column}\" >= timestamp '{opened}' "
                 f"AND t.\"{column}\" < timestamp '{closed}')"
             )
@@ -377,6 +397,7 @@ class Publisher:
         replace_ids: set[str] | None = None,
         hours: tuple[tuple[str, datetime], ...] | None = None,
         result_ids: tuple[str, ...] | None = None,
+        fact_bounds: tuple[tuple[str, datetime, datetime], ...] | None = None,
         lock_timeout: float = 0,
     ) -> dict:
         if (
@@ -402,6 +423,7 @@ class Publisher:
                 replace_ids,
                 hours,
                 result_ids,
+                fact_bounds,
             )
 
     def _publish_stream(
@@ -414,6 +436,7 @@ class Publisher:
         replace_ids=None,
         hours=None,
         result_ids=None,
+        fact_bounds=None,
     ):
         """Publish from the spill file, one batch of 1000 rows at a time."""
         from .contracts import CONTRACT_VERSION, CONTRACTS, contract_id, ordered, validate
@@ -576,7 +599,9 @@ class Publisher:
                             .when_matched_update_all(predicate=changed)
                             .when_not_matched_insert_all()
                         )
-                        predicate = chunk_delete_predicate(name, replace_ids, hours, result_ids)
+                        predicate = chunk_delete_predicate(
+                            name, replace_ids, hours, result_ids, fact_bounds
+                        )
                         if predicate is not None:
                             delete = merge.when_not_matched_by_source_delete
                             merge = delete() if predicate == "" else delete(predicate=predicate)
@@ -641,6 +666,7 @@ class Publisher:
         replace_ids=None,
         hours=None,
         result_ids=None,
+        fact_bounds=None,
     ):
         from .contracts import CONTRACT_VERSION, CONTRACTS, contract_id, ordered, validate
 
@@ -648,7 +674,15 @@ class Publisher:
             if scopes:
                 raise IntegrityError("A spilled publication has no partial replacement scope")
             return self._publish_stream(
-                snapshot, rows, config_id, cutoff, coverage, replace_ids, hours, result_ids
+                snapshot,
+                rows,
+                config_id,
+                cutoff,
+                coverage,
+                replace_ids,
+                hours,
+                result_ids,
+                fact_bounds,
             )
         ordered(rows)
         for name, values in rows.items():

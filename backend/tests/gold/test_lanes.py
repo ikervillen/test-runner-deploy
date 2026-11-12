@@ -31,9 +31,9 @@ def test_live_writes_only_the_open_hour_and_history_the_newest_hour_outside_it()
     coverage = _coverage(CEILING)
 
     live = plan(productions, {}, coverage, CEILING, "live")
-    assert [(c.production_id, c.start, c.cutoff) for c in live] == [
-        ("older", datetime(2026, 11, 10, 12, 0), CEILING),
-        ("recent", datetime(2026, 11, 10, 12, 0), CEILING),
+    assert [(c.production_id, c.start, c.cutoff, c.facts_only) for c in live] == [
+        ("older", datetime(2026, 11, 10, 12, 0), CEILING, True),
+        ("recent", datetime(2026, 11, 10, 12, 0), CEILING, True),
     ]
     history = plan(productions, {}, coverage, CEILING, "history")
     assert [(c.production_id, c.start, c.end) for c in history] == [
@@ -51,17 +51,35 @@ def test_live_is_idle_when_every_hour_of_the_window_is_stored():
         end = cursor + timedelta(hours=1)
         stored["open"][cursor] = CEILING if cursor.hour == 12 else end
         cursor = end
-    assert plan([production], stored, _coverage(CEILING), CEILING, "live") == []
+    assert (
+        plan(
+            [production],
+            stored,
+            _coverage(CEILING),
+            CEILING,
+            "live",
+            copied_until={"open": CEILING},
+        )
+        == []
+    )
     assert plan([production], stored, _coverage(CEILING), CEILING, "history") == []
 
 
-def test_live_fills_one_missing_hour_inside_the_window_when_the_present_is_current():
+def test_live_does_not_walk_back_through_hours_already_behind_the_deployment():
     production = _production("open", datetime(2026, 11, 10, 6, 0))
     stored = {"open": {datetime(2026, 11, 10, 12, 0): CEILING}}
-    missing = plan([production], stored, _coverage(CEILING), CEILING, "live")
-    assert len(missing) == 1
-    assert missing[0].start == datetime(2026, 11, 10, 11, 0)
-    assert missing[0].end > CEILING - HORIZON
+    assert plan([production], stored, _coverage(CEILING), CEILING, "live", since=CEILING) == []
+    closed = plan(
+        [production],
+        {},
+        _coverage(datetime(2026, 11, 10, 13, 0)),
+        datetime(2026, 11, 10, 13, 0),
+        "live",
+        since=datetime(2026, 11, 10, 12, 0),
+    )
+    assert [(chunk.start, chunk.cutoff, chunk.facts_only) for chunk in closed] == [
+        (datetime(2026, 11, 10, 12, 0), datetime(2026, 11, 10, 13, 0), False)
+    ]
 
 
 def test_an_interval_that_crosses_the_hour_belongs_to_the_chunk():
@@ -89,8 +107,9 @@ def test_a_closed_hour_reopens_only_when_a_stop_crosses_it():
         CEILING,
         "live",
         reopen={("open", closed)},
+        copied_until={"open": CEILING},
     )
-    assert [chunk.start for chunk in reopened] == [closed]
+    assert [(chunk.start, chunk.facts_only) for chunk in reopened] == [(closed, False)]
 
 
 def test_a_blocked_origin_is_not_a_chunk():
