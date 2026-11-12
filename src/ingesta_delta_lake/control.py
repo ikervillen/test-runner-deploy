@@ -125,6 +125,27 @@ class Control:
         row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
         return row[0] if row else None
 
+    def advance_observed_until(self, marks: dict) -> None:
+        """Latest accepted observation per origin. Empty means no row, not a missing slot."""
+        if not marks:
+            return
+        current = json.loads(self.setting("observed_until") or "{}")
+        changed = False
+        for origin, stamp in marks.items():
+            if not isinstance(origin, str) or not isinstance(stamp, str) or len(stamp) != 19:
+                continue
+            if current.get(origin) is None or stamp > current[origin]:
+                current[origin] = stamp
+                changed = True
+        if not changed:
+            return
+        with self.db:
+            self.db.execute(
+                "INSERT INTO settings VALUES('observed_until', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (canonical(current),),
+            )
+
     def start_attempt(self) -> str:
         attempt = str(uuid.uuid4())
         with self.db:

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
-from .common import IntegrityError, blank_input, canonical, digest, parse_int64
+from .common import IntegrityError, blank_input, canonical, digest, note_observed_time, parse_int64
 from .mp9 import timestamp
 
 CONTRACT = "lista_defectos_v2"
@@ -74,6 +74,7 @@ class Parsed:
     invalid_groups: set[tuple] = field(default_factory=set)
     rows_read: int = 0
     invalid_rows: int = 0
+    observed: dict[str, str] = field(default_factory=dict)
 
 
 def parse(snapshots, encoding):
@@ -89,6 +90,7 @@ def parse(snapshots, encoding):
             "bronze_path": snap.bronze_path,
         }
         if blank_input(data):
+            note_observed_time(result.observed, snap.origin, snap.producer_time)
             continue
         try:
             text = data.decode(encoding, errors="strict")

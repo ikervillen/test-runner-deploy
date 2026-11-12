@@ -40,6 +40,28 @@ def blank_input(data: bytes) -> bool:
     return not data.strip(b"\x00\t\r\n ")
 
 
+def note_observed_time(marks: dict[str, str], origin: str, stamp: str | None) -> None:
+    """Keep the latest local filename clock. A date without a clock is not a cutoff."""
+    if not origin or not stamp or len(stamp) != 19 or stamp[10] != "T":
+        return
+    current = marks.get(origin)
+    if current is None or stamp > current:
+        marks[origin] = stamp
+
+
+def horizon_marks(observed: dict, inserts, *, wrote: bool) -> dict[str, str]:
+    """Blank files and rows actually written. A rejected row does not move the horizon."""
+    marks = dict(observed or {})
+    if not wrote:
+        return marks
+    for row in inserts:
+        fecha = row.get("FECHA")
+        origin = row.get("origen_fenix")
+        if origin and hasattr(fecha, "strftime"):
+            note_observed_time(marks, origin, fecha.strftime("%Y-%m-%dT%H:%M:%S"))
+    return marks
+
+
 def parse_int64(token: str) -> int:
     """Entero decimal exacto; sin float ni conversión de códigos a categorías."""
     if not re.fullmatch(r"[+-]?[0-9]+", token.strip()):

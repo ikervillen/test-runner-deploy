@@ -9,7 +9,14 @@ from datetime import datetime
 
 from . import __version__
 from . import cont_zc as zc
-from .common import ConfigurationError, IntegrityError, canonical, digest, parse_int64
+from .common import (
+    ConfigurationError,
+    IntegrityError,
+    canonical,
+    digest,
+    horizon_marks,
+    parse_int64,
+)
 from .service import _apply
 from .sources import capture_inputs
 from .zc_storage import ZcStore
@@ -86,6 +93,7 @@ def process(config, control, attempt):
         version, wrote = _apply(config, control, store, control.batch(batch_id))
     elif inserts:
         raise IntegrityError("Un lote CONT_ZC confirmado exige nuevas inserciones")
+    control.advance_observed_until(horizon_marks(parsed.observed, inserts, wrote=wrote))
     return {
         "attempt_id": attempt,
         "batch_id": batch_id,

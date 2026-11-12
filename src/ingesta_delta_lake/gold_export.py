@@ -10,8 +10,9 @@ from .runtime import atomic_json
 def refresh(config, discoveries, *, exporter=None):
     """Republish review coverage while a data backlog is still pending.
 
-    Resolved controls must show READY without waiting for another family's queue.
-    This does not rewrite Silver tables or advance their data horizon.
+    Resolved controls show READY without waiting for another family's queue.
+    A family that already accepted a file, including an empty one, advances its
+    own horizon. Silver tables are not rewritten here.
     """
     if os.environ.get("INGESTA_GOLD_EXPORT", "0") != "1":
         return {"status": "DISABLED"}

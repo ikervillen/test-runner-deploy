@@ -167,7 +167,7 @@ def test_new_arrivals_are_consumed_on_next_scan_without_replaying_history(mia, m
 
 def test_partial_capture_is_durable_even_if_a_later_file_fails(mia, monkeypatch):
     paths = sources(mia, 2)
-    original = batching.capture
+    original = batching.stable_capture
 
     def capture(config, origin, path, stamp, **kwargs):
         if path == paths[1]:
@@ -175,7 +175,7 @@ def test_partial_capture_is_durable_even_if_a_later_file_fails(mia, monkeypatch)
         return original(config, origin, path, stamp, **kwargs)
 
     with monkeypatch.context() as patch:
-        patch.setattr(batching, "capture", capture)
+        patch.setattr(batching, "stable_capture", capture)
         with pytest.raises(OSError):
             run(mia)
     paths[0].unlink()
@@ -218,7 +218,7 @@ def test_pending_commit_recovers_before_a_new_intake_failure(mia, monkeypatch):
         with pytest.raises(OSError):
             run(mia)
     with monkeypatch.context() as patch:
-        patch.setattr(batching, "capture", fail)
+        patch.setattr(batching, "stable_capture", fail)
         with pytest.raises(OSError):
             run(mia)
     assert query(mia, "SELECT state FROM batches") == [("COMPLETED",)]

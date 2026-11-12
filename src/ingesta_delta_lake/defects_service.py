@@ -10,11 +10,11 @@ from dataclasses import replace
 
 from . import __version__
 from . import lista_defectos as defects
-from .common import ConfigurationError, IntegrityError, canonical, digest
+from .common import ConfigurationError, IntegrityError, canonical, digest, horizon_marks
 from .defects_storage import DefectsStore
 from .mia_scope import files, group_holds, scope_for
 from .service import _apply
-from .sources import capture, discover, input_scan, orphan_captures
+from .sources import discover, input_scan, orphan_captures, stable_capture
 
 BATCH_FILES = 8
 BATCH_BYTES = 4 * 1024 * 1024
@@ -112,7 +112,7 @@ def process(
     with input_scan(config, control) as due:
         if due:
             for origin, path, stamp in discover(config):
-                snapshot = capture(
+                snapshot = stable_capture(
                     replace(
                         config,
                         max_file_bytes=config.max_file_bytes
@@ -125,6 +125,8 @@ def process(
                     known=captured,
                     verified=verified,
                 )
+                if snapshot is None:
+                    continue
                 # Durable as soon as captured: a later capture error cannot lose this input.
                 control.receipts(attempt, [snapshot])
                 snapshots.append(snapshot)
@@ -333,12 +335,14 @@ def process_batch(
     prior = control.batch(batch_id)
     wrote = False
     scoped_rows = len(merged)
+    blank_marks = dict(getattr(parsed, "observed", {}))
     del existing, merged, parsed
     if prior is None:
         control.prepare(batch_id, digest([batch_id, operation_kind]), prepared)
         version, wrote = _apply(config, control, store, control.batch(batch_id))
     elif inserts:
         raise IntegrityError(f"Un lote {config.family} confirmado exige nuevas inserciones")
+    control.advance_observed_until(horizon_marks(blank_marks, inserts, wrote=wrote))
     status = (
         ("PARTIAL" if published_rows + len(inserts) else "BLOCKED")
         if not complete

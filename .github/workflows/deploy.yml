@@ -33,8 +33,8 @@ permissions:
   contents: read
 
 env:
-  GOLD_CONTEXT_COMMIT: 01dfd18f2ccbc0baf5779ff6213f5b3bf8f18493
-  GOLD_SOURCE_COMMIT: aed67ba50aee8fd7251db412610c11a1ce179f73
+  GOLD_CONTEXT_COMMIT: 6728e2d2beaa32235ead9f1b931cb9a9bc184872
+  GOLD_SOURCE_COMMIT: ac0e9d4be2bb5aa55600bb9670689549568c8727
 
 jobs:
   control-maintenance:
@@ -301,8 +301,8 @@ jobs:
       cancel-in-progress: false
     timeout-minutes: 1080
     env:
-      GOLD_CONTEXT_COMMIT: 3831dcbbd0d2c3c5947eb2e8f7638508e63075ac
-      GOLD_SOURCE_COMMIT: cd54407c097ef9848c9222c3133ec67b8b53ac12
+      GOLD_CONTEXT_COMMIT: 6728e2d2beaa32235ead9f1b931cb9a9bc184872
+      GOLD_SOURCE_COMMIT: ac0e9d4be2bb5aa55600bb9670689549568c8727
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

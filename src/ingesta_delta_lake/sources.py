@@ -170,7 +170,11 @@ def capture_inputs(config, control, attempt):
     with input_scan(config, control) as due:
         if due:
             for origin, path, stamp in discover(config):
-                snapshot = capture(config, origin, path, stamp, known=known, verified=verified)
+                snapshot = stable_capture(
+                    config, origin, path, stamp, known=known, verified=verified
+                )
+                if snapshot is None:
+                    continue
                 control.receipts(attempt, [snapshot])
                 snapshots.append(snapshot)
                 included.add((origin, snapshot.sha256))
@@ -190,6 +194,16 @@ def _read_limited(path: Path, maximum: int) -> bytes:
     if len(data) > maximum:
         raise CaptureError(f"Archivo por encima del límite de captura: {path}")
     return data
+
+
+def stable_capture(
+    config: Config, origin: str, path: Path, producer_time: str | None, *, known=None, verified=None
+) -> Snapshot | None:
+    """Skip a file that is still being copied. The rest of the family continues."""
+    try:
+        return capture(config, origin, path, producer_time, known=known, verified=verified)
+    except CaptureError:
+        return None
 
 
 def capture(
