@@ -7,6 +7,7 @@
     [string]$Python = 'python',
     [ValidateSet('Deploy', 'Rollback')][string]$Mode = 'Deploy'
 )
+# The plant job clones this tree with git. It does not download actions/checkout.
 $ErrorActionPreference = 'Stop'
 $projectDirectory = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 
