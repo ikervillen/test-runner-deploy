@@ -10,7 +10,15 @@ from dataclasses import replace
 
 from . import __version__
 from . import lista_defectos as defects
-from .common import ConfigurationError, IntegrityError, canonical, digest, horizon_marks
+from .common import (
+    ConfigurationError,
+    IntegrityError,
+    canonical,
+    digest,
+    horizon_marks,
+    live_slot_marks,
+    newest_slot,
+)
 from .defects_storage import DefectsStore
 from .mia_scope import files, group_holds, scope_for
 from .service import _apply
@@ -163,8 +171,10 @@ def process(
     wrote = recovery_count > 0
     stopped = False
     yielded = False
-    fresh = [item for item in pending if (item.origin, item.sha256) not in known_before]
-    backlog = [item for item in pending if (item.origin, item.sha256) in known_before]
+    unseen = [item for item in pending if (item.origin, item.sha256) not in known_before]
+    live = newest_slot(unseen)
+    live_keys = {(item.origin, item.sha256) for item in live}
+    backlog = [item for item in pending if (item.origin, item.sha256) not in live_keys]
     saved_origin = control.setting("last_mia_origin")
 
     def ordered(items):
@@ -174,7 +184,7 @@ def process(
             turns(items, saved_origin or "") if config.mia_batches_per_turn else chunks(items)
         )
 
-    phases = [ordered(fresh), ordered(backlog)] if pending else [iter([[]])]
+    phases = [ordered(live), ordered(backlog)] if pending else [iter([[]])]
     # An empty batch still reconciles old uncertain commits and reports current coverage.
     # Files that arrived this scan are written before any older backlog batch.
     for phase_index, selected in enumerate(phases):
@@ -196,6 +206,8 @@ def process(
                 operation_kind=operation_kind,
             )
             control.acknowledge_inputs(result["batch_id"], batch)
+            if phase_index == 0:
+                control.advance_live_until(live_slot_marks(batch))
             recovered.extend(result["recovered_operations"])
             batch_count += bool(batch)
             wrote = wrote or result["status"] == "APPLIED"
@@ -218,7 +230,7 @@ def process(
             )
             for key in cumulative:
                 totals[key] = totals.get(key, 0) + result[key]
-        if phase_index == 0 and fresh and backlog:
+        if phase_index == 0 and live and backlog:
             _restore_origin(control, saved_origin)
         if stopped or yielded:
             break

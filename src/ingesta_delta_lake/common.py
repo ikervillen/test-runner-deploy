@@ -40,6 +40,36 @@ def blank_input(data: bytes) -> bool:
     return not data.strip(b"\x00\t\r\n ")
 
 
+def slot_stamp(stamp: str | None) -> str | None:
+    """Ten-minute bucket of a filename clock. A date without a clock is not a live slot."""
+    if not stamp or len(stamp) != 19 or stamp[10] != "T":
+        return None
+    minute = int(stamp[14:16]) // 10 * 10
+    return f"{stamp[:14]}{minute:02d}:00"
+
+
+def newest_slot(snapshots) -> list:
+    """Files of the newest ten-minute bucket per origin. Older files stay on the backlog."""
+    newest: dict[str, str] = {}
+    for snap in snapshots:
+        slot = slot_stamp(getattr(snap, "producer_time", None))
+        if slot is not None and (snap.origin not in newest or slot > newest[snap.origin]):
+            newest[snap.origin] = slot
+    return [
+        snap
+        for snap in snapshots
+        if slot_stamp(getattr(snap, "producer_time", None)) == newest.get(snap.origin)
+    ]
+
+
+def live_slot_marks(snapshots) -> dict[str, str]:
+    """Filename clock of that newest bucket. This is the live signal, not the backlog fecha."""
+    marks: dict[str, str] = {}
+    for snap in newest_slot(snapshots):
+        note_observed_time(marks, snap.origin, snap.producer_time)
+    return marks
+
+
 def note_observed_time(marks: dict[str, str], origin: str, stamp: str | None) -> None:
     """Keep the latest local filename clock. A date without a clock is not a cutoff."""
     if not origin or not stamp or len(stamp) != 19 or stamp[10] != "T":

@@ -126,10 +126,17 @@ class Control:
         return row[0] if row else None
 
     def advance_observed_until(self, marks: dict) -> None:
-        """Latest accepted observation per origin. Empty means no row, not a missing slot."""
+        """History cursor: fecha of rows the backlog has actually stored."""
+        self._advance_mark("observed_until", marks)
+
+    def advance_live_until(self, marks: dict) -> None:
+        """Live cursor: filename clock of the newest slot. The backlog does not move it."""
+        self._advance_mark("live_until", marks)
+
+    def _advance_mark(self, key: str, marks: dict) -> None:
         if not marks:
             return
-        current = json.loads(self.setting("observed_until") or "{}")
+        current = json.loads(self.setting(key) or "{}")
         changed = False
         for origin, stamp in marks.items():
             if not isinstance(origin, str) or not isinstance(stamp, str) or len(stamp) != 19:
@@ -141,7 +148,7 @@ class Control:
             return
         with self.db:
             self.db.execute(
-                "INSERT INTO settings VALUES('observed_until', ?) "
+                f"INSERT INTO settings VALUES('{key}', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (canonical(current),),
             )

@@ -4,7 +4,12 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-from ingesta_delta_lake.common import CaptureError, horizon_marks, note_observed_time
+from ingesta_delta_lake.common import (
+    CaptureError,
+    horizon_marks,
+    live_slot_marks,
+    note_observed_time,
+)
 from ingesta_delta_lake.control import Control
 from ingesta_delta_lake.lista_defectos import parse
 from ingesta_delta_lake.sources import Snapshot, capture_inputs
@@ -31,6 +36,22 @@ def test_an_empty_file_records_its_clock_and_no_rows(tmp_path):
     assert parsed.entries == {}
     assert parsed.issues == []
     assert parsed.observed == {"AV21": "2026-11-12T09:10:00"}
+
+
+def test_only_the_newest_slot_is_the_live_signal():
+    class Snap:
+        def __init__(self, origin, producer_time):
+            self.origin = origin
+            self.producer_time = producer_time
+
+    marks = live_slot_marks(
+        [
+            Snap("AV21", "2026-11-12T06:50:00"),
+            Snap("AV21", "2026-11-12T15:02:01"),
+            Snap("AV22", "2026-11-12T15:10:00"),
+        ]
+    )
+    assert marks == {"AV21": "2026-11-12T15:02:01", "AV22": "2026-11-12T15:10:00"}
 
 
 def test_a_file_without_a_clock_does_not_invent_a_cutoff():

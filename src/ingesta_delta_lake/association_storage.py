@@ -115,19 +115,21 @@ def source_snapshot(config, family, read=True, *, expected=None):
                 ]
             else:
                 rows = list(data.values())
-        try:
-            observed_until = (
-                json.loads(settings["observed_until"]) if settings.get("observed_until") else {}
-            )
-        except json.JSONDecodeError:
-            observed_until = {}
+        def _mark(name):
+            try:
+                value = json.loads(settings[name]) if settings.get(name) else {}
+            except json.JSONDecodeError:
+                return {}
+            return value if isinstance(value, dict) else {}
+
         meta = {
             "family": family,
             "contract": cfg.contract.name,
             "version": version,
             "control_id": settings["control_id"],
             "quality_hash": digest(cases),
-            "observed_until": observed_until if isinstance(observed_until, dict) else {},
+            "observed_until": _mark("observed_until"),
+            "live_until": _mark("live_until"),
         }
         extra = {}
         if family == "CATALOGO_PRODUCCIONES":

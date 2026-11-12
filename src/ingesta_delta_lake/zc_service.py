@@ -15,6 +15,7 @@ from .common import (
     canonical,
     digest,
     horizon_marks,
+    live_slot_marks,
     parse_int64,
 )
 from .service import _apply
@@ -94,6 +95,7 @@ def process(config, control, attempt):
     elif inserts:
         raise IntegrityError("Un lote CONT_ZC confirmado exige nuevas inserciones")
     control.advance_observed_until(horizon_marks(parsed.observed, inserts, wrote=wrote))
+    control.advance_live_until(live_slot_marks(snapshots))
     return {
         "attempt_id": attempt,
         "batch_id": batch_id,
