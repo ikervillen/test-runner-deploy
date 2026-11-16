@@ -87,15 +87,44 @@ if ($env:GOLD_EXISTING_IMAGES) {
         Write-Output "Imagen verificada $image $identity"
         $index++
     }
-} else {
-    $buildxExe = Get-PinnedDockerTool 'docker-buildx-v0.38.1.exe' `
-        'https://github.com/docker/buildx/releases/download/v0.38.1/buildx-v0.38.1.windows-amd64.exe' `
-        'fd2e18501910dd535ea3aa7f69010b3cfdfba0f47aa27674124554386dfa26f3'
-    foreach ($image in $images.Keys) {
-        & $buildxExe build --load --platform linux/amd64 --provenance=false `
-            --file (Join-Path $root $images[$image]) --tag $image $root
-        if ($LASTEXITCODE -ne 0) { throw "No se pudo construir $image." }
+} elseif ($env:GOLD_REGISTRY_IMAGES) {
+    $published = @($env:GOLD_REGISTRY_IMAGES.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $invalidPublished = $published | Where-Object { $_ -notmatch '^ghcr.io/.+@sha256:[0-9a-f]{64}$' }
+    $localNames = @($images.Keys) + @('postgres:16')
+    if ($published.Count -ne $localNames.Count -or $invalidPublished) {
+        throw 'Se requieren las cuatro imagenes Gold publicadas por digest.'
     }
+    if (-not $env:INGESTA_GITHUB_TOKEN -or -not $env:INGESTA_REGISTRY_USER) {
+        throw 'Faltan las credenciales para descargar las imagenes Gold.'
+    }
+    $originalDockerConfig = $env:DOCKER_CONFIG
+    $sourceDockerConfig = if ($originalDockerConfig) { $originalDockerConfig } else {
+        Join-Path $env:USERPROFILE '.docker'
+    }
+    $temporaryParent = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+    $temporaryDockerConfig = Join-Path $temporaryParent ('fenix-gold-registry-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $temporaryDockerConfig | Out-Null
+    try {
+        $contextsDirectory = Join-Path $sourceDockerConfig 'contexts'
+        if (Test-Path -LiteralPath $contextsDirectory) {
+            Copy-Item -LiteralPath $contextsDirectory -Destination $temporaryDockerConfig -Recurse
+        }
+        $env:DOCKER_CONFIG = $temporaryDockerConfig
+        python -m deployment.registry
+        if ($LASTEXITCODE -ne 0) { throw 'No se ha podido autenticar el acceso al registro.' }
+        for ($index = 0; $index -lt $published.Count; $index++) {
+            & docker --context $context pull $published[$index]
+            if ($LASTEXITCODE -ne 0) { throw "No se pudo descargar $($published[$index])." }
+            & docker --context $context tag $published[$index] $localNames[$index]
+            if ($LASTEXITCODE -ne 0) { throw "No se pudo etiquetar $($localNames[$index])." }
+            Write-Output "Imagen lista $($localNames[$index])"
+        }
+    } finally {
+        $env:DOCKER_CONFIG = $originalDockerConfig
+        Remove-Item -LiteralPath $temporaryDockerConfig -Recurse -Force
+    }
+} else {
+    throw 'Gold ya no se construye en el servidor. Faltan las imagenes publicadas.'
 }
 
 function Start-VerifiedGoldApplication {

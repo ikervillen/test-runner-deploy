@@ -292,10 +292,77 @@ jobs:
           if ($env:GOLD_OPERATION -eq 'gold-data-status') { $arguments += '--data-status' }
           python @arguments
 
+  gold-images:
+    if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["gold-airflow","gold-activate"]'), inputs.operation) && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      images: ${{ steps.publish.outputs.images }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.GOLD_CONTEXT_COMMIT }}
+          path: .gold-context
+          persist-credentials: false
+      - name: Build Gold images and publish them
+        id: publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$(tr -d '[:space:]' < .gold-context/GOLD_REVISION)" = "$GOLD_SOURCE_COMMIT"
+          owner="${GITHUB_REPOSITORY,,}"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          publish() {
+            local remote="$1"
+            shift
+            docker build --platform linux/amd64 -t "$remote" "$@" >&2
+            docker push "$remote" >&2
+            local digest
+            digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "$remote")"
+            if [[ ! "$digest" =~ @sha256:[0-9a-f]{64}$ ]]; then
+              echo "La imagen $remote no tiene digest publicado" >&2
+              exit 1
+            fi
+            printf '%s\n' "$digest"
+          }
+          airflow="$(publish "ghcr.io/${owner}:gold-airflow-${GOLD_SOURCE_COMMIT}" -f .gold-context/orchestration/airflow/Dockerfile .gold-context)"
+          backend="$(publish "ghcr.io/${owner}:gold-backend-${GOLD_SOURCE_COMMIT}" -f .gold-context/backend/Dockerfile .gold-context)"
+          frontend="$(publish "ghcr.io/${owner}:gold-frontend-${GOLD_SOURCE_COMMIT}" -f .gold-context/Dockerfile.frontend .gold-context)"
+          postgres_remote="ghcr.io/${owner}:gold-postgres-16"
+          docker pull postgres:16
+          docker tag postgres:16 "$postgres_remote"
+          docker push "$postgres_remote"
+          postgres="$(docker image inspect --format '{{index .RepoDigests 0}}' "$postgres_remote")"
+          if [[ ! "$postgres" =~ @sha256:[0-9a-f]{64}$ ]]; then
+            echo "Postgres no tiene digest publicado" >&2
+            exit 1
+          fi
+          echo "images=${airflow},${backend},${frontend},${postgres}" >> "$GITHUB_OUTPUT"
+          docker logout ghcr.io
+
   gold-airflow:
-    if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["gold-airflow","gold-activate","gold-verify"]'), inputs.operation) && github.ref == 'refs/heads/develop'
+    needs: gold-images
+    if: >-
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/develop' &&
+      (
+        (inputs.operation == 'gold-verify' && needs.gold-images.result == 'skipped') ||
+        (contains(fromJSON('["gold-airflow","gold-activate"]'), inputs.operation) && needs.gold-images.result == 'success')
+      )
     runs-on: ${{ fromJSON(vars.INGESTA_RUNNER_LABELS || '["self-hosted","Windows","X64"]') }}
     environment: develop
+    permissions:
+      contents: read
+      packages: read
     concurrency:
       group: gold-develop-${{ github.repository }}
       cancel-in-progress: false
@@ -307,7 +374,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - name: Build Gold and start the Airflow control plane
+      - name: Pull published Gold images and start the Airflow control plane
         shell: powershell
         env:
           DEPLOY_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
@@ -321,6 +388,9 @@ jobs:
           GOLD_CONTEXT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GOLD_OPERATION: ${{ inputs.operation }}
           GOLD_EXISTING_IMAGES: ${{ inputs.gold_images }}
+          GOLD_REGISTRY_IMAGES: ${{ needs.gold-images.outputs.images }}
+          INGESTA_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INGESTA_REGISTRY_USER: ${{ github.actor }}
           DOCKER_BUILDKIT: '1'
         run: |
           $ErrorActionPreference = 'Stop'
