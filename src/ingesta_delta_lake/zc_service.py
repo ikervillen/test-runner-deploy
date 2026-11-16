@@ -16,6 +16,7 @@ from .common import (
     digest,
     horizon_marks,
     live_slot_marks,
+    newest_slot,
     parse_int64,
 )
 from .service import _apply
@@ -38,10 +39,42 @@ def process(config, control, attempt):
                 "wrote_this_attempt": wrote,
             }
         )
-    version, existing = store.read()
+    version, _existing = store.read()
     if control.setting("last_version") not in (None, str(version)):
         raise IntegrityError("Snapshot CONT_ZC distinto de su control")
     snapshots = capture_inputs(config, control, attempt)
+    live = newest_slot(snapshots)
+    live_ids = {(item.origin, item.sha256) for item in live}
+    # A repeated file is the same observation. It stays with the newest slot
+    # so the backlog does not count those rows a second time.
+    live = [item for item in snapshots if (item.origin, item.sha256) in live_ids]
+    backlog = [item for item in snapshots if (item.origin, item.sha256) not in live_ids]
+    phases = [batch for batch in (live, backlog) if batch] or [[]]
+    result = None
+    inserted = 0
+    wrote_any = False
+    for index, batch in enumerate(phases):
+        result = _commit_batch(
+            config,
+            control,
+            attempt,
+            store,
+            batch,
+            recovered if index == 0 else [],
+            recovered_count if index == 0 else 0,
+        )
+        inserted += result["inserted_this_attempt"]
+        wrote_any = wrote_any or result["status"] == "APPLIED"
+        if batch is live:
+            control.advance_live_until(live_slot_marks(batch))
+    result["inserted_this_attempt"] = inserted
+    if wrote_any and result["status"] == "NO_CHANGE":
+        result["status"] = "APPLIED"
+    return result
+
+
+def _commit_batch(config, control, attempt, store, snapshots, recovered, recovered_count):
+    version, existing = store.read()
     parsed = zc.parse(snapshots, config.encoding)
     from .review_adapters import filter_rejected
 
@@ -95,7 +128,6 @@ def process(config, control, attempt):
     elif inserts:
         raise IntegrityError("Un lote CONT_ZC confirmado exige nuevas inserciones")
     control.advance_observed_until(horizon_marks(parsed.observed, inserts, wrote=wrote))
-    control.advance_live_until(live_slot_marks(snapshots))
     return {
         "attempt_id": attempt,
         "batch_id": batch_id,

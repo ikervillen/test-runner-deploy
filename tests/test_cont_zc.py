@@ -9,6 +9,7 @@ import pytest
 from deltalake import DeltaTable
 
 from ingesta_delta_lake import cont_zc as zc
+from ingesta_delta_lake import zc_service
 from ingesta_delta_lake.cli import main
 from ingesta_delta_lake.common import ConfigurationError, IngestaError, IntegrityError
 from ingesta_delta_lake.service import run
@@ -450,3 +451,28 @@ def test_cli_ingest_and_read_only_yield(config, source, tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["published_records"] == 1
     assert main(["zc-yield", "--config", str(p), "--origin", "AV21", "--machine", "23"]) == 0
     assert json.loads(capsys.readouterr().out)["summary"]["rate_percent"] == "98.0793"
+
+
+def test_newest_counter_slot_is_stored_before_the_october_queue(config, monkeypatch):
+    folder = config.input_root / "AV21"
+    (folder / "19102026_090000_CONT_ZC.csv").write_text(
+        line(FECHA="19/10/2026 9:00:00"), encoding="utf-8"
+    )
+    (folder / "16112026_161000_CONT_ZC.csv").write_text(
+        line(FECHA="16/11/2026 16:10:00"), encoding="utf-8"
+    )
+    seen = []
+    real = zc_service._commit_batch
+
+    def spy(*args, **kwargs):
+        snapshots = kwargs.get("snapshots", args[4])
+        seen.append([item.producer_time for item in snapshots])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(zc_service, "_commit_batch", spy)
+    run(config)
+    assert seen == [["2026-11-16T16:10:00"], ["2026-10-19T09:00:00"]]
+    assert query(config, "SELECT value FROM settings WHERE key='live_until'") == [
+        ('{"AV21":"2026-11-16T16:10:00"}',)
+    ]
+    assert len(rows(config)) == 2
