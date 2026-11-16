@@ -8,6 +8,7 @@
     [ValidateSet('Deploy', 'Rollback')][string]$Mode = 'Deploy'
 )
 # The plant job clones this tree with git. It does not download actions/checkout.
+# This file is part of the develop pipeline. Changes limited to deploy.yml do not start it.
 $ErrorActionPreference = 'Stop'
 $projectDirectory = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 
