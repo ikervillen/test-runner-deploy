@@ -327,8 +327,8 @@ jobs:
             docker push "$remote" >&2
             local digest
             digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "$remote")"
-            if [[ ! "$digest" =~ @sha256:[0-9a-f]{64}$ ]]; then
-              echo "La imagen $remote no tiene digest publicado" >&2
+            if [[ ! "$digest" =~ ^ghcr.io/.+@sha256:[0-9a-f]{64}$ ]]; then
+              echo "La imagen $remote no tiene digest de ghcr.io: $digest" >&2
               exit 1
             fi
             printf '%s\n' "$digest"
@@ -337,12 +337,12 @@ jobs:
           backend="$(publish "ghcr.io/${owner}:gold-backend-${GOLD_SOURCE_COMMIT}" -f .gold-context/backend/Dockerfile .gold-context)"
           frontend="$(publish "ghcr.io/${owner}:gold-frontend-${GOLD_SOURCE_COMMIT}" -f .gold-context/Dockerfile.frontend .gold-context)"
           postgres_remote="ghcr.io/${owner}:gold-postgres-16"
-          docker pull postgres:16
+          docker pull postgres:16 >&2
           docker tag postgres:16 "$postgres_remote"
-          docker push "$postgres_remote"
-          postgres="$(docker image inspect --format '{{index .RepoDigests 0}}' "$postgres_remote")"
-          if [[ ! "$postgres" =~ @sha256:[0-9a-f]{64}$ ]]; then
-            echo "Postgres no tiene digest publicado" >&2
+          docker push "$postgres_remote" >&2
+          postgres="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$postgres_remote" | awk -v prefix="ghcr.io/${owner}@" 'index($0, prefix)==1 { print; exit }')"
+          if [[ ! "$postgres" =~ ^ghcr.io/.+@sha256:[0-9a-f]{64}$ ]]; then
+            echo "Postgres no tiene digest de ghcr.io" >&2
             exit 1
           fi
           echo "images=${airflow},${backend},${frontend},${postgres}" >> "$GITHUB_OUTPUT"

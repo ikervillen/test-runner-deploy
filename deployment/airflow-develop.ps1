@@ -92,7 +92,7 @@ if ($env:GOLD_EXISTING_IMAGES) {
     $invalidPublished = $published | Where-Object { $_ -notmatch '^ghcr.io/.+@sha256:[0-9a-f]{64}$' }
     $localNames = @($images.Keys) + @('postgres:16')
     if ($published.Count -ne $localNames.Count -or $invalidPublished) {
-        throw 'Se requieren las cuatro imagenes Gold publicadas por digest.'
+        throw "Se requieren las cuatro imagenes Gold publicadas por digest. Recibido: $($env:GOLD_REGISTRY_IMAGES)"
     }
     if (-not $env:INGESTA_GITHUB_TOKEN -or -not $env:INGESTA_REGISTRY_USER) {
         throw 'Faltan las credenciales para descargar las imagenes Gold.'
