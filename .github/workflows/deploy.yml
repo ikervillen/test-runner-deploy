@@ -181,6 +181,10 @@ jobs:
       contents: read
       packages: read
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - name: Deploy exact tested image to the branch environment
         shell: powershell
         env:
@@ -194,19 +198,6 @@ jobs:
           RELEASE_BRANCH: ${{ github.ref_name }}
           RELEASE_RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $dest = Join-Path $env:RUNNER_TEMP "ingesta-$env:GITHUB_RUN_ID"
-          if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
-          $ask = Join-Path $env:RUNNER_TEMP "askpass-$env:GITHUB_RUN_ID.cmd"
-          Set-Content -LiteralPath $ask -Value "@echo off`r`necho %INGESTA_GITHUB_TOKEN%" -Encoding ascii
-          $env:GIT_ASKPASS = $ask
-          $env:GIT_TERMINAL_PROMPT = '0'
-          git -c http.sslBackend=schannel clone --depth 1 --branch $env:RELEASE_BRANCH `
-            "https://x-access-token@github.com/$env:GITHUB_REPOSITORY.git" $dest
-          if ($LASTEXITCODE -ne 0) { throw 'No se ha podido clonar el commit probado.' }
-          Set-Location -LiteralPath $dest
-          $head = (git rev-parse HEAD).Trim()
-          if ($head -ne $env:RELEASE_SHA) { throw "El clon $head no es el commit probado." }
           $site = ./scripts/prepare_site.ps1 -Repository $env:GITHUB_REPOSITORY `
             -Branch $env:RELEASE_BRANCH -SitePath $env:DEPLOY_SITE `
             -InputBind $env:INPUT_BIND -DockerContext $env:DOCKER_CONTEXT_NAME
