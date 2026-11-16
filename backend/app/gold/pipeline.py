@@ -1347,13 +1347,29 @@ def _live_receipt(output_root: Path) -> dict | None:
     return read_json(path) if path.exists() else None
 
 
+def _live_anchor(cutoff: datetime) -> datetime:
+    """Start of the ten-minute slot that the next filename clock must pass.
+
+    A run at 16:10 is the slot that closes then. The anchor is 16:00, so a
+    file named 16:10 is copied and a file Silver already stored at 16:00 is not.
+    Between ticks, 16:07 keeps the same anchor: the slot that will enter is 16:10.
+    """
+    floored = cutoff.replace(minute=(cutoff.minute // 10) * 10, second=0, microsecond=0)
+    if cutoff == floored:
+        return floored - timedelta(minutes=10)
+    return floored
+
+
 def _mark_live_since(output_root: Path, cutoff: datetime) -> tuple[datetime, bool]:
-    """The first live run after deployment remembers its cutoff and copies nothing older."""
+    """Remember the slot Gold may copy. A mark from an older deployment is moved forward."""
+    anchor = _live_anchor(cutoff)
     path = output_root / "lanes" / "since.json"
     if path.exists():
-        return datetime.fromisoformat(read_json(path)["since"]), False
-    atomic_json(path, {"since": cutoff.isoformat()})
-    return cutoff, True
+        stored = datetime.fromisoformat(read_json(path)["since"])
+        if stored >= anchor - timedelta(minutes=10):
+            return stored, False
+    atomic_json(path, {"since": anchor.isoformat()})
+    return anchor, False
 
 
 def _read_copied(output_root: Path) -> dict[str, datetime]:
@@ -1501,14 +1517,7 @@ def _run(
         previous = Snapshot.open(output_root) if (output_root / "current.json").exists() else None
         since = copied_until = None
         if lane == "live":
-            since, fresh = _mark_live_since(output_root, cutoff)
-            if fresh:
-                return {
-                    "status": "UNCHANGED",
-                    "lane": lane,
-                    "publication_id": previous.publication_id if previous is not None else None,
-                    "source": source,
-                }
+            since, _ = _mark_live_since(output_root, cutoff)
             copied_until = _read_copied(output_root)
         statistics: dict[str, Any] = {}
         tables, coverage = build(

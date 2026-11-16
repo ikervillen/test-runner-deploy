@@ -145,3 +145,10 @@ def test_a_hour_chunk_deletes_only_that_hour():
         chunk_delete_predicate("quality_score_components", {"p1"}, hours, ("result-1",))
         == "t.\"id_resultado\" IN ('result-1')"
     )
+
+
+def test_the_live_anchor_is_the_slot_that_closes_next():
+    from app.gold.pipeline import _live_anchor
+
+    assert _live_anchor(datetime(2026, 11, 16, 16, 7)) == datetime(2026, 11, 16, 16, 0)
+    assert _live_anchor(datetime(2026, 11, 16, 16, 10)) == datetime(2026, 11, 16, 16, 0)
