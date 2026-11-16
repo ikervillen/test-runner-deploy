@@ -43,6 +43,7 @@ def process(config, control, attempt):
     if control.setting("last_version") not in (None, str(version)):
         raise IntegrityError("Snapshot CONT_ZC distinto de su control")
     snapshots = capture_inputs(config, control, attempt)
+    # The newest ten-minute slot is its own commit. October does not share it.
     live = newest_slot(snapshots)
     live_ids = {(item.origin, item.sha256) for item in live}
     # A repeated file is the same observation. It stays with the newest slot
