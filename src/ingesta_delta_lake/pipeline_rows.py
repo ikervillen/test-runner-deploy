@@ -45,6 +45,14 @@ def payload_hash(row):
     return digest(portable(row))
 
 
+def review_hash(family, row):
+    value = portable(row)
+    if family == "CONT_ZC":
+        for field in cont_zc.SPEEDS:
+            value[field] = cont_zc.speed(value[field])
+    return digest(value)
+
+
 def accepted_extension(family, old, new):
     """Only choose a published row that extends another; never synthesize a row."""
     if old == new:

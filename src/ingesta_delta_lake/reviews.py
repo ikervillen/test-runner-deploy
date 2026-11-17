@@ -244,6 +244,7 @@ def _execute(config, control, command, plan):
                     "ingesta_release": __version__,
                     "ingesta_timestamp_policy": config.timestamp_policy,
                     "ingesta_review_decision": command["decision_id"],
+                    "ingesta_review_rejected_hashes": canonical(plan["reject"]),
                 },
                 app_transactions=application_transaction(
                     control.control_id, plan["before_version"]
@@ -259,20 +260,18 @@ def _execute(config, control, command, plan):
                     commit_properties=props,
                 )
             elif replacing:
-                metrics = (
-                    table.merge(
-                        arrow,
-                        predicate,
-                        source_alias="s",
-                        target_alias="t",
-                        commit_properties=props,
-                    )
-                    .when_matched_update({f: f"s.`{f}`" for f in fields})
-                    .execute()
-                )
+                merger = table.merge(
+                    arrow,
+                    predicate,
+                    source_alias="s",
+                    target_alias="t",
+                    commit_properties=props,
+                ).when_matched_update({f: f"s.`{f}`" for f in fields})
+                if plan.get("archive_context"):
+                    merger = merger.when_not_matched_insert({f: f"s.`{f}`" for f in fields})
+                metrics = merger.execute()
                 if (
-                    metrics["num_target_rows_updated"] != 1
-                    or metrics["num_target_rows_inserted"]
+                    metrics["num_target_rows_updated"] + metrics["num_target_rows_inserted"] != 1
                     or metrics["num_target_rows_deleted"]
                 ):
                     raise IntegrityError("Review did not update exactly one homologous row")
