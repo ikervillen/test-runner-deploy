@@ -184,6 +184,7 @@ def _replace(config, control, a, origin, winners):
     )
     plan = {
         "before_version": version,
+        "archive_context": config.archive_context,
         "scope": scope,
         "old": old,
         "candidate": candidate,

@@ -16,10 +16,18 @@ SCHEMA = MODEL_SCHEMA  # Compatibilidad pública de la primera entrega.
 class DeltaStore:
     def __init__(self, config: Config, control_id: str):
         self.config = config
+        self.read_context = config.archive_context
         self.path = config.table_path
         self.plant = config.plant
         self.control_id = control_id
         self.contract = config.contract
+
+    def read_view(self, table):
+        if self.read_context is None:
+            return table
+        from .pipeline_read import AcceptedRead
+
+        return table if isinstance(table, AcceptedRead) else AcceptedRead(self, table)
 
     def table(self) -> DeltaTable | None:
         if not DeltaTable.is_deltatable(str(self.path)):
@@ -47,7 +55,7 @@ class DeltaStore:
         return table
 
     def read(self, table: DeltaTable | None = None) -> tuple[int | None, dict]:
-        table = table if table is not None else self.table()
+        table = self.read_view(table if table is not None else self.table())
         if table is None:
             return None, {}
         arrow = table.to_pyarrow_table()

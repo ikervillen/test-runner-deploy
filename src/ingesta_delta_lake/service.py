@@ -40,7 +40,16 @@ def _check_evidence(config: Config, prepared: dict) -> None:
 def _apply(
     config: Config, control: Control, store: DeltaStore, batch: dict
 ) -> tuple[int | None, bool]:
+    previous_context = store.read_context
+    try:
+        return _apply_pinned(config, control, store, batch)
+    finally:
+        store.read_context = previous_context
+
+
+def _apply_pinned(config, control, store, batch):
     prepared = control.prepared(batch)
+    store.read_context = prepared.get("archive_context")
     scoped = "read_scope" in prepared
     if scoped:
         if config.family not in {"LISTA_RECH", "LISTA_DEFECTOS"}:

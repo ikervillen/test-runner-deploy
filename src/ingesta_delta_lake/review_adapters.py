@@ -89,7 +89,12 @@ class Adapter:
             def version(self):
                 return 0
 
-        self.store.read(Snapshot())
+        context = self.store.read_context
+        try:
+            self.store.read_context = None
+            self.store.read(Snapshot())
+        finally:
+            self.store.read_context = context
         family = self.config.family
         if family == "MP9_CAMBIO_MODELO":
             from .mp9 import Parsed, decide

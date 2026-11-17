@@ -351,7 +351,7 @@ class AssociationControl(Control):
 
 class AssociationStore(DeltaStore):
     def read(self, table=None):
-        table = table if table is not None else self.table()
+        table = self.read_view(table if table is not None else self.table())
         if table is None:
             return None, {}
         arrow = table.to_pyarrow_table()
