@@ -219,7 +219,9 @@ class PipelineWorker:
                     family=family,
                     captured_ids=ids,
                 )
-                if result.get("status") == "APPLIED" and manifest is None:
+                if result.get("status") == "APPLIED" and (
+                    manifest is None or family not in manifest["tables"]
+                ):
                     raise IntegrityError("Applied transformation has no confirmed Silver table")
                 if ids:
                     intake.acknowledge(ids, result, published_at=now())

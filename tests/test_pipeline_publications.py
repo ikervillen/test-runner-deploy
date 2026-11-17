@@ -23,6 +23,10 @@ def test_reader_uses_confirmed_delta_without_opening_active_sqlite(
         worker.cycle(intake, phases=(("SIP_MODELO",),))
     snapshot = SilverSnapshot.open(pipeline_config.live)
     monkeypatch.setattr(sqlite3, "connect", lambda *a, **kw: pytest.fail("Reader opened SQLite"))
+    projection = snapshot.control("SIP_MODELO")
+    assert projection["cases"] == []
+    assert projection["meta"]["version"] == 0
+    assert projection["processing_window"] is None
     rows = [r for b in snapshot.batches("SIP_MODELO", batch_size=10) for r in b.to_pylist()]
     assert rows == [{"id_modelo_fenix": 2, "codigo_modelo_botella": "3082/360"}]
 
@@ -78,3 +82,38 @@ def test_manifest_tampering_is_rejected(config, pipeline_config):
             pipeline_config.live,
             {"schema_id": "fenix-silver-snapshot-v1", "publication_id": "a" * 64, "tables": {}},
         )
+
+
+def test_first_blocked_input_publishes_review_evidence_without_claiming_a_table(
+    config, pipeline_config
+):
+    (config.sources[0][1] / "SIP_MODELO.csv").write_text("2;3082/360;1;\n2;3082/361;1;\n")
+    worker = PipelineWorker(pipeline_config, "live", config)
+    worker.prepare()
+    with closing(
+        Intake(worker.source.intake_path, lane="live", identity=worker.identity)
+    ) as intake:
+        result = worker.cycle(intake, phases=(("SIP_MODELO",),))
+        assert result["SIP_MODELO"]["status"] == "BLOCKED"
+    snapshot = SilverSnapshot.open(worker.storage)
+    assert "SIP_MODELO" not in snapshot.manifest["tables"]
+    projection = snapshot.control("SIP_MODELO")
+    assert projection["version"] is None and projection["cases"]
+    assert projection["meta"]["quality_hash"]
+
+
+def test_association_artifacts_are_published_without_exposing_private_controls(
+    config, pipeline_config
+):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from ingesta_delta_lake.association_cas import read_blocks
+    from ingesta_delta_lake.association_storage import artifact
+
+    cfg = replace(config, publication_root=pipeline_config.live.exchange)
+    descriptor = artifact(cfg, {"approved": "decision"})
+    assert str(pipeline_config.live.exchange) in descriptor["path"]
+    consumer = SimpleNamespace(control_root=pipeline_config.live.exchange / "artifacts")
+    assert b'"approved":"decision"' in b"".join(read_blocks(consumer, descriptor))
+    assert not config.control_root.exists()
