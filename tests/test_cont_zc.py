@@ -2,7 +2,6 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import replace
-from datetime import datetime
 from decimal import ROUND_UP, Decimal, localcontext
 from pathlib import Path
 
@@ -455,7 +454,6 @@ def test_cli_ingest_and_read_only_yield(config, source, tmp_path, capsys):
 
 
 def test_newest_counter_slot_is_stored_before_the_october_queue(config, monkeypatch):
-    monkeypatch.setattr(zc_service, "plant_now", lambda: datetime(2026, 11, 16, 16, 20))
     folder = config.input_root / "AV21"
     (folder / "19102026_090000_CONT_ZC.csv").write_text(
         line(FECHA="19/10/2026 9:00:00"), encoding="utf-8"
@@ -475,13 +473,12 @@ def test_newest_counter_slot_is_stored_before_the_october_queue(config, monkeypa
     run(config)
     assert seen == [["2026-11-16T16:10:00"], ["2026-10-19T09:00:00"]]
     assert query(config, "SELECT value FROM settings WHERE key='live_until'") == [
-        ('{"AV21":"2026-11-16T16:20:00"}',)
+        ('{"AV21":"2026-11-16T16:10:00"}',)
     ]
     assert len(rows(config)) == 2
 
 
 def test_realtime_waits_for_the_next_slot_and_history_takes_october(config, monkeypatch):
-    monkeypatch.setattr(zc_service, "plant_now", lambda: datetime(2026, 11, 16, 16, 20))
     folder = config.input_root / "AV21"
     (folder / "19102026_090000_CONT_ZC.csv").write_text(
         line(FECHA="19/10/2026 9:00:00"), encoding="utf-8"
@@ -505,6 +502,6 @@ def test_realtime_waits_for_the_next_slot_and_history_takes_october(config, monk
     run(config)
     assert seen == [["2026-10-19T10:00:00"]]
     assert query(config, "SELECT value FROM settings WHERE key='live_until'") == [
-        ('{"AV21":"2026-11-16T16:20:00"}',)
+        ('{"AV21":"2026-11-16T16:10:00"}',)
     ]
     assert len(rows(config)) == 3

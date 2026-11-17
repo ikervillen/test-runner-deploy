@@ -68,13 +68,13 @@ def test_realtime_does_not_take_october_when_the_current_slot_is_stored():
     live, backlog, marks = split_live_backlog([october], [current, october], window)
     assert live == []
     assert backlog == [october]
-    assert marks == {"AV21": "2026-11-16T16:20:00"}
+    assert marks == {"AV21": "2026-11-16T16:10:00"}
     late = Snap("AV32", "2026-11-16T08:40:00", "late")
     slot = Snap("AV21", "2026-11-16T16:10:00", "slot")
     live, backlog, marks = split_live_backlog([late, slot], [late, slot], window)
     assert live == [slot]
     assert backlog == [late]
-    assert marks == {"AV32": "2026-11-16T16:20:00", "AV21": "2026-11-16T16:20:00"}
+    assert marks == {"AV32": "2026-11-16T16:10:00", "AV21": "2026-11-16T16:10:00"}
 
 
 def test_a_file_without_a_clock_does_not_invent_a_cutoff():

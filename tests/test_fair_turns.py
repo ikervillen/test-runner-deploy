@@ -35,12 +35,7 @@ def test_origin_cursor_and_budget_survive_new_attempts(config, family):
     assert final["remaining_versions"] == 0 and final["published_rows"] == 20
 
 
-def test_the_clock_slot_is_written_and_the_backlog_keeps_its_budget(config, monkeypatch):
-    from datetime import datetime
-
-    from ingesta_delta_lake import defects_service
-
-    monkeypatch.setattr(defects_service, "plant_now", lambda: datetime(2026, 10, 14, 10, 10))
+def test_the_clock_slot_is_written_and_the_backlog_keeps_its_budget(config):
     folder = config.sources[0][1]
     cfg = replace(
         config,

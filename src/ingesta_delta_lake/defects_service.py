@@ -17,8 +17,7 @@ from .common import (
     digest,
     history_yields,
     horizon_marks,
-    live_window,
-    plant_now,
+    shared_bronze_window,
     split_live_backlog,
 )
 from .defects_storage import DefectsStore
@@ -163,11 +162,15 @@ def process(
     stopped = False
     yielded = False
     # One clock window for every line. An older file on one line is backlog.
-    live, backlog, bronze_now = split_live_backlog(
-        pending, list(captured.values()), live_window(plant_now())
-    )
+    window, origins = shared_bronze_window(config.control_root)
+    if window is None:
+        live, backlog, bronze_now = [], list(pending), {}
+    else:
+        live, backlog, bronze_now = split_live_backlog(
+            pending, list(captured.values()), window, origins
+        )
     if lane != "history" and not live:
-        control.advance_live_until(bronze_now)
+        control.set_live_slot(bronze_now)
     if lane == "history" and history_yields():
         remaining = list(backlog)
         return {
@@ -230,7 +233,7 @@ def process(
             )
             control.acknowledge_inputs(result["batch_id"], batch)
             if is_live:
-                control.advance_live_until(bronze_now)
+                control.set_live_slot(bronze_now)
             recovered.extend(result["recovered_operations"])
             if not is_live:
                 batch_count += bool(batch)

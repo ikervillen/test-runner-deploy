@@ -129,9 +129,26 @@ class Control:
         """History cursor: fecha of rows the backlog has actually stored."""
         self._advance_mark("observed_until", marks)
 
-    def advance_live_until(self, marks: dict) -> None:
-        """Live cursor: filename clock of the newest slot. The backlog does not move it."""
-        self._advance_mark("live_until", marks)
+    def set_live_slot(self, marks: dict) -> None:
+        """Live cursor equals the Bronze slot. A clock that ran ahead is corrected."""
+        if not marks:
+            return
+        current = json.loads(self.setting("live_until") or "{}")
+        changed = False
+        for origin, stamp in marks.items():
+            if not isinstance(origin, str) or not isinstance(stamp, str) or len(stamp) != 19:
+                continue
+            if current.get(origin) != stamp:
+                current[origin] = stamp
+                changed = True
+        if not changed:
+            return
+        with self.db:
+            self.db.execute(
+                "INSERT INTO settings VALUES('live_until', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (canonical(current),),
+            )
 
     def _advance_mark(self, key: str, marks: dict) -> None:
         if not marks:

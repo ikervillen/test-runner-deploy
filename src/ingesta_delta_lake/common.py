@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -106,14 +108,54 @@ def live_slot_marks(snapshots) -> dict[str, str]:
     return marks
 
 
-def split_live_backlog(pending, bronze, window: tuple[str, str]):
-    """Live is the clock window, the same one for every table and every line.
+LIVE_SLOT_FAMILIES = ("LISTA_DEFECTOS", "LISTA_RECH", "CONT_ZC")
 
-    A file at 08:40 stays on the backlog when the clock window is 09:20–09:30,
-    even if that file is the newest one Bronze has for its table. The returned
-    marks close the window for every origin already present in Bronze, so a
-    line with no file in the window does not keep an older slot as live.
+
+def _family_captures(control_root, family: str):
+    path = control_root / f"control-{family.lower()}.sqlite"
+    if not path.exists():
+        return
+    uri = path.as_uri() + "?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+    except sqlite3.OperationalError:
+        return
+    with closing(connection) as db:
+        db.execute("PRAGMA query_only=ON")
+        for table in ("input_versions", "capture_cache"):
+            try:
+                rows = db.execute(f"SELECT descriptor_json FROM {table}").fetchall()
+            except sqlite3.OperationalError:
+                continue
+            for (raw,) in rows:
+                item = json.loads(raw)
+                yield item.get("origin"), item.get("producer_time")
+
+
+def shared_bronze_window(control_root):
+    """The last ten-minute slot Bronze has copied, shared by every family and line.
+
+    The slot is the filename clock of that copy. It is never the wall clock and
+    never ten minutes past the newest file.
     """
+    slot = None
+    origins: set[str] = set()
+    for family in LIVE_SLOT_FAMILIES:
+        for origin, stamp in _family_captures(control_root, family):
+            if origin:
+                origins.add(origin)
+            bucket = slot_stamp(stamp)
+            if bucket and (slot is None or bucket > slot):
+                slot = bucket
+    if slot is None:
+        return None, origins
+    start = datetime.fromisoformat(slot)
+    end = (start + timedelta(minutes=10)).isoformat(timespec="seconds")
+    return (slot, end), origins
+
+
+def split_live_backlog(pending, bronze, window: tuple[str, str], origins=None):
+    """Live is that one Bronze slot. Older copies, including October, are backlog."""
     start, end = window
     live = [
         snap
@@ -125,11 +167,9 @@ def split_live_backlog(pending, bronze, window: tuple[str, str]):
     # A repeated file is the same observation, even when its name has no clock.
     live = [snap for snap in pending if (snap.origin, snap.sha256) in live_shas]
     backlog = [snap for snap in pending if (snap.origin, snap.sha256) not in live_shas]
-    marks = {
-        snap.origin: end
-        for snap in bronze
-        if getattr(snap, "origin", None) and slot_stamp(getattr(snap, "producer_time", None))
-    }
+    if origins is None:
+        origins = {snap.origin for snap in bronze if getattr(snap, "origin", None)}
+    marks = {origin: start for origin in origins}
     return live, backlog, marks
 
 

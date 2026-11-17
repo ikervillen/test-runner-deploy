@@ -16,9 +16,8 @@ from .common import (
     digest,
     history_yields,
     horizon_marks,
-    live_window,
     parse_int64,
-    plant_now,
+    shared_bronze_window,
     slot_stamp,
     split_live_backlog,
 )
@@ -50,11 +49,15 @@ def process(config, control, attempt, *, lane="all"):
     unhandled = set(control.known_captures(pending=True))
     pending = [item for item in snapshots if (item.origin, item.sha256) in unhandled]
     bronze = list(control.known_captures().values())
-    live, backlog, bronze_now = split_live_backlog(
-        pending, bronze or snapshots, live_window(plant_now())
-    )
+    window, origins = shared_bronze_window(config.control_root)
+    if window is None:
+        live, backlog, bronze_now = [], list(pending), {}
+    else:
+        live, backlog, bronze_now = split_live_backlog(
+            pending, bronze or snapshots, window, origins
+        )
     if lane != "history" and not pending:
-        control.advance_live_until(bronze_now)
+        control.set_live_slot(bronze_now)
         if snapshots:
             return {
                 "status": "NO_CHANGE",
@@ -68,7 +71,7 @@ def process(config, control, attempt, *, lane="all"):
                 "remaining_versions": 0,
             }
     if lane != "history" and not live:
-        control.advance_live_until(bronze_now)
+        control.set_live_slot(bronze_now)
     if lane == "history" and history_yields():
         return {
             "status": "BACKLOG_PENDING" if backlog else "NO_INPUTS",
@@ -109,7 +112,7 @@ def process(config, control, attempt, *, lane="all"):
         inserted += result["inserted_this_attempt"]
         wrote_any = wrote_any or result["status"] == "APPLIED"
         if is_live_batch:
-            control.advance_live_until(bronze_now)
+            control.set_live_slot(bronze_now)
         if batch:
             committed.extend(batch)
     result["inserted_this_attempt"] = inserted
