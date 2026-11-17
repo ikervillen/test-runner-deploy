@@ -346,26 +346,17 @@ def worker(interval=600):
                             continue
                         run_phase(base, phase, stop, stop_path, record, active, lane="live")
                         service_reviews(base, stop, record)
-                    while not stop.is_set() and not history_yields():
-                        waiting = False
-
-                        def note(family, result, seconds):
-                            nonlocal waiting
-                            record(family, result, seconds)
-                            waiting = waiting or bool(result.get("remaining_versions", 0))
-
+                    if not stop.is_set() and not history_yields():
                         run_phase(
                             base,
                             HISTORY,
                             stop,
                             stop_path,
-                            note,
+                            record,
                             active,
                             limit=1,
                             lane="history",
                         )
-                        if not waiting:
-                            break
                 else:
                     from .common import history_yields
                     from .service import run
@@ -395,8 +386,7 @@ def worker(interval=600):
                             result = {"status": "FAILED", "error": str(exc)}
                         record(family, result, round(time.monotonic() - started, 3))
                         service_reviews(base, stop, record)
-                    while not stop.is_set() and not history_yields():
-                        waiting = False
+                    if not stop.is_set() and not history_yields():
                         for family in HISTORY:
                             if stop.is_set() or history_yields():
                                 break
@@ -413,9 +403,6 @@ def worker(interval=600):
                             except Exception as exc:
                                 result = {"status": "FAILED", "error": str(exc)}
                             record(family, result, round(time.monotonic() - started, 3))
-                            waiting = waiting or bool(result.get("remaining_versions", 0))
-                        if not waiting:
-                            break
                 if not stop.is_set() and not failed:
                     # A full export waits until every family has drained its queue.
                     # Review coverage does not: a closed case is READY on the next

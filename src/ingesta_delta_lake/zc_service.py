@@ -19,6 +19,7 @@ from .common import (
     live_window,
     parse_int64,
     plant_now,
+    slot_stamp,
     split_live_backlog,
 )
 from .defects_service import chunks
@@ -94,6 +95,7 @@ def process(config, control, attempt, *, lane="all"):
     for index, batch in enumerate(phases):
         if lane == "history" and index and history_yields():
             break
+        batch = _with_stored_slot(batch, bronze)
         result = _commit_batch(
             config,
             control,
@@ -116,6 +118,28 @@ def process(config, control, attempt, *, lane="all"):
     if wrote_any and result["status"] == "NO_CHANGE":
         result["status"] = "APPLIED"
     return result
+
+
+def _with_stored_slot(batch, bronze):
+    """A late file for a minute already stored must be parsed with that minute.
+
+    The later export stays the winner. An older copy alone would replace it.
+    """
+    if not batch:
+        return batch
+    slots = {
+        (item.origin, slot_stamp(item.producer_time))
+        for item in batch
+        if slot_stamp(item.producer_time)
+    }
+    seen = {(item.origin, item.sha256) for item in batch}
+    company = [
+        item
+        for item in bronze
+        if (item.origin, item.sha256) not in seen
+        and (item.origin, slot_stamp(item.producer_time)) in slots
+    ]
+    return [*batch, *company]
 
 
 def _bounded(backlog, limit):

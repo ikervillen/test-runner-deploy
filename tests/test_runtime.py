@@ -168,7 +168,7 @@ def test_parallel_worker_runs_dependency_phases_and_audits_each_child(mounted, m
     callbacks, phases = {}, []
     monkeypatch.setattr(signal, "signal", lambda n, f: callbacks.update({n: f}))
 
-    def phase(base, families, stop, stop_path, record, active):
+    def phase(base, families, stop, stop_path, record, active, lane="all", **_):
         assert not stop_file.exists()
         assert stop_path == stop_file
         phases.append(families)
@@ -324,7 +324,7 @@ def test_derived_cadence_is_bounded_with_permanent_backlog(mounted, monkeypatch,
                 callbacks[signal.SIGTERM]()
         return {"status": "NO_CHANGE", "remaining_versions": 1}
 
-    def phase(base, families, stop, stop_path, record, active):
+    def phase(base, families, stop, stop_path, record, active, lane="all", **_):
         for family in families:
             record(family, unit(__import__("dataclasses").replace(base, family=family)), 0)
 

@@ -43,6 +43,11 @@ class Captures:
         ):
             yield (origin, sha), Snapshot(**json.loads(raw))
 
+    def values(self):
+        """Every registered file, including ones already stored. The live clock needs them."""
+        for (raw,) in self.db.execute("SELECT descriptor_json FROM input_versions ORDER BY rowid"):
+            yield Snapshot(**json.loads(raw))
+
 
 class Consumed(Set):
     def __init__(self, db):
