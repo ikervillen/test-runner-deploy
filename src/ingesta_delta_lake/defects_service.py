@@ -266,9 +266,11 @@ def process_batch(
     scope = scope_for(parsed, model)
     store.set_scope(scope)
     before_files = files(store.table())
-    published_rows = sum(row[2] for row in before_files)
+    from .pipeline_retired import logical_rows
+
+    published_rows = logical_rows(control, store.table())
     control.ensure_inspection_index(
-        store.table().version() if before_files else None, published_rows
+        store.table().version() if store.table() is not None else None, published_rows
     )
     version, existing = store.read()
     if control.setting("last_version") not in (None, str(version)):

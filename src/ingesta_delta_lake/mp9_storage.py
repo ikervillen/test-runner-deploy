@@ -10,7 +10,7 @@ from deltalake import write_deltalake
 from deltalake.transaction import CommitProperties
 
 from . import __version__, mp9
-from .commit_protocol import application_transaction, delta_configuration
+from .commit_protocol import application_transaction, delta_configuration, merge_counts_match
 from .common import IntegrityError, canonical
 from .delta import DeltaStore
 from .modelos import content_hash as model_hash
@@ -158,9 +158,5 @@ class Mp9Store(DeltaStore):
                 .when_not_matched_insert_all()
                 .execute()
             )
-            if (
-                metrics["num_target_rows_inserted"] != len(inserts)
-                or metrics["num_target_rows_updated"] != len(updates)
-                or metrics["num_target_rows_deleted"] != 0
-            ):
+            if not merge_counts_match(metrics, inserts, updates, self.config):
                 raise IntegrityError("El MERGE MP9 no coincide con las intenciones preparadas")

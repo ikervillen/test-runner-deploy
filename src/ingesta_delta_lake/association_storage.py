@@ -17,7 +17,7 @@ from . import __version__, topology
 from . import associations as a
 from .ar_storage import ArStore
 from .catalog_storage import CatalogStore
-from .commit_protocol import application_transaction, delta_configuration
+from .commit_protocol import application_transaction, delta_configuration, merge_counts_match
 from .common import IntegrityError, canonical, digest, now
 from .control import Control
 from .defects_storage import DefectsStore
@@ -455,9 +455,5 @@ class AssociationStore(DeltaStore):
                 .when_not_matched_insert_all()
                 .execute()
             )
-            if (
-                m["num_target_rows_inserted"] != len(inserts)
-                or m["num_target_rows_updated"] != len(updates)
-                or m["num_target_rows_deleted"]
-            ):
+            if not merge_counts_match(m, inserts, updates, self.config):
                 raise IntegrityError("MERGE distinto de las decisiones")

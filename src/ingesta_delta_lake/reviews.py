@@ -130,9 +130,9 @@ def _plan(config, control, command):
     if (control.setting("last_version") or "None") != str(version):
         raise IntegrityError("Review destination is not confirmed")
     if scope and version is not None:
-        from .mia_scope import files
+        from .pipeline_retired import logical_rows
 
-        control.ensure_inspection_index(version, sum(row[2] for row in files(a.store.table())))
+        control.ensure_inspection_index(version, logical_rows(control, a.store.table()))
     rows = a.rows(existing)
     if rows.get(a.key(target)) != old:
         raise IntegrityError("Accepted value changed since the evidence was captured")
@@ -352,6 +352,9 @@ def _execute(config, control, command, plan):
             "UPDATE issues SET status='RESOLVED' WHERE issue_id=?", [(i,) for i in plan["close"]]
         )
         if plan["scope"]:
+            from .pipeline_retired import synchronize
+
+            synchronize(control, a.store.table())
             control.db.executemany(
                 "DELETE FROM inspection_current WHERE group_id=?",
                 [(g,) for g in plan.get("removed_group_ids", [])],
