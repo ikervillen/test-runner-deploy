@@ -226,7 +226,7 @@ def test_overwrites_and_new_versions_append_without_deleting_history(config, sou
     versioned.write_text("43;5;Rechazo molde NP;3;\n", encoding=config.encoding)
     assert run(config)["delta_version"] == 2 and len(rows(config)) == 3
     assert parse_name(versioned.name, config.family) == "2026-10-16T09:20:28"
-    (source.parent / "bad_SIP_DEFECTO_AR.csv").write_bytes(versioned.read_bytes())
+    (source.parent / "32102026_92028_SIP_DEFECTO_AR.csv").write_bytes(versioned.read_bytes())
     with pytest.raises(CaptureError):
         run(config)
 
