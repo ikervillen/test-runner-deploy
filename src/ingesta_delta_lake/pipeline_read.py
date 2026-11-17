@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 
 import pyarrow as pa
+import pyarrow.dataset as ds
 
 from .common import IntegrityError
 from .pipeline_view import ArchiveSnapshot, SilverView
@@ -19,6 +20,15 @@ class AcceptedArchive(ArchiveSnapshot):
         self.manifest = {**self.manifest, "rejections": {}}
 
     def records(self, *args, **kwargs):
+        local = self.view.local
+        if self.view.context["lane"] == "live":
+            if local is None:
+                return
+            own = (ds.field("__archive_source_table") == local.metadata().id) & (
+                ds.field("__archive_source_version") <= local.version()
+            )
+            selected = kwargs.get("expression")
+            kwargs["expression"] = own if selected is None else own & selected
         for record in super().records(*args, **kwargs):
             local = self.view.local
             if self.view.context["lane"] == "live" and (
