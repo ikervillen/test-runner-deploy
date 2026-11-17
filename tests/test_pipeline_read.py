@@ -137,3 +137,44 @@ def test_scoped_mia_reads_reuse_archived_evidence_with_dictionary_decoding(confi
         store.set_scope([["AV21", "2026-10-14T00:01:00", "2026-10-14T00:01:00"]])
         rows = list(store.read()[1].values())
         assert len(rows) == 1 and rows[0]["FECHA"] == "2026-10-14T00:01:00"
+
+
+def test_authorized_review_of_retired_row_does_not_resurrect_old_variant(config, pipeline_config):
+    from test_review_execution import command
+
+    from ingesta_delta_lake.common import now
+    from ingesta_delta_lake.pipeline_intake import Intake
+    from ingesta_delta_lake.pipeline_publications import SilverSnapshot, publish_family
+    from ingesta_delta_lake.pipeline_view import ArchiveSnapshot, SilverView
+    from ingesta_delta_lake.review_adapters import REPLACE
+    from ingesta_delta_lake.reviews import apply_command
+
+    manifest = archived(config, pipeline_config)
+    worker = PipelineWorker(pipeline_config, "live", config)
+    source = config.sources[0][1] / "01012020_120000_SIP_MODELO.csv"
+    source.write_text("2;3082/361;1;\n")
+    with closing(
+        Intake(worker.source.intake_path, lane="live", identity=worker.identity)
+    ) as intake:
+        assert worker.cycle(intake, phases=(("SIP_MODELO",),))["SIP_MODELO"]["status"] == "BLOCKED"
+    cfg = context(worker, manifest, pipeline_config)
+    with closing(Control(cfg)) as control:
+        table = DeltaStore(cfg, control.control_id).table()
+        metadata = {k: v for k, v in table.history(1)[0].items() if k.startswith("ingesta_")}
+        metadata.update(ingesta_maintenance="archive-retirement", ingesta_operation_id="retire")
+        table.delete(commit_properties=CommitProperties(custom_metadata=metadata))
+        with control.db:
+            control.db.execute(
+                "INSERT INTO batches VALUES('retire','retire','COMPLETED','{}',?,?,1)",
+                (now(), now()),
+            )
+            control.db.execute("UPDATE settings SET value='1' WHERE key='last_version'")
+        decision = command(cfg, control, REPLACE)
+        apply_command(cfg, control, decision)
+        assert DeltaStore(cfg, control.control_id).read()[1] == {2: "3082/361"}
+    publish_family(cfg, worker.storage, lane="live", identity=worker.identity, family=cfg.family)
+    result = SilverView(
+        live=SilverSnapshot.open(worker.storage), archive=ArchiveSnapshot(pipeline_config.history)
+    ).rows(cfg.family, max_rows=20, batch_size=1)
+    assert not result.conflicts
+    assert [row["codigo_modelo_botella"] for row in result.rows] == ["3082/361"]

@@ -12,7 +12,7 @@ from .common import IntegrityError, digest
 from .contracts import CONTRACTS, DictionaryContract
 from .pipeline_archive import META
 from .pipeline_publications import _inside, schema_hash
-from .pipeline_rows import business_key, payload_hash, reconcile
+from .pipeline_rows import business_key, payload_hash, reconcile, review_hash
 
 
 class ArchiveSnapshot:
@@ -76,6 +76,14 @@ class SilverView:
 
     def rows(self, family, *, max_rows, batch_size, expression=None):
         grouped, scanned = defaultdict(list), 0
+        rejected = set()
+        for snapshot in (self.live, self.history):
+            if snapshot is not None:
+                rejected.update(
+                    snapshot.manifest["tables"].get(family, {}).get("rejected_hashes", [])
+                )
+        if self.archive is not None:
+            rejected.update(self.archive.manifest.get("rejections", {}).get(family, []))
 
         def accept(records):
             nonlocal scanned
@@ -83,6 +91,8 @@ class SilverView:
                 scanned += 1
                 if scanned > max_rows:
                     raise IntegrityError("Combined Silver query exceeds its explicit row budget")
+                if review_hash(family, record["row"]) in rejected:
+                    continue
                 grouped[business_key(family, record["row"])].append(record)
 
         for snapshot in (self.live, self.history):
@@ -123,6 +133,8 @@ class SilverView:
                                 for k, v in event.items()
                                 if k in CONTRACTS[family].schema.names
                             }
+                            if review_hash(family, row) in rejected:
+                                continue
                             grouped[business_key(family, row)].append(
                                 {
                                     "row": row,

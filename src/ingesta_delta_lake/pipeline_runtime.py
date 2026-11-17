@@ -148,6 +148,8 @@ class PipelineWorker:
         )
 
     def refresh_archive(self):
+        if self.lane != "live":
+            return
         historical = self.pipelines.history
         root = historical.exchange / "archive"
         cached = self.storage.checkpoint / "archive-reference.json"

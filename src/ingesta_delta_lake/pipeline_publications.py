@@ -121,6 +121,11 @@ def publish_family(config, storage, *, lane, identity, family, captured_ids=()):
             name: json.loads(settings.get(name) or "{}")
             for name in ("observed_until", "live_until")
         }
+        rejected = [
+            r[0] for r in db.execute("SELECT row_hash FROM review_rejections ORDER BY row_hash")
+        ]
+        if cfg.read_max_rows is not None and len(rejected) > cfg.read_max_rows:
+            raise IntegrityError("Review publication exceeds its explicit row budget")
     root = storage.exchange / "silver"
     root.mkdir(parents=True, exist_ok=True)
     refs, parent = {}, None
@@ -142,6 +147,7 @@ def publish_family(config, storage, *, lane, identity, family, captured_ids=()):
         "confirmed_at": confirmed_at,
         "schema_id": schema_hash(pa.schema(table.schema().to_arrow())),
         "captured_ids": list(captured_ids),
+        "rejected_hashes": rejected,
         **horizons,
     }
     if parent and refs == previous.manifest["tables"]:

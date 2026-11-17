@@ -46,6 +46,8 @@ class Archive:
                 source TEXT PRIMARY KEY, row_offset INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS completed(
                 source_table TEXT PRIMARY KEY, version INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS rejections(
+                family TEXT NOT NULL, row_hash TEXT NOT NULL, PRIMARY KEY(family,row_hash));
             CREATE TABLE IF NOT EXISTS jobs(
               job_id TEXT PRIMARY KEY, family TEXT NOT NULL, before_version INTEGER,
               artifact TEXT NOT NULL, source TEXT NOT NULL, next_offset INTEGER NOT NULL,
@@ -76,6 +78,11 @@ class Archive:
         with portalocker.Lock(str(self.storage.checkpoint / "archive.lock"), mode="a", timeout=0):
             self.recover()
             ref = snapshot.manifest["tables"][family]
+            with self.db:
+                self.db.executemany(
+                    "INSERT OR IGNORE INTO rejections VALUES(?,?)",
+                    [(family, value) for value in ref.get("rejected_hashes", [])],
+                )
             if confirmation_age(ref, technical_now) < policy.retention_seconds:
                 return {"status": "NOT_DUE", "rows": 0}
             completed = self.db.execute(
@@ -317,6 +324,18 @@ class Archive:
             "owner": self.identity,
             "tables": tables,
             "completed": dict(self.db.execute("SELECT source_table,version FROM completed")),
+            "rejections": {
+                family: [
+                    r[0]
+                    for r in self.db.execute(
+                        "SELECT row_hash FROM rejections WHERE family=? ORDER BY row_hash",
+                        (family,),
+                    )
+                ]
+                for (family,) in self.db.execute(
+                    "SELECT DISTINCT family FROM rejections ORDER BY family"
+                ).fetchall()
+            },
         }
         publication = {**value, "publication_id": digest(value)}
         immutable_json(self.root / (publication["publication_id"] + ".json"), publication)

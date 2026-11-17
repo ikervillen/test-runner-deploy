@@ -1,5 +1,6 @@
 """Pinned accepted archive context for validation after physical live retirement."""
 
+import json
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -14,6 +15,8 @@ class AcceptedArchive(ArchiveSnapshot):
         super().__init__(
             SimpleNamespace(silver=view.context["root"]), manifest_path=view.context["manifest"]
         )
+        # A native owner's validator must not silently adopt another owner's decisions.
+        self.manifest = {**self.manifest, "rejections": {}}
 
     def records(self, *args, **kwargs):
         for record in super().records(*args, **kwargs):
@@ -81,6 +84,16 @@ class AcceptedScanner:
                         family: {
                             "table_id": view.local.metadata().id,
                             "version": view.local.version(),
+                            "rejected_hashes": sorted(
+                                {
+                                    value
+                                    for commit in view.local.history()
+                                    if commit["version"] <= view.local.version()
+                                    for value in json.loads(
+                                        commit.get("ingesta_review_rejected_hashes", "[]")
+                                    )
+                                }
+                            ),
                         }
                     }
                 },

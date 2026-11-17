@@ -59,6 +59,10 @@ class ArchiveQueue:
                 raise IntegrityError("Publication ancestry crosses producers")
             with self.db:
                 for family, ref in snapshot.manifest["tables"].items():
+                    self.db.executemany(
+                        "INSERT OR IGNORE INTO rejections VALUES(?,?)",
+                        [(family, value) for value in ref.get("rejected_hashes", [])],
+                    )
                     self.db.execute(
                         "INSERT OR IGNORE INTO archive_queue VALUES(?,?,?,?,?,0,0)",
                         (ref["table_id"], ref["version"], identity, family, ref["confirmed_at"]),
@@ -73,6 +77,8 @@ class ArchiveQueue:
                         (snapshot.manifest["parent"],),
                     )
             discovered += 1
+        if discovered:
+            self.archive._publish()
         return discovered
 
     def turn(self, *, policy, technical_now):
