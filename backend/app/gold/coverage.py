@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 from .context import stamp
 
 STEP = timedelta(minutes=10)
-INCOMPLETE_AFTER = timedelta(hours=24)
 REQUIRED_FAMILIES = frozenset({"LISTA_DEFECTOS", "LISTA_RECH", "LISTA_AR", "CONT_ZC"})
 
 
@@ -177,11 +176,8 @@ def _missing(reason: str | None) -> list[str]:
 def coverage_state(
     ceiling: datetime, target: datetime, cutoff: datetime | None, accreditation: Accreditation
 ) -> tuple[str, str | None]:
-    """READY when the data reach the target; INCOMPLETE after a day without them."""
+    """READY when the data reach the target. A gap, of any age, is still waiting."""
     if cutoff is not None and cutoff >= target:
         return "READY", None
     reason = accreditation.reason or "COVERAGE:INTERVAL"
-    waiting_since = cutoff if cutoff is not None else None
-    if waiting_since is not None and ceiling - waiting_since > INCOMPLETE_AFTER:
-        return "INCOMPLETE", reason
     return "WAITING_DEPENDENCY", reason

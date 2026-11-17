@@ -88,7 +88,7 @@ def test_effective_cutoff_is_capped_by_the_ceiling_and_never_regresses():
         (
             T - timedelta(hours=25),
             Accreditation(None, ("CONT_ZC", "LISTA_RECH"), False),
-            ("INCOMPLETE", "COVERAGE:CONT_ZC,LISTA_RECH"),
+            ("WAITING_DEPENDENCY", "COVERAGE:CONT_ZC,LISTA_RECH"),
         ),
     ],
 )
