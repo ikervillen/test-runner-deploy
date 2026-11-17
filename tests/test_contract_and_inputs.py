@@ -69,6 +69,35 @@ def test_unknown_selected_name_is_not_silently_ignored(config, source):
         discover(config)
 
 
+def test_live_copies_the_newest_slot_and_history_walks_the_older_ones(
+    config, source, monkeypatch
+):
+    from ingesta_delta_lake.sources import mirror_exports
+
+    folder = source.parent
+    for stamp, body in (
+        ("100000", "old"),
+        ("101000", "middle"),
+        ("102000", "new"),
+    ):
+        (folder / f"17112026_{stamp}_CONT_GEN.csv").write_text(body, encoding="utf-8")
+    live = mirror_exports(config, lane="live")
+    assert live["copied"] == 2
+    kinds = {path.parent.parent.name for path in config.bronze_root.rglob("*.csv")}
+    assert kinds == {"CONT_GEN", "SIP_MODELO"}
+    calls = {"n": 0}
+
+    def stop_before_the_second_slot(moment=None):
+        calls["n"] += 1
+        return calls["n"] > 2
+
+    monkeypatch.setattr("ingesta_delta_lake.sources.history_yields", stop_before_the_second_slot)
+    assert mirror_exports(config, lane="history")["copied"] == 1
+    assert len(list(config.bronze_root.rglob("*.csv"))) == 3
+    monkeypatch.setattr("ingesta_delta_lake.sources.history_yields", lambda moment=None: False)
+    assert mirror_exports(config, lane="history")["copied"] == 1
+
+
 def test_mirror_copies_every_csv_and_silver_ignores_the_other_suffixes(config, source):
     from dataclasses import replace
 

@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .common import CaptureError, IntegrityError, canonical, digest, now
+from .common import CaptureError, IntegrityError, canonical, digest, history_yields, now, slot_stamp
 from .config import Config
 
 FAMILY = "SIP_MODELO"
@@ -180,62 +180,116 @@ def input_scan(config, control):
             )
 
 
-def mirror_exports(config: Config) -> dict:
-    """Copy every CSV Fenix has left in the line folder. One failure does not stop the rest.
+def export_slot(name: str, kind: str) -> str | None:
+    """Ten-minute filename slot. A CSV without a clock is not a historical slot."""
+    if kind == "OTROS":
+        return None
+    try:
+        return slot_stamp(parse_name(name, kind))
+    except CaptureError:
+        return None
 
-    Unchanged files are not read again. A file that is still being written is left
-    for the next pass. Silver later opens only the families it knows.
-    """
-    index_path = config.control_root / "bronze-mirror.json"
-    index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {}
-    copied = unchanged = skipped = failed = 0
+
+def _mirror_candidates(config: Config, index: dict) -> tuple[list[dict], dict]:
+    """Every CSV in the line folders. Unchanged bytes are not read again."""
+    found: list[dict] = []
+    counts = {"unchanged": 0, "failed": 0}
     for origin, folder in config.sources:
         root = folder.resolve()
         if not root.is_dir():
-            failed += 1
+            counts["failed"] += 1
             continue
         with os.scandir(root) as entries:
-            names = sorted(e.name for e in entries if e.name.lower().endswith(".csv"))
+            names = sorted(entry.name for entry in entries if entry.name.lower().endswith(".csv"))
         for name in names:
             path = root / name
             try:
                 stat = path.stat()
             except OSError:
-                failed += 1
+                counts["failed"] += 1
                 continue
+            kind = export_kind(name) or "OTROS"
             previous = index.get(str(path))
-            if (
+            same = (
                 previous
                 and previous.get("size") == stat.st_size
                 and previous.get("mtime_ns") == stat.st_mtime_ns
-            ):
-                unchanged += 1
+            )
+            if same:
+                counts["unchanged"] += 1
+            found.append(
+                {
+                    "origin": origin,
+                    "path": path,
+                    "kind": kind,
+                    "slot": export_slot(name, kind),
+                    "same": same,
+                }
+            )
+    return found, counts
+
+
+def _copy_one(config: Config, index: dict, item: dict) -> str:
+    if item["same"]:
+        return "unchanged"
+    kind = item["kind"]
+    try:
+        stamp = None if kind == "OTROS" else parse_name(item["path"].name, kind)
+    except CaptureError:
+        stamp = None
+    try:
+        snapshot = capture(replace(config, family=kind), item["origin"], item["path"], stamp)
+    except CaptureError:
+        return "skipped"
+    except (OSError, IntegrityError):
+        return "failed"
+    index[str(item["path"])] = {
+        "size": snapshot.size,
+        "mtime_ns": snapshot.mtime_ns,
+        "sha256": snapshot.sha256,
+    }
+    return "copied"
+
+
+def mirror_exports(config: Config, lane: str = "all") -> dict:
+    """Copy Fenix into Bronze in two passes, the same way Silver and Gold run.
+
+    ``live`` copies the newest ten-minute slot, plus a file that has no clock.
+    ``history`` copies older slots, oldest first, and stops before the live tick.
+    One failure does not stop the rest. Silver later opens only the families it knows.
+    """
+    if lane not in {"live", "history", "all"}:
+        raise CaptureError(f"Carril de copia desconocido: {lane}")
+    index_path = config.control_root / "bronze-mirror.json"
+    index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {}
+    found, counts = _mirror_candidates(config, index)
+    newest = max((item["slot"] for item in found if item["slot"]), default=None)
+    live = [item for item in found if item["slot"] is None or item["slot"] == newest]
+    older: dict[str, list] = {}
+    for item in found:
+        if item["slot"] and item["slot"] != newest:
+            older.setdefault(item["slot"], []).append(item)
+    groups: list[list] = []
+    if lane in {"live", "all"}:
+        groups.append(live)
+    if lane in {"history", "all"} and not (lane == "history" and history_yields()):
+        for slot in sorted(older):
+            if history_yields():
+                break
+            groups.append(older[slot])
+    counts.update({"copied": 0, "skipped": 0, "lane": lane})
+    for group in groups:
+        for item in group:
+            outcome = _copy_one(config, index, item)
+            if outcome == "unchanged":
                 continue
-            kind = export_kind(name) or "OTROS"
-            try:
-                stamp = None if kind == "OTROS" else parse_name(name, kind)
-            except CaptureError:
-                stamp = None
-            try:
-                snapshot = capture(replace(config, family=kind), origin, path, stamp)
-            except CaptureError:
-                skipped += 1
-                continue
-            except (OSError, IntegrityError):
-                failed += 1
-                continue
-            index[str(path)] = {
-                "size": snapshot.size,
-                "mtime_ns": snapshot.mtime_ns,
-                "sha256": snapshot.sha256,
-            }
-            copied += 1
-    if copied or not index_path.exists():
+            counts[outcome] = counts.get(outcome, 0) + 1
+    if counts["copied"] or not index_path.exists():
         config.control_root.mkdir(parents=True, exist_ok=True)
         temporary = index_path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(index, sort_keys=True), encoding="utf-8")
         os.replace(temporary, index_path)
-    return {"copied": copied, "unchanged": unchanged, "skipped": skipped, "failed": failed}
+    return counts
 
 
 def capture_inputs(config, control, attempt):

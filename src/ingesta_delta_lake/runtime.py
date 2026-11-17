@@ -284,21 +284,28 @@ def worker(interval=600):
                 pass
             if activation.exists() and json.loads(activation.read_text()) != {"token": token}:
                 raise IntegrityError("Activación de otra instancia")
-            while not stop.is_set():
-                cycle_started = time.monotonic()
+            def mirror(lane):
                 try:
                     from .sources import mirror_exports
 
-                    mirrored = mirror_exports(base)
+                    mirrored = mirror_exports(base, lane=lane)
                 except Exception as exc:
                     mirrored = {
                         "copied": 0,
                         "unchanged": 0,
                         "skipped": 0,
                         "failed": 1,
+                        "lane": lane,
                         "error": str(exc),
                     }
-                print(canonical({"event": "BRONZE_MIRROR", "time": now(), **mirrored}), flush=True)
+                print(
+                    canonical({"event": "BRONZE_MIRROR", "time": now(), **mirrored}),
+                    flush=True,
+                )
+
+            while not stop.is_set():
+                cycle_started = time.monotonic()
+                mirror("live")
                 backlog = False
                 failed = False
                 next_scans = []
@@ -360,6 +367,8 @@ def worker(interval=600):
                         run_phase(base, phase, stop, stop_path, record, active, lane="live")
                         service_reviews(base, stop, record)
                     if not stop.is_set() and not history_yields():
+                        mirror("history")
+                    if not stop.is_set() and not history_yields():
                         run_phase(
                             base,
                             HISTORY,
@@ -399,6 +408,8 @@ def worker(interval=600):
                             result = {"status": "FAILED", "error": str(exc)}
                         record(family, result, round(time.monotonic() - started, 3))
                         service_reviews(base, stop, record)
+                    if not stop.is_set() and not history_yields():
+                        mirror("history")
                     if not stop.is_set() and not history_yields():
                         for family in HISTORY:
                             if stop.is_set() or history_yields():
