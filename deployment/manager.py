@@ -226,6 +226,48 @@ class Docker:
             raise
         return json.loads(result)
 
+    def fold_control_wal(self, record):
+        """Fold a leftover WAL into its database, then drop a tail that will not close.
+
+        The preflight opens controls read-only. A non-empty -wal from the previous
+        process blocks that open. TRUNCATE keeps the committed frames. A file that
+        is still non-empty afterwards is the unreadable tail and is removed.
+        """
+        script = (
+            "import sqlite3\n"
+            "from pathlib import Path\n"
+            "root = Path('/lake/control')\n"
+            "for path in sorted(root.glob('*.sqlite')):\n"
+            "    wal = Path(str(path) + '-wal')\n"
+            "    shm = Path(str(path) + '-shm')\n"
+            "    if wal.exists() and wal.stat().st_size:\n"
+            "        con = sqlite3.connect(path)\n"
+            "        try:\n"
+            "            con.execute('PRAGMA wal_checkpoint(TRUNCATE)')\n"
+            "        finally:\n"
+            "            con.close()\n"
+            "    if wal.exists() and wal.stat().st_size:\n"
+            "        wal.unlink()\n"
+            "    if shm.exists() and not wal.exists():\n"
+            "        shm.unlink()\n"
+        )
+        self.call(
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--user",
+            "10001:10001",
+            "--entrypoint",
+            "python",
+            "--mount",
+            "type=volume,src=" + record["volume"] + ",dst=/lake",
+            record["image"],
+            "-c",
+            script,
+            timeout=120,
+        )
+
     def create_control_trial(self, record):
         volume = record["volume"] + "-trial-" + uuid.uuid4().hex[:12]
         self.call(
@@ -705,6 +747,7 @@ class Deployment:
                 self.audit(journal, "DRAINING")
                 if old:
                     self.docker.drain(old, self.site["drain_seconds"])
+                self.docker.fold_control_wal(record)
                 checked = self.docker.helper(record, ["check"])
                 if not old and any(v is not None for v in checked["versions"].values()):
                     raise RuntimeError("No adoptar tablas sin descriptor de release anterior")

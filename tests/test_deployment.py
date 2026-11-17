@@ -90,6 +90,9 @@ class FakeDocker:
         if record["container"] in self.containers:
             self.containers[record["container"]]["running"] = False
 
+    def fold_control_wal(self, record):
+        self.events.append(("fold-wal", record["channel"]))
+
     def launch(self, record):
         self.events.append(("launch", record["container"]))
         if self.failed == "launch":
