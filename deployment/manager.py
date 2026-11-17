@@ -579,7 +579,7 @@ class Deployment:
             self.docker.resume(old)
         self.complete(journal, "RECOVERED_PREVIOUS")
 
-    def prepare_volume(self, record, *, allow_create):
+    def prepare_volume(self, record, *, allow_create, storage_image=None):
         volume = record["volume"]
         existing = self.docker.call("volume", "ls", "--format", "{{.Name}}").splitlines()
         labels = {
@@ -597,10 +597,11 @@ class Deployment:
         actual = self.docker.json("volume", "inspect", volume)[0].get("Labels") or {}
         if any(actual.get(k) != v for k, v in labels.items()):
             raise RuntimeError("El volumen no pertenece al entorno esperado")
-        if allow_create:
-            self.docker.helper(record, ["bootstrap"], readonly=False, root=True)
-        else:
+        if not allow_create:
             self.docker.helper(record, ["identity"])
+        storage_record = {**record, "image": storage_image or record["image"]}
+        self.docker.helper(storage_record, ["bootstrap"], readonly=False, root=True)
+        self.docker.helper(storage_record, ["storage-check"], readonly=False)
 
     def assert_latest(self, sha):
         if self.head(self.site["repository"], self.channel) != sha:
@@ -808,7 +809,9 @@ class Deployment:
                 or target["volume"] != current["volume"]
             ):
                 raise RuntimeError("Rollback incompatible con motor/contratos/datos actuales")
-            self.prepare_volume(target, allow_create=False)
+            # The previous image may predate storage-check. Use the current
+            # runtime to prepare the same validated volume before rolling back.
+            self.prepare_volume(target, allow_create=False, storage_image=current["image"])
             journal = {
                 "operation_id": uuid.uuid4().hex,
                 "candidate": target,

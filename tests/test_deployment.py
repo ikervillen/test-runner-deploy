@@ -160,8 +160,67 @@ def test_two_branches_have_independent_worker_volumes_and_descriptors(site, moto
     assert all(r["enabled"] for r in motor.containers.values())
     for branch in ("main", "develop"):
         helper_calls = [e for e in motor.events if e[0] == "helper" and e[1] == branch]
-        assert [e[2] for e in helper_calls] == [("bootstrap",), ("check",)]
+        assert [e[2] for e in helper_calls] == [("bootstrap",), ("storage-check",), ("check",)]
         assert helper_calls[-1][3] == {}  # check usa montaje readonly por defecto.
+
+
+def test_update_repairs_storage_as_root_then_checks_as_worker_before_draining(site, motor):
+    dep = deployer(site, motor)
+    dep.deploy(IMAGE1, SHA1, "first")
+    motor.events.clear()
+    motor.latest = SHA2
+    assert dep.deploy(IMAGE2, SHA2, "update")["status"] == "DEPLOYED"
+    repair = next(
+        i for i, e in enumerate(motor.events) if e[0] == "helper" and e[2] == ("bootstrap",)
+    )
+    probe = next(
+        i for i, e in enumerate(motor.events) if e[0] == "helper" and e[2] == ("storage-check",)
+    )
+    drain = next(i for i, e in enumerate(motor.events) if e[0] == "drain")
+    assert repair < probe < drain
+    assert motor.events[repair][3] == {"readonly": False, "root": True}
+    assert motor.events[probe][3] == {"readonly": False}
+
+
+def test_storage_failure_preserves_the_current_running_worker(site, motor):
+    dep = deployer(site, motor)
+    old = dep.deploy(IMAGE1, SHA1, "first")["release"]
+    motor.events.clear()
+    motor.latest = SHA2
+    original = motor.helper
+
+    def unwritable(record, command, **kwargs):
+        if command == ["storage-check"]:
+            raise RuntimeError("Sin permiso de escritura en /lake/bronze")
+        return original(record, command, **kwargs)
+
+    motor.helper = unwritable
+    with pytest.raises(RuntimeError, match="Sin permiso de escritura"):
+        dep.deploy(IMAGE2, SHA2, "update")
+    assert dep.active() == old
+    assert motor.containers[old["container"]]["running"]
+    assert not any(e[0] == "drain" for e in motor.events)
+
+
+def test_rollback_prepares_storage_with_current_runtime_when_old_image_lacks_probe(site, motor):
+    dep = deployer(site, motor)
+    dep.deploy(IMAGE1, SHA1, "first")
+    motor.latest = SHA2
+    dep.deploy(IMAGE2, SHA2, "update")
+    original = motor.helper
+    probes = []
+
+    def legacy_runtime(record, command, **kwargs):
+        if command == ["storage-check"]:
+            probes.append(record["image"])
+            if record["image"] == IMAGE1:
+                raise RuntimeError("Unknown command: storage-check")
+        return original(record, command, **kwargs)
+
+    motor.helper = legacy_runtime
+    assert dep.rollback("rollback")["status"] == "ROLLED_BACK"
+    assert probes == [IMAGE2]
+    assert dep.active()["image"] == IMAGE1
 
 
 def test_unicode_contract_metadata_remains_compatible_across_updates(site, motor):

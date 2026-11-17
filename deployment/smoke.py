@@ -48,6 +48,38 @@ def exercise(image):
                 records.append(current)
                 if len(records) == 1:
                     docker.helper(current, ["bootstrap"], readonly=False, root=True)
+                    # Reproduce the plant's legacy root-owned Bronze directory.
+                    docker.call(
+                        "run",
+                        "--rm",
+                        "--network",
+                        "none",
+                        "--read-only",
+                        "--user",
+                        "0:0",
+                        "--cap-drop",
+                        "ALL",
+                        "--cap-add",
+                        "CHOWN",
+                        "--mount",
+                        f"type=volume,src={volume},dst=/lake",
+                        "--entrypoint",
+                        "python",
+                        image,
+                        "-c",
+                        "import os; os.chown('/lake/bronze', 0, 0)",
+                    )
+                    try:
+                        docker.helper(current, ["storage-check"], readonly=False)
+                    except RuntimeError as exc:
+                        if "Sin permiso de escritura" not in str(exc):
+                            raise
+                    else:
+                        raise RuntimeError("Root-owned Bronze did not block the worker UID")
+                    docker.helper(current, ["bootstrap"], readonly=False, root=True)
+                    assert docker.helper(current, ["storage-check"], readonly=False) == {
+                        "status": "WRITABLE"
+                    }
                     assert all(
                         v is None for v in docker.helper(current, ["check"])["versions"].values()
                     )
@@ -87,6 +119,7 @@ def exercise(image):
                 "status": "PASSED",
                 "checks": [
                     "bootstrap",
+                    "legacy-bronze-ownership-repair",
                     "read-only-preflight",
                     "ready-gate",
                     "activation",

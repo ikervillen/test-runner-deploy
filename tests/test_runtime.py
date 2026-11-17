@@ -50,6 +50,58 @@ def test_bootstrap_is_explicit_repeatable_and_does_not_initialize_delta(mounted)
     assert all(v is None for v in runtime.check()["versions"].values())
 
 
+def test_existing_storage_repairs_directory_ownership_without_touching_data(mounted, monkeypatch):
+    runtime.bootstrap()
+    payload = mounted / "lake/bronze/existing.csv"
+    payload.write_bytes(b"original\n")
+    (mounted / "lake/gold").mkdir()
+    changed = []
+    monkeypatch.setattr(os, "chown", lambda *args: changed.append(args))
+
+    assert runtime.bootstrap()["status"] == "ALREADY_PREPARED"
+    assert set(changed) == {
+        (mounted / "lake" / name, 10001, 10001) for name in runtime.STORAGE_DIRECTORIES
+    }
+    assert payload.read_bytes() == b"original\n"
+
+
+@pytest.mark.parametrize("invalid", ["missing", "file", "wrong-environment"])
+def test_existing_storage_is_validated_before_any_ownership_change(mounted, monkeypatch, invalid):
+    runtime.bootstrap()
+    bronze = mounted / "lake/bronze"
+    if invalid == "wrong-environment":
+        monkeypatch.setenv("INGESTA_CHANNEL", "main")
+    else:
+        bronze.rmdir()
+        if invalid == "file":
+            bronze.write_text("not a directory")
+    changed = []
+    monkeypatch.setattr(os, "chown", lambda *args: changed.append(args))
+
+    with pytest.raises(IngestaError):
+        runtime.bootstrap()
+    assert not changed
+
+
+@pytest.mark.parametrize("name", runtime.STORAGE_DIRECTORIES)
+def test_worker_refuses_unwritable_storage_before_reporting_ready(mounted, monkeypatch, name):
+    runtime.bootstrap()
+    denied = mounted / "lake" / name
+    original = os.access
+    monkeypatch.setattr(os, "access", lambda path, mode: path != denied and original(path, mode))
+
+    with pytest.raises(IntegrityError, match="Sin permiso de escritura"):
+        runtime.worker(10)
+    assert not runtime.token_paths()[1].exists()
+
+
+def test_storage_check_does_not_write_probe_files(mounted):
+    runtime.bootstrap()
+    before = {p: p.read_bytes() for p in (mounted / "lake").rglob("*") if p.is_file()}
+    assert runtime.storage_check() == {"status": "WRITABLE"}
+    assert before == {p: p.read_bytes() for p in (mounted / "lake").rglob("*") if p.is_file()}
+
+
 @pytest.mark.parametrize("budget", [1, 3, 5])
 def test_mia_turn_budget_is_configurable_without_changing_batch_memory(
     mounted, monkeypatch, budget

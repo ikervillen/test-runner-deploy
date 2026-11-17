@@ -36,6 +36,7 @@ ORDER = (
 HISTORY = ("CONT_ZC", "LISTA_RECH", "LISTA_DEFECTOS")
 PROTOCOL = 1
 POLICY = "pilot-local-naive-v1"
+STORAGE_DIRECTORIES = ("bronze", "silver", "control", "runtime", "logs")
 
 
 def describe():
@@ -108,16 +109,35 @@ def bootstrap():
     path = root / "environment.json"
     if path.exists():
         marker()
+        # Existing volumes can contain a root-owned Bronze directory. Validate
+        # every target before repairing only the infrastructure directories.
+        directories = [root / name for name in STORAGE_DIRECTORIES]
+        if any(p.is_symlink() or not p.is_dir() for p in directories):
+            raise IntegrityError("Directorio de almacenamiento ausente o no seguro")
+        for directory in directories:
+            os.chown(directory, 10001, 10001)
         return {"status": "ALREADY_PREPARED"}
     if any(root.iterdir()):
         raise IntegrityError("No adoptar un volumen no vacío sin identidad")
     # Solo infraestructura explícita: no crea tablas ni controles SQLite.
-    for name in ("bronze", "silver", "control", "runtime", "logs"):
+    for name in STORAGE_DIRECTORIES:
         p = root / name
         p.mkdir()
         os.chown(p, 10001, 10001)
     atomic_json(path, {"channel": channel, "instance": instance, "protocol": PROTOCOL})
     return {"status": "PREPARED"}
+
+
+def storage_check():
+    """Run as the worker UID on a writable mount, without creating probe files."""
+    marker()
+    for name in STORAGE_DIRECTORIES:
+        directory = Path("/lake") / name
+        if directory.is_symlink() or not directory.is_dir():
+            raise IntegrityError(f"Directorio de almacenamiento no seguro: {directory}")
+        if not os.access(directory, os.W_OK | os.X_OK):
+            raise IntegrityError(f"Sin permiso de escritura en {directory}")
+    return {"status": "WRITABLE"}
 
 
 @contextmanager
@@ -254,6 +274,7 @@ def worker(interval=600):
     if not 10 <= interval <= 86400:
         raise ConfigurationError("Intervalo fuera de rango")
     _, _, base = settings()
+    storage_check()
     workers = int(os.environ.get("INGESTA_WORKERS", "2"))
     if workers not in (1, 2):
         raise ConfigurationError("INGESTA_WORKERS debe ser 1 o 2")
@@ -477,6 +498,7 @@ def main(argv=None):
         choices=[
             "describe",
             "bootstrap",
+            "storage-check",
             "identity",
             "check",
             "worker",
@@ -554,6 +576,7 @@ def main(argv=None):
         else:
             result = {
                 "bootstrap": bootstrap,
+                "storage-check": storage_check,
                 "identity": marker,
                 "health": health,
                 "activate": activate,
