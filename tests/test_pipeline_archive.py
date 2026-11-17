@@ -69,6 +69,12 @@ def test_archive_copies_then_confirms_without_mutating_live(config, pipeline_con
         "SIP_MODELO", max_rows=10, batch_size=2
     )
     assert len(combined.rows) == 1 and not combined.conflicts
+    from ingesta_delta_lake.pipeline_rows import business_key, review_hash
+
+    key = business_key("SIP_MODELO", combined.rows[0])
+    proofs = combined.lineages[key]
+    assert {p["source_table"] for p in proofs} == {snapshot.table("SIP_MODELO").metadata().id}
+    assert {p["row_hash"] for p in proofs} == {review_hash("SIP_MODELO", combined.rows[0])}
 
 
 def test_lost_archive_commit_ack_recovers_without_duplicates(config, pipeline_config, monkeypatch):
