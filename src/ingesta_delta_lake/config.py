@@ -45,6 +45,7 @@ class Config:
     pipeline_lane: str | None = None
     archive_root: Path | None = None
     archive_manifest: Path | None = None
+    reviews_only: bool = False
 
     @property
     def archive_context(self):
@@ -77,6 +78,8 @@ class Config:
         return self.control_root / filename
 
     def validate(self) -> None:
+        if type(self.reviews_only) is not bool:
+            raise ConfigurationError("reviews_only must be boolean")
         if type(self.change_data_feed) is not bool:
             raise ConfigurationError("change_data_feed must be boolean")
         for name in ("max_parallel_workers", "arrow_threads", "read_batch_rows"):

@@ -508,3 +508,21 @@ def process(config, control):
             atomic(result_path, result)
             result_path.with_suffix(".progress.json").unlink(missing_ok=True)
         processed += 1
+
+
+def pending_families(families):
+    """Discover command names only; the owner validates commands under its writer lock."""
+    configured = os.environ.get("INGESTA_REVIEW_ROOT")
+    if not configured:
+        return set()
+    root, pending = Path(configured), set()
+    for family in families:
+        for path in (root / "commands" / family).glob("*.json"):
+            try:
+                identifier = str(uuid.UUID(path.stem))
+            except ValueError:
+                continue
+            if not (root / "results" / family / (identifier + ".json")).exists():
+                pending.add(family)
+                break
+    return pending

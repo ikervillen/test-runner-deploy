@@ -63,7 +63,15 @@ def execute(config, result_path, stop_path, lane="all"):
     pa.set_io_thread_count(config.arrow_threads)
     started = time.monotonic()
     try:
-        result = run(config, runtime_owner=True, stop_requested=stop_path.exists, lane=lane)
+        result = run(
+            config,
+            runtime_owner=True,
+            stop_requested=stop_path.exists,
+            lane=lane,
+            reviews_only=config.reviews_only,
+        )
+        if config.reviews_only and result.get("status") == "REVIEW_WAITING_RECOVERY":
+            result = run(config, runtime_owner=True, stop_requested=stop_path.exists, lane=lane)
     except Exception as exc:
         result = {"status": "FAILED", "error": str(exc), "error_type": type(exc).__name__}
     atomic_json(

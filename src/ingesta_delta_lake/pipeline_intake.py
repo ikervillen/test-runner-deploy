@@ -236,7 +236,11 @@ class Intake:
         return tuple(r[0] for r in self.db.execute(query + " LIMIT ?", [*params, limit]))
 
     def acknowledge(self, ids, result, *, published_at):
-        if result.get("status") == "FAILED":
+        if (
+            result.get("status") not in {"APPLIED", "NO_CHANGE"}
+            or not result.get("complete", True)
+            or result.get("remaining_versions", 0)
+        ):
             return
         summary = {
             k: result[k]
@@ -253,6 +257,27 @@ class Intake:
                 "UPDATE inputs SET state='HANDLED', published_at=?, result=? "
                 "WHERE input_id=? AND state='CAPTURED'",
                 [(published_at, receipt, identity) for identity in ids],
+            )
+
+    def defer(self, ids, result):
+        if result.get("status") in {"RETRY_WAIT", "PAUSED_RETRY_EXHAUSTED"}:
+            state = "WAITING_RETRY"
+        elif result.get("status") in {"BLOCKED", "PARTIAL"}:
+            state = "WAITING_REVIEW"
+        else:
+            return
+        with self.db:
+            self.db.executemany(
+                "UPDATE inputs SET state=? WHERE input_id=? AND state='CAPTURED'",
+                [(state, identity) for identity in ids],
+            )
+
+    def release(self, family, state):
+        if state not in {"WAITING_REVIEW", "WAITING_RETRY"}:
+            raise IntegrityError("Only deferred captures can be released")
+        with self.db:
+            self.db.execute(
+                "UPDATE inputs SET state='CAPTURED' WHERE family=? AND state=?", (family, state)
             )
 
     def capture_turn(self, config, policy, candidates, *, clock=time.monotonic):
