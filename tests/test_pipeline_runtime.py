@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 from contextlib import closing
 from dataclasses import replace
@@ -106,3 +107,52 @@ def test_runtime_paths_remain_within_own_lane(config, pipeline_config):
     assert worker.source.runtime_root.is_relative_to(pipeline_config.live.checkpoint)
     assert not pipeline_config.history.checkpoint.exists()
     assert not pipeline_config.history.control.exists()
+
+
+def test_slow_derivation_does_not_hold_up_next_live_publication(config, pipeline_config):
+    from ingesta_delta_lake.workers import run_phase
+
+    source = config.sources[0][1] / "SIP_MODELO.csv"
+    source.write_text("2;3082/360;1;\n")
+    pipelines = replace(pipeline_config, policy=replace(pipeline_config.policy, poll_seconds=1))
+    worker = PipelineWorker(pipelines, "live", config)
+    entered, release = threading.Event(), threading.Event()
+
+    def execution(base, phase, stop, stop_path, on_result, *args, **kwargs):
+        if phase == ("ASIGNACION_PRODUCCION_RAMAL",):
+            entered.set()
+            release.wait()
+            on_result(phase[0], {"status": "NO_INPUTS"}, 0)
+        else:
+            run_phase(base, phase, stop, stop_path, on_result, *args, **kwargs)
+
+    errors = []
+
+    def run_worker():
+        try:
+            worker.run(
+                phases=(("SIP_MODELO",), ("ASIGNACION_PRODUCCION_RAMAL",)), executor=execution
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run_worker)
+    thread.start()
+    try:
+        assert entered.wait(15)
+        source.write_text("2;3082/360;1;\n3;3083/360;1;\n")
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if DeltaTable.is_deltatable(str(worker.source.table_path)):
+                table = DeltaTable(str(worker.source.table_path))
+                if table.count() == 2:
+                    break
+            time.sleep(0.1)
+        else:
+            pytest.fail("Next live input waited for the blocked derived job")
+        assert not release.is_set()
+    finally:
+        worker.stop.set()
+        release.set()
+        thread.join(15)
+    assert not thread.is_alive() and not errors
