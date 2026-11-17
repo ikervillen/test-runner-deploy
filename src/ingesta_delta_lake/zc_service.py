@@ -49,7 +49,9 @@ def process(config, control, attempt, *, lane="all"):
     unhandled = set(control.known_captures(pending=True))
     pending = [item for item in snapshots if (item.origin, item.sha256) in unhandled]
     bronze = list(control.known_captures().values())
-    window, origins = shared_bronze_window(config.control_root)
+    window, origins = shared_bronze_window(
+        config.control_root, selected_window=config.processing_window
+    )
     if window is None:
         live, backlog, bronze_now = [], list(pending), {}
     else:
@@ -72,7 +74,7 @@ def process(config, control, attempt, *, lane="all"):
             }
     if lane != "history" and not live:
         control.set_live_slot(bronze_now)
-    if lane == "history" and history_yields():
+    if lane == "history" and config.intake_path is None and history_yields():
         return {
             "status": "BACKLOG_PENDING" if backlog else "NO_INPUTS",
             "complete": not backlog,
@@ -95,7 +97,7 @@ def process(config, control, attempt, *, lane="all"):
     committed = []
     for index, batch in enumerate(phases):
         upcoming_live = bool(live) and batch is live
-        if index and not upcoming_live and history_yields():
+        if index and not upcoming_live and config.intake_path is None and history_yields():
             break
         is_live_batch = upcoming_live
         parsing = _with_stored_slot(batch, bronze)

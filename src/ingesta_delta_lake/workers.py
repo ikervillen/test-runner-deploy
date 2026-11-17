@@ -33,6 +33,10 @@ def decode_config(text):
         values["intake_path"] = Path(values["intake_path"])
     if "intake_ids" in values:
         values["intake_ids"] = tuple(values["intake_ids"])
+    if values.get("runtime_root") is not None:
+        values["runtime_root"] = Path(values["runtime_root"])
+    if values.get("processing_window") is not None:
+        values["processing_window"] = tuple(values["processing_window"])
     values["sources"] = tuple((o, Path(p)) for o, p in values["sources"])
     for name in ("line_by_origin", "line_code_by_origin"):
         values[name] = tuple(tuple(pair) for pair in values.get(name, ()))
@@ -47,13 +51,13 @@ def execute(config, result_path, stop_path, lane="all"):
     from .runtime import atomic_json
     from .service import run
 
-    root = (config.control_root.parent / "runtime").resolve()
+    root = (config.runtime_root or config.control_root.parent / "runtime").resolve()
     if any(p.resolve().parent != root for p in (result_path, stop_path)):
         raise ConfigurationError(
             "Unit result/stop paths must be in the controlled runtime directory"
         )
-    pa.set_cpu_count(2)
-    pa.set_io_thread_count(2)
+    pa.set_cpu_count(config.arrow_threads)
+    pa.set_io_thread_count(config.arrow_threads)
     started = time.monotonic()
     try:
         result = run(config, runtime_owner=True, stop_requested=stop_path.exists, lane=lane)
@@ -71,19 +75,32 @@ def execute(config, result_path, stop_path, lane="all"):
 
 
 def run_phase(
-    base, families, stop, stop_path, on_result, on_active=lambda _: None, *, limit=2, lane="all"
+    base,
+    families,
+    stop,
+    stop_path,
+    on_result,
+    on_active=lambda _: None,
+    *,
+    limit=2,
+    lane="all",
+    configs=None,
 ):
-    if limit not in (1, 2) or len(families) != len(set(families)):
+    if (
+        type(limit) is not int
+        or not 1 <= limit <= base.max_parallel_workers
+        or (len(families) != len(set(families)))
+    ):
         raise ConfigurationError("Invalid process budget or duplicate table in phase")
-    root = base.control_root.parent / "runtime"
+    root = base.runtime_root or base.control_root.parent / "runtime"
     if stop_path.resolve().parent != root.resolve():
         raise ConfigurationError("Stop path must be in the controlled runtime directory")
     root.mkdir(parents=True, exist_ok=True)
     pending, active = list(families), {}
     environment = {
         **os.environ,
-        "RAYON_NUM_THREADS": "2",
-        "TOKIO_WORKER_THREADS": "2",
+        "RAYON_NUM_THREADS": str(base.arrow_threads),
+        "TOKIO_WORKER_THREADS": str(base.arrow_threads),
         "OMP_NUM_THREADS": "1",
         "OPENBLAS_NUM_THREADS": "1",
     }
@@ -100,7 +117,7 @@ def run_phase(
                 if index is None:
                     break
                 family = pending.pop(index)
-                cfg = replace(base, family=family)
+                cfg = configs[family] if configs is not None else replace(base, family=family)
                 result_path = root / ("unit-" + uuid.uuid4().hex + ".json")
                 command = [
                     sys.executable,
