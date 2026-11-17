@@ -1456,11 +1456,16 @@ def _run(
         else:
             held.release()
     priority = (
-        portalocker.Lock(output_root / "live.priority.lock", timeout=0)
+        portalocker.Lock(output_root / "live.priority.lock", timeout=2)
         if lane == "live"
         else nullcontext()
     )
-    with priority:
+    try:
+        if lane == "live":
+            priority.acquire()
+    except portalocker.exceptions.LockException:
+        return {"status": "UNCHANGED", "lane": "live", "reason": "LIVE_BUSY"}
+    try:
         # A lane scores outside it and waits only for the other lane's commit.
         hold = (
             portalocker.Lock(output_root / "pipeline.lock", timeout=0)
@@ -1648,6 +1653,9 @@ def _run(
                     }
             finally:
                 tables.close()
+    finally:
+        if lane == "live":
+            priority.release()
 
 
 def run(input_root, output_root, **kwargs):
