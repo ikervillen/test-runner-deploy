@@ -15,9 +15,11 @@ from .common import (
     IntegrityError,
     canonical,
     digest,
+    history_yields,
     horizon_marks,
-    live_slot_marks,
-    newest_slot,
+    live_window,
+    plant_now,
+    split_live_backlog,
 )
 from .defects_storage import DefectsStore
 from .mia_scope import files, group_holds, scope_for
@@ -41,17 +43,6 @@ def chunks(snapshots):
         size += snapshot.size
     if batch:
         yield batch
-
-
-def _known_versions(control, captured):
-    """Versions already queued before this scan. A file seen now for the first time is live."""
-    database = getattr(captured, "db", None)
-    if database is not None:
-        return {
-            (origin, sha)
-            for origin, sha in database.execute("SELECT origin, sha256 FROM input_versions")
-        }
-    return set(captured)
 
 
 def _restore_origin(control, origin):
@@ -110,12 +101,12 @@ def process(
     store_class=DefectsStore,
     operation_kind="lista_defectos_insert_v2",
     stop_requested=None,
+    lane="all",
 ):
     # Technical recovery has priority over intake; an unavailable new CSV must
     # never prevent reconciliation of an already prepared/committed operation.
     recovered, recovery_count = reconcile_pending(config, control, store_class)
     captured = control.captured_inputs()
-    known_before = _known_versions(control, captured)
     snapshots, verified = [], set()
     with input_scan(config, control) as due:
         if due:
@@ -171,10 +162,30 @@ def process(
     wrote = recovery_count > 0
     stopped = False
     yielded = False
-    unseen = [item for item in pending if (item.origin, item.sha256) not in known_before]
-    live = newest_slot(unseen)
-    live_keys = {(item.origin, item.sha256) for item in live}
-    backlog = [item for item in pending if (item.origin, item.sha256) not in live_keys]
+    # One clock window for every line. An older file on one line is backlog.
+    live, backlog, bronze_now = split_live_backlog(
+        pending, list(captured.values()), live_window(plant_now())
+    )
+    if lane != "history" and not live:
+        control.advance_live_until(bronze_now)
+    if lane == "history" and history_yields():
+        remaining = list(backlog)
+        return {
+            "status": "BACKLOG_PENDING" if remaining else "NO_INPUTS",
+            "complete": not remaining,
+            "batch_id": None,
+            "remaining_versions": len(remaining),
+            "processed_versions": 0,
+            "recovered_operations": recovered,
+            "inserted_this_attempt": recovery_count,
+            "source_files": len(snapshots),
+            "pending_by_origin": dict(Counter(s.origin for s in remaining)),
+            "pending_bytes": sum(s.size for s in remaining),
+            "oldest_pending_received_at": min((s.received_at for s in remaining), default=None),
+            **control.progress(0, len(remaining)),
+            "completed_batches": 0,
+            "stats_scope": "sum_of_processed_batches",
+        }
     saved_origin = control.setting("last_mia_origin")
 
     def ordered(items):
@@ -184,15 +195,27 @@ def process(
             turns(items, saved_origin or "") if config.mia_batches_per_turn else chunks(items)
         )
 
-    phases = [ordered(live), ordered(backlog)] if pending else [iter([[]])]
-    # An empty batch still reconciles old uncertain commits and reports current coverage.
-    # Files that arrived this scan are written before any older backlog batch.
-    for phase_index, selected in enumerate(phases):
+    phases = []
+    if lane != "history" and live:
+        phases.append((True, ordered(live)))
+    if lane != "live" and backlog:
+        phases.append((False, ordered(backlog)))
+    if not phases:
+        phases = [(False, iter([[]]))]
+    for is_live, selected in phases:
         for batch in selected:
-            if result is not None and stop_requested is not None and stop_requested():
+            if result is not None and (
+                (stop_requested is not None and stop_requested())
+                or (lane == "history" and history_yields())
+            ):
                 stopped = True
                 break
-            if config.mia_batches_per_turn and batch_count >= config.mia_batches_per_turn:
+            if (
+                lane != "history"
+                and not is_live
+                and config.mia_batches_per_turn
+                and batch_count >= config.mia_batches_per_turn
+            ):
                 yielded = True
                 break
             started = time.monotonic()
@@ -206,10 +229,11 @@ def process(
                 operation_kind=operation_kind,
             )
             control.acknowledge_inputs(result["batch_id"], batch)
-            if phase_index == 0:
-                control.advance_live_until(live_slot_marks(batch))
+            if is_live:
+                control.advance_live_until(bronze_now)
             recovered.extend(result["recovered_operations"])
-            batch_count += bool(batch)
+            if not is_live:
+                batch_count += bool(batch)
             wrote = wrote or result["status"] == "APPLIED"
             completed += len(batch)
             print(
@@ -230,7 +254,7 @@ def process(
             )
             for key in cumulative:
                 totals[key] = totals.get(key, 0) + result[key]
-        if phase_index == 0 and live and backlog:
+        if is_live and live and backlog:
             _restore_origin(control, saved_origin)
         if stopped or yielded:
             break

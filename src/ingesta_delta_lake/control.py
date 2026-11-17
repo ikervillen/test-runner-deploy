@@ -169,8 +169,15 @@ class Control:
                 (result.get("batch_id"), now(), result["status"], canonical(result), attempt),
             )
             if self.capture_cached and result["status"] != "FAILED":
-                # The sole writer processes every pending cached revision in capture_inputs.
-                self.db.execute("UPDATE capture_cache SET handled=1 WHERE handled=0")
+                committed = result.get("committed_captures")
+                if committed is None:
+                    # Families that still commit the whole pending set in one turn.
+                    self.db.execute("UPDATE capture_cache SET handled=1 WHERE handled=0")
+                else:
+                    self.db.executemany(
+                        "UPDATE capture_cache SET handled=1 WHERE origin=? AND sha256=?",
+                        committed,
+                    )
         from .retention import compact_batch
         from .supervision_export import export
 

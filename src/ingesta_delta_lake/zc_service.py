@@ -14,17 +14,20 @@ from .common import (
     IntegrityError,
     canonical,
     digest,
+    history_yields,
     horizon_marks,
-    live_slot_marks,
-    newest_slot,
+    live_window,
     parse_int64,
+    plant_now,
+    split_live_backlog,
 )
+from .defects_service import chunks
 from .service import _apply
 from .sources import capture_inputs
 from .zc_storage import ZcStore
 
 
-def process(config, control, attempt):
+def process(config, control, attempt, *, lane="all"):
     store = ZcStore(config, control.control_id)
     recovered, recovered_count = [], 0
     for pending in control.pending():
@@ -43,18 +46,54 @@ def process(config, control, attempt):
     if control.setting("last_version") not in (None, str(version)):
         raise IntegrityError("Snapshot CONT_ZC distinto de su control")
     snapshots = capture_inputs(config, control, attempt)
-    # The newest ten-minute slot is its own commit. October does not share it.
-    live = newest_slot(snapshots)
-    live_ids = {(item.origin, item.sha256) for item in live}
-    # A repeated file is the same observation. It stays with the newest slot
-    # so the backlog does not count those rows a second time.
-    live = [item for item in snapshots if (item.origin, item.sha256) in live_ids]
-    backlog = [item for item in snapshots if (item.origin, item.sha256) not in live_ids]
-    phases = [batch for batch in (live, backlog) if batch] or [[]]
+    unhandled = set(control.known_captures(pending=True))
+    pending = [item for item in snapshots if (item.origin, item.sha256) in unhandled]
+    bronze = list(control.known_captures().values())
+    live, backlog, bronze_now = split_live_backlog(
+        pending, bronze or snapshots, live_window(plant_now())
+    )
+    if lane != "history" and not pending:
+        control.advance_live_until(bronze_now)
+        if snapshots:
+            return {
+                "status": "NO_CHANGE",
+                "complete": True,
+                "source_files": len(snapshots),
+                "inserted_this_attempt": recovered_count,
+                "recovered_operations": recovered,
+                "published_records": len(_existing),
+                "delta_version": version,
+                "committed_captures": [],
+                "remaining_versions": 0,
+            }
+    if lane != "history" and not live:
+        control.advance_live_until(bronze_now)
+    if lane == "history" and history_yields():
+        return {
+            "status": "BACKLOG_PENDING" if backlog else "NO_INPUTS",
+            "complete": not backlog,
+            "source_files": len(snapshots),
+            "inserted_this_attempt": recovered_count,
+            "recovered_operations": recovered,
+            "published_records": len(_existing),
+            "delta_version": version,
+            "committed_captures": [],
+            "remaining_versions": len(backlog),
+        }
+    if lane == "history":
+        phases = list(chunks(backlog)) or [[]]
+    elif lane == "live":
+        phases = [live] if live else [[]]
+    else:
+        history = _bounded(backlog, config.mia_batches_per_turn)
+        phases = [batch for batch in (live, history) if batch] or [[]]
     result = None
     inserted = 0
     wrote_any = False
+    committed = []
     for index, batch in enumerate(phases):
+        if lane == "history" and index and history_yields():
+            break
         result = _commit_batch(
             config,
             control,
@@ -66,12 +105,29 @@ def process(config, control, attempt):
         )
         inserted += result["inserted_this_attempt"]
         wrote_any = wrote_any or result["status"] == "APPLIED"
-        if batch is live:
-            control.advance_live_until(live_slot_marks(batch))
+        if live and batch is live:
+            control.advance_live_until(bronze_now)
+        if batch:
+            committed.extend(batch)
     result["inserted_this_attempt"] = inserted
+    result["committed_captures"] = [(item.origin, item.sha256) for item in committed]
+    if lane == "history":
+        result["remaining_versions"] = max(0, len(backlog) - len(committed))
     if wrote_any and result["status"] == "NO_CHANGE":
         result["status"] = "APPLIED"
     return result
+
+
+def _bounded(backlog, limit):
+    """Same history budget as defectos and rechazos: N batches, not the whole queue."""
+    if not limit:
+        return backlog
+    chosen = []
+    for index, batch in enumerate(chunks(backlog)):
+        if index >= limit:
+            break
+        chosen.extend(batch)
+    return chosen
 
 
 def _commit_batch(config, control, attempt, store, snapshots, recovered, recovered_count):

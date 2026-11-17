@@ -9,6 +9,7 @@ from ingesta_delta_lake.common import (
     horizon_marks,
     live_slot_marks,
     note_observed_time,
+    split_live_backlog,
 )
 from ingesta_delta_lake.control import Control
 from ingesta_delta_lake.lista_defectos import parse
@@ -52,6 +53,28 @@ def test_only_the_newest_slot_is_the_live_signal():
         ]
     )
     assert marks == {"AV21": "2026-11-12T15:02:01", "AV22": "2026-11-12T15:10:00"}
+
+
+def test_realtime_does_not_take_october_when_the_current_slot_is_stored():
+    class Snap:
+        def __init__(self, origin, producer_time, sha):
+            self.origin = origin
+            self.producer_time = producer_time
+            self.sha256 = sha
+
+    current = Snap("AV21", "2026-11-16T16:10:00", "current")
+    october = Snap("AV21", "2026-10-19T09:00:00", "october")
+    window = ("2026-11-16T16:10:00", "2026-11-16T16:20:00")
+    live, backlog, marks = split_live_backlog([october], [current, october], window)
+    assert live == []
+    assert backlog == [october]
+    assert marks == {"AV21": "2026-11-16T16:20:00"}
+    late = Snap("AV32", "2026-11-16T08:40:00", "late")
+    slot = Snap("AV21", "2026-11-16T16:10:00", "slot")
+    live, backlog, marks = split_live_backlog([late, slot], [late, slot], window)
+    assert live == [slot]
+    assert backlog == [late]
+    assert marks == {"AV32": "2026-11-16T16:20:00", "AV21": "2026-11-16T16:20:00"}
 
 
 def test_a_file_without_a_clock_does_not_invent_a_cutoff():

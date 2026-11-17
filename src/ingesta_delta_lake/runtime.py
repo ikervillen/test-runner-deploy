@@ -33,6 +33,7 @@ ORDER = (
     "LISTA_DEFECTOS",
     "ASIGNACION_PRODUCCION_RAMAL",
 )
+HISTORY = ("CONT_ZC", "LISTA_RECH", "LISTA_DEFECTOS")
 PROTOCOL = 1
 POLICY = "pilot-local-naive-v1"
 
@@ -321,6 +322,7 @@ def worker(interval=600):
                     print(canonical(event), flush=True)
 
                 if workers == 2:
+                    from .common import history_yields
                     from .workers import PHASES, run_phase
 
                     def active(units):
@@ -342,9 +344,32 @@ def worker(interval=600):
                                 0,
                             )
                             continue
-                        run_phase(base, phase, stop, stop_path, record, active)
+                        run_phase(base, phase, stop, stop_path, record, active, lane="live")
                         service_reviews(base, stop, record)
+                    while not stop.is_set() and not history_yields():
+                        waiting = False
+
+                        def note(family, result, seconds):
+                            nonlocal waiting
+                            record(family, result, seconds)
+                            waiting = waiting or bool(result.get("remaining_versions", 0))
+
+                        run_phase(
+                            base,
+                            HISTORY,
+                            stop,
+                            stop_path,
+                            note,
+                            active,
+                            limit=1,
+                            lane="history",
+                        )
+                        if not waiting:
+                            break
                 else:
+                    from .common import history_yields
+                    from .service import run
+
                     for family in ORDER:
                         if stop.is_set():
                             break
@@ -352,8 +377,6 @@ def worker(interval=600):
                             status.update(phase="RUNNING", family=family)
                         started = time.monotonic()
                         try:
-                            from .service import run
-
                             if (
                                 family == "ASIGNACION_PRODUCCION_RAMAL"
                                 and time.monotonic() < next_derived
@@ -366,11 +389,33 @@ def worker(interval=600):
                                     replace(base, family=family),
                                     runtime_owner=True,
                                     stop_requested=stop.is_set,
+                                    lane="live",
                                 )
                         except Exception as exc:
                             result = {"status": "FAILED", "error": str(exc)}
                         record(family, result, round(time.monotonic() - started, 3))
                         service_reviews(base, stop, record)
+                    while not stop.is_set() and not history_yields():
+                        waiting = False
+                        for family in HISTORY:
+                            if stop.is_set() or history_yields():
+                                break
+                            with guard:
+                                status.update(phase="RUNNING", family=family)
+                            started = time.monotonic()
+                            try:
+                                result = run(
+                                    replace(base, family=family),
+                                    runtime_owner=True,
+                                    stop_requested=lambda: stop.is_set() or history_yields(),
+                                    lane="history",
+                                )
+                            except Exception as exc:
+                                result = {"status": "FAILED", "error": str(exc)}
+                            record(family, result, round(time.monotonic() - started, 3))
+                            waiting = waiting or bool(result.get("remaining_versions", 0))
+                        if not waiting:
+                            break
                 if not stop.is_set() and not failed:
                     # A full export waits until every family has drained its queue.
                     # Review coverage does not: a closed case is READY on the next
@@ -392,16 +437,19 @@ def worker(interval=600):
                         )
                 with guard:
                     status.update(phase="IDLE", family=None)
-                # Rotate immediately while a durable backlog exists. When caught
-                # up, schedule scans from cycle start instead of adding 10 minutes
-                # on top of however long processing took. Errors retain backoff.
-                delay = (
-                    (30 if failed else 1)
-                    if backlog or failed
-                    else max(1, interval - (time.monotonic() - cycle_started))
-                )
-                if next_scans and not backlog and not failed:
-                    delay = max(1, min(delay, min(next_scans) - time.time()))
+                from .common import history_yields, next_live_tick, plant_now
+
+                until_tick = (next_live_tick(plant_now()) - plant_now()).total_seconds()
+                if history_yields():
+                    delay = max(0, until_tick)
+                else:
+                    delay = (
+                        (30 if failed else 1)
+                        if backlog or failed
+                        else max(1, interval - (time.monotonic() - cycle_started))
+                    )
+                    if next_scans and not backlog and not failed:
+                        delay = max(1, min(delay, min(next_scans) - time.time()))
                 stop.wait(delay)
         finally:
             heartbeat_stop.set()

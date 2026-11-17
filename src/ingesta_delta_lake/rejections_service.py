@@ -6,7 +6,7 @@ from .defects_service import process as ingest_observations
 from .rejections_storage import RejectionsStore
 
 
-def process(config, control, attempt, *, stop_requested=None):
+def process(config, control, attempt, *, stop_requested=None, lane="all"):
     return ingest_observations(
         config,
         control,
@@ -15,6 +15,7 @@ def process(config, control, attempt, *, stop_requested=None):
         store_class=RejectionsStore,
         operation_kind="lista_rech_insert_v1",
         stop_requested=stop_requested,
+        lane=lane,
     )
 
 

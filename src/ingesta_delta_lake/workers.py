@@ -37,7 +37,7 @@ def decode_config(text):
     return config
 
 
-def execute(config, result_path, stop_path):
+def execute(config, result_path, stop_path, lane="all"):
     import pyarrow as pa
 
     from .runtime import atomic_json
@@ -52,7 +52,7 @@ def execute(config, result_path, stop_path):
     pa.set_io_thread_count(2)
     started = time.monotonic()
     try:
-        result = run(config, runtime_owner=True, stop_requested=stop_path.exists)
+        result = run(config, runtime_owner=True, stop_requested=stop_path.exists, lane=lane)
     except Exception as exc:
         result = {"status": "FAILED", "error": str(exc), "error_type": type(exc).__name__}
     atomic_json(
@@ -66,7 +66,9 @@ def execute(config, result_path, stop_path):
     return 3 if result["status"] == "FAILED" else 0
 
 
-def run_phase(base, families, stop, stop_path, on_result, on_active=lambda _: None, *, limit=2):
+def run_phase(
+    base, families, stop, stop_path, on_result, on_active=lambda _: None, *, limit=2, lane="all"
+):
     if limit not in (1, 2) or len(families) != len(set(families)):
         raise ConfigurationError("Invalid process budget or duplicate table in phase")
     root = base.control_root.parent / "runtime"
@@ -106,6 +108,8 @@ def run_phase(base, families, stop, stop_path, on_result, on_active=lambda _: No
                     str(result_path),
                     "--stop",
                     str(stop_path),
+                    "--lane",
+                    lane,
                 ]
                 # Inherit stdout/stderr: a full pipe must never block a writer.
                 process = subprocess.Popen(command, env=environment)
@@ -159,8 +163,9 @@ def main(argv=None):
     parser.add_argument("--config-json", required=True)
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--stop", type=Path, required=True)
+    parser.add_argument("--lane", choices=("live", "history", "all"), default="all")
     args = parser.parse_args(argv)
-    return execute(decode_config(args.config_json), args.result, args.stop)
+    return execute(decode_config(args.config_json), args.result, args.stop, args.lane)
 
 
 if __name__ == "__main__":

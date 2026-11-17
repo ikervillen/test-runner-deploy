@@ -117,7 +117,9 @@ def _apply(
         raise IngestaError(f"Operación pendiente de reconciliación: {operation}: {exc}") from exc
 
 
-def _process(config: Config, control: Control, attempt: str, stop_requested=None) -> dict:
+def _process(
+    config: Config, control: Control, attempt: str, stop_requested=None, lane="all"
+) -> dict:
     if config.family in {"SIP_MAQUINA_MOLDEO", "SIP_LINEA_ZF"}:
         from .topology_service import process
 
@@ -129,7 +131,7 @@ def _process(config: Config, control: Control, attempt: str, stop_requested=None
     if config.family == "CONT_ZC":
         from .zc_service import process
 
-        return process(config, control, attempt)
+        return process(config, control, attempt, lane=lane)
     if config.family == "LISTA_AR":
         from .ar_service import process
 
@@ -137,11 +139,11 @@ def _process(config: Config, control: Control, attempt: str, stop_requested=None
     if config.family == "LISTA_RECH":
         from .rejections_service import process
 
-        return process(config, control, attempt, stop_requested=stop_requested)
+        return process(config, control, attempt, stop_requested=stop_requested, lane=lane)
     if config.family == "LISTA_DEFECTOS":
         from .defects_service import process
 
-        return process(config, control, attempt, stop_requested=stop_requested)
+        return process(config, control, attempt, stop_requested=stop_requested, lane=lane)
     if config.family == "CATALOGO_PRODUCCIONES":
         from .catalog_service import process
 
@@ -271,7 +273,12 @@ def _process(config: Config, control: Control, attempt: str, stop_requested=None
 
 
 def run(
-    config: Config, *, runtime_owner: bool = False, stop_requested=None, reviews_only=False
+    config: Config,
+    *,
+    runtime_owner: bool = False,
+    stop_requested=None,
+    reviews_only=False,
+    lane="all",
 ) -> dict:
     config.validate()
     for path in (config.bronze_root, config.silver_root, config.control_root):
@@ -353,7 +360,9 @@ def run(
                     from .reviews import process as process_reviews
 
                     process_reviews(config, control)
-                    result = _process(config, control, attempt, stop_requested=stop_requested)
+                    result = _process(
+                        config, control, attempt, stop_requested=stop_requested, lane=lane
+                    )
                     from .repeated_hour import process as resolve_repeated_hour
 
                     try:

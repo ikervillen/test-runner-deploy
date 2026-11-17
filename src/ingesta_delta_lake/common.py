@@ -2,9 +2,11 @@
 
 import hashlib
 import json
+import os
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 class IngestaError(Exception):
@@ -33,6 +35,40 @@ def digest(value: Any) -> str:
 
 def now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def plant_now() -> datetime:
+    """Filename clocks are plant-local. The live slot is that clock, not UTC."""
+    zone = ZoneInfo(os.environ.get("INGESTA_SOURCE_TIMEZONE", "Europe/Madrid"))
+    return datetime.now(zone).replace(tzinfo=None)
+
+
+def live_window(moment: datetime) -> tuple[str, str]:
+    """The ten minutes the live phase owns.
+
+    On a tick, 09:30:00, that is the slot that just closed: 09:20–09:30.
+    Between ticks, 09:37, it is the slot that contains the clock: 09:30–09:40.
+    Every family and every line uses this same pair.
+    """
+    floored = moment.replace(minute=(moment.minute // 10) * 10, second=0, microsecond=0)
+    on_tick = moment.second == 0 and moment.microsecond == 0 and moment.minute % 10 == 0
+    start = floored - timedelta(minutes=10) if on_tick else floored
+    end = start + timedelta(minutes=10)
+    return start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")
+
+
+def next_live_tick(moment: datetime) -> datetime:
+    """The next 10-minute boundary. A moment already on the boundary is that tick."""
+    floored = moment.replace(minute=(moment.minute // 10) * 10, second=0, microsecond=0)
+    if moment.replace(microsecond=0) == floored and moment.microsecond == 0:
+        return floored
+    return floored + timedelta(minutes=10)
+
+
+def history_yields(moment: datetime | None = None) -> bool:
+    """History releases the disk 20 seconds before the live tick owns it."""
+    moment = moment or plant_now()
+    return next_live_tick(moment) - moment <= timedelta(seconds=20)
 
 
 def blank_input(data: bytes) -> bool:
@@ -68,6 +104,33 @@ def live_slot_marks(snapshots) -> dict[str, str]:
     for snap in newest_slot(snapshots):
         note_observed_time(marks, snap.origin, snap.producer_time)
     return marks
+
+
+def split_live_backlog(pending, bronze, window: tuple[str, str]):
+    """Live is the clock window, the same one for every table and every line.
+
+    A file at 08:40 stays on the backlog when the clock window is 09:20–09:30,
+    even if that file is the newest one Bronze has for its table. The returned
+    marks close the window for every origin already present in Bronze, so a
+    line with no file in the window does not keep an older slot as live.
+    """
+    start, end = window
+    live = [
+        snap
+        for snap in pending
+        if (slot := slot_stamp(getattr(snap, "producer_time", None))) is not None
+        and start <= slot < end
+    ]
+    live_shas = {(snap.origin, snap.sha256) for snap in live}
+    # A repeated file is the same observation, even when its name has no clock.
+    live = [snap for snap in pending if (snap.origin, snap.sha256) in live_shas]
+    backlog = [snap for snap in pending if (snap.origin, snap.sha256) not in live_shas]
+    marks = {
+        snap.origin: end
+        for snap in bronze
+        if getattr(snap, "origin", None) and slot_stamp(getattr(snap, "producer_time", None))
+    }
+    return live, backlog, marks
 
 
 def note_observed_time(marks: dict[str, str], origin: str, stamp: str | None) -> None:
