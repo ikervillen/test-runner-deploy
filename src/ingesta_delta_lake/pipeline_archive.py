@@ -48,6 +48,8 @@ class Archive:
                 source_table TEXT PRIMARY KEY, version INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS rejections(
                 family TEXT NOT NULL, row_hash TEXT NOT NULL, PRIMARY KEY(family,row_hash));
+            CREATE TABLE IF NOT EXISTS receipt_links(
+                operation_id TEXT PRIMARY KEY,parent_json TEXT NOT NULL,receipt_hash TEXT);
             CREATE TABLE IF NOT EXISTS jobs(
               job_id TEXT PRIMARY KEY, family TEXT NOT NULL, before_version INTEGER,
               artifact TEXT NOT NULL, source TEXT NOT NULL, next_offset INTEGER NOT NULL,
@@ -269,6 +271,18 @@ class Archive:
         actual = {r["__archive_id"]: r for r in accepted.to_pylist()}
         if actual != expected_rows or len(actual) != accepted.num_rows:
             raise IntegrityError("Archive result differs from its prepared rows")
+        link = self.db.execute(
+            "SELECT parent_json FROM receipt_links WHERE operation_id=?", (job["job_id"],)
+        ).fetchone()
+        if link is None:
+            parent = self.receipt_head()
+            with self.db:
+                self.db.execute(
+                    "INSERT INTO receipt_links VALUES(?,?,NULL)",
+                    (job["job_id"], json.dumps(parent)),
+                )
+        else:
+            parent = json.loads(link[0])
         receipt = {
             "schema_id": "fenix-archive-receipt-v1",
             "operation_id": job["job_id"],
@@ -280,11 +294,17 @@ class Archive:
             "archive_version": expected,
             "schema_id_hash": schema_hash(pa.schema(table.schema().to_arrow())),
             "rows": [{k: r[k] for k in META.names} for r in data.to_pylist()],
+            "parent": parent,
         }
+        receipt["receipt_hash"] = digest(receipt)
         receipts = self.root / "receipts"
         receipts.mkdir(exist_ok=True)
         immutable_json(receipts / (job["job_id"] + ".json"), receipt)
         with self.db:
+            self.db.execute(
+                "UPDATE receipt_links SET receipt_hash=? WHERE operation_id=?",
+                (receipt["receipt_hash"], job["job_id"]),
+            )
             self.db.executemany(
                 "INSERT OR IGNORE INTO seen VALUES(?)", [(identity,) for identity in ids]
             )
@@ -304,6 +324,13 @@ class Archive:
         artifact.unlink(missing_ok=True)
         return receipt
 
+    def receipt_head(self):
+        head = self.db.execute(
+            "SELECT operation_id,receipt_hash FROM receipt_links WHERE receipt_hash IS NOT NULL "
+            "ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        return {"operation_id": head[0], "receipt_hash": head[1]} if head else None
+
     def _publish(self, family=None, receipt=None):
         path = self.root / "current.json"
         previous = json.loads(path.read_text()) if path.exists() else {"tables": {}}
@@ -322,6 +349,7 @@ class Archive:
         value = {
             "schema_id": "fenix-archive-snapshot-v1",
             "owner": self.identity,
+            "receipt_head": self.receipt_head(),
             "tables": tables,
             "completed": dict(self.db.execute("SELECT source_table,version FROM completed")),
             "rejections": {
