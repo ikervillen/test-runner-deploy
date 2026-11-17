@@ -152,6 +152,10 @@ def input_scan(config, control):
     Timestamp the start, confirm only a complete discovery/capture pass. Failed
     scans retry immediately; successful captures remain queued independently.
     """
+    if config.intake_path is not None:
+        control.input_scan_performed = bool(config.intake_ids)
+        yield control.input_scan_performed
+        return
     started = time.time()
     signature = digest(
         [
@@ -303,23 +307,34 @@ def capture_inputs(config, control, attempt):
     snapshots, included, verified = [], set(), set()
     with input_scan(config, control) as due:
         if due:
-            for origin, path, stamp in discover(config):
-                snapshot = stable_capture(
-                    config, origin, path, stamp, known=known, verified=verified
-                )
-                if snapshot is None:
-                    continue
+            for snapshot in available_captures(config, known=known, verified=verified):
                 control.receipts(attempt, [snapshot])
                 snapshots.append(snapshot)
-                included.add((origin, snapshot.sha256))
-                known.setdefault((origin, snapshot.sha256), snapshot)
-            for snapshot in orphan_captures(config, known):
-                control.receipts(attempt, [snapshot])
-                known[(snapshot.origin, snapshot.sha256)] = snapshot
+                included.add((snapshot.origin, snapshot.sha256))
+                known.setdefault((snapshot.origin, snapshot.sha256), snapshot)
+            if config.intake_path is None:
+                for snapshot in orphan_captures(config, known):
+                    control.receipts(attempt, [snapshot])
+                    known[(snapshot.origin, snapshot.sha256)] = snapshot
     for key, snapshot in control.known_captures(pending=True).items():
         if key not in included:
             snapshots.append(snapshot)
     return snapshots
+
+
+def available_captures(config, *, known, verified, discoverer=None, capturer=None):
+    """Both generic and MIA ingestion share the same selected-Bronze boundary."""
+    if config.intake_path is not None:
+        from .pipeline_intake import selected_snapshots
+
+        yield from selected_snapshots(config)
+        return
+    for origin, path, stamp in (discoverer or discover)(config):
+        snapshot = (capturer or stable_capture)(
+            config, origin, path, stamp, known=known, verified=verified
+        )
+        if snapshot is not None:
+            yield snapshot
 
 
 def _read_limited(path: Path, maximum: int) -> bytes:

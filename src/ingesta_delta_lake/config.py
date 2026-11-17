@@ -33,6 +33,8 @@ class Config:
     mia_batches_per_turn: int | None = None
     input_scan_interval_seconds: int = 0
     control_format: int = 2
+    intake_path: Path | None = None
+    intake_ids: tuple[str, ...] = ()
 
     @property
     def contract(self):
@@ -55,6 +57,17 @@ class Config:
         return self.control_root / filename
 
     def validate(self) -> None:
+        if self.intake_path is not None:
+            if (
+                not self.intake_path.is_absolute()
+                or self.intake_path != self.intake_path.resolve()
+                or str(self.intake_path).startswith("\\\\")
+            ):
+                raise ConfigurationError("Intake must be a resolved local checkpoint")
+            if any(not re.fullmatch(r"[0-9a-f]{64}", identity) for identity in self.intake_ids):
+                raise ConfigurationError("Invalid captured input identity")
+        elif self.intake_ids:
+            raise ConfigurationError("Selected inputs require an intake checkpoint")
         if type(self.control_format) is not int or self.control_format not in (2, 3):
             raise ConfigurationError("control_format must be 2 or 3")
         _ = self.contract  # Rechazar familias no implementadas antes de crear destinos.
@@ -141,13 +154,15 @@ class Config:
                 raise ConfigurationError("Los datos operativos no pueden estar dentro del código")
             if p.exists() and not p.is_dir():
                 raise ConfigurationError(f"No es un directorio: {p}")
-        if not self.input_root.is_dir() or not self.sources:
+        if (self.intake_path is None and not self.input_root.is_dir()) or not self.sources:
             raise ConfigurationError("Se necesita una entrada existente y al menos un origen")
         seen = set()
         for origin, path in self.sources:
             if not re.fullmatch(r"[A-Z0-9][A-Z0-9_-]*", origin):
                 raise ConfigurationError(f"Origen inválido: {origin}")
-            if not path.is_relative_to(self.input_root) or not path.is_dir():
+            if not path.is_relative_to(self.input_root) or (
+                self.intake_path is None and not path.is_dir()
+            ):
                 raise ConfigurationError(f"Origen fuera de la entrada o inexistente: {origin}")
             if path in seen:
                 raise ConfigurationError("Dos orígenes no pueden reutilizar la misma carpeta")
@@ -188,6 +203,13 @@ def load_config(path: Path) -> Config:
             if not decision_path.is_absolute():
                 raise ConfigurationError("association_decisions debe ser absoluto")
             data["association_decisions"] = decision_path.resolve()
+        if data.get("intake_path") is not None:
+            intake_path = Path(data["intake_path"])
+            if not intake_path.is_absolute():
+                raise ConfigurationError("Intake debe ser absoluto")
+            data["intake_path"] = intake_path.resolve()
+        if "intake_ids" in data:
+            data["intake_ids"] = tuple(data["intake_ids"])
         config = Config(**{**data, **roots, "sources": sources})
         config.validate()
         return config

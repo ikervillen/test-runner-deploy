@@ -24,7 +24,7 @@ from .common import (
 from .defects_storage import DefectsStore
 from .mia_scope import files, group_holds, scope_for
 from .service import _apply
-from .sources import discover, input_scan, orphan_captures, stable_capture
+from .sources import available_captures, discover, input_scan, orphan_captures, stable_capture
 
 MAX_FILE_BYTES = 8 * 1024 * 1024
 POLICY = "bounded-context-v2"
@@ -86,29 +86,26 @@ def process(
     snapshots, verified = [], set()
     with input_scan(config, control) as due:
         if due:
-            for origin, path, stamp in discover(config):
-                snapshot = stable_capture(
-                    replace(
-                        config,
-                        max_file_bytes=config.max_file_bytes
-                        if control.compact
-                        else min(config.max_file_bytes, MAX_FILE_BYTES),
-                    ),
-                    origin,
-                    path,
-                    stamp,
-                    known=captured,
-                    verified=verified,
-                )
-                if snapshot is None:
-                    continue
+            for snapshot in available_captures(
+                replace(
+                    config,
+                    max_file_bytes=config.max_file_bytes
+                    if control.compact
+                    else min(config.max_file_bytes, MAX_FILE_BYTES),
+                ),
+                known=captured,
+                verified=verified,
+                discoverer=discover,
+                capturer=stable_capture,
+            ):
                 # Durable as soon as captured: a later capture error cannot lose this input.
                 control.receipts(attempt, [snapshot])
                 snapshots.append(snapshot)
                 captured.setdefault((snapshot.origin, snapshot.sha256), snapshot)
-            for snapshot in orphan_captures(config, captured):
-                control.receipts(attempt, [snapshot])
-                captured[(snapshot.origin, snapshot.sha256)] = snapshot
+            if config.intake_path is None:
+                for snapshot in orphan_captures(config, captured):
+                    control.receipts(attempt, [snapshot])
+                    captured[(snapshot.origin, snapshot.sha256)] = snapshot
     consumed = control.consumed_inputs()
     parents = set()
     if control.compact:

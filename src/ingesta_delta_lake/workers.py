@@ -29,6 +29,10 @@ def decode_config(text):
         values[name] = Path(values[name])
     if values.get("association_decisions") is not None:
         values["association_decisions"] = Path(values["association_decisions"])
+    if values.get("intake_path") is not None:
+        values["intake_path"] = Path(values["intake_path"])
+    if "intake_ids" in values:
+        values["intake_ids"] = tuple(values["intake_ids"])
     values["sources"] = tuple((o, Path(p)) for o, p in values["sources"])
     for name in ("line_by_origin", "line_code_by_origin"):
         values[name] = tuple(tuple(pair) for pair in values.get(name, ()))
