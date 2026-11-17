@@ -31,6 +31,9 @@ def pipelines(tmp_path):
         stable_wait_seconds=0.01,
         capture_attempts=3,
         max_file_bytes=64 * 1024**2,
+        archive_publications_per_turn=256,
+        read_batch_rows=8192,
+        read_max_rows=1000000,
         archive_batch_rows=1000,
     )
     return IndependentPipelines(

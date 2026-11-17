@@ -50,6 +50,9 @@ class PipelinePolicy:
     capture_attempts: int
     max_file_bytes: int
     archive_batch_rows: int
+    archive_publications_per_turn: int
+    read_batch_rows: int
+    read_max_rows: int
 
     def __post_init__(self):
         try:
@@ -71,6 +74,9 @@ class PipelinePolicy:
             "capture_attempts",
             "max_file_bytes",
             "archive_batch_rows",
+            "archive_publications_per_turn",
+            "read_batch_rows",
+            "read_max_rows",
         ):
             _positive(getattr(self, name), name)
         if self.retention_seconds < self.window_seconds:

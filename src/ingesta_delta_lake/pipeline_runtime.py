@@ -16,9 +16,12 @@ import portalocker
 from .common import IntegrityError, canonical, digest, now
 from .config import load_config
 from .contracts import CONTRACTS
+from .pipeline_archive import Archive
+from .pipeline_archive_queue import ArchiveQueue
 from .pipeline_intake import Intake, discover_lanes
 from .pipeline_policy import LANES, STORES, IndependentPipelines
 from .pipeline_publications import publish_family
+from .pipeline_view import ArchiveSnapshot
 from .runtime import atomic_json
 from .sources import SILVER_EXPORTS
 from .workers import PHASES, run_phase
@@ -40,6 +43,11 @@ class PipelineWorker:
             max_parallel_workers=self.parallel,
             arrow_threads=self.policy.arrow_threads,
             change_data_feed=True,
+            pipeline_lane=lane,
+            read_batch_rows=self.policy.read_batch_rows,
+            read_max_rows=self.policy.read_max_rows,
+            archive_root=None,
+            archive_manifest=None,
         )
         self.source.validate()
         self.stop = stop if stop is not None else threading.Event()
@@ -54,6 +62,7 @@ class PipelineWorker:
         self.status_path = self.storage.checkpoint / "worker.json"
         self.status = {"lane": lane, "identity": self.identity, "phase": "STARTING"}
         self.guard = threading.Lock()
+        self.archive_context = {}
 
     def prepare(self):
         marker = self.storage.checkpoint / "identity.json"
@@ -108,7 +117,59 @@ class PipelineWorker:
                 window=window if self.lane == "live" else None,
             ),
             processing_window=bounds if self.lane == "live" else None,
+            **self.archive_context,
         )
+
+    def refresh_archive(self):
+        historical = self.pipelines.history
+        root = historical.exchange / "archive"
+        cached = self.storage.checkpoint / "archive-reference.json"
+
+        def accept(manifest):
+            if manifest.parent != root or manifest.name == "current.json":
+                raise IntegrityError("Archive reference escapes its immutable exchange")
+            snapshot = ArchiveSnapshot(historical, manifest_path=manifest)
+            if manifest.name != snapshot.manifest["publication_id"] + ".json":
+                raise IntegrityError("Archive reference identity differs")
+            self.archive_context = {"archive_root": historical.silver, "archive_manifest": manifest}
+
+        if not self.archive_context and cached.exists():
+            try:
+                accept(Path(json.loads(cached.read_text())["manifest"]))
+            except (OSError, ValueError, KeyError, IntegrityError) as exc:
+                self.event({"event": "ARCHIVE_REFERENCE_FAILED", "error": str(exc)})
+        if not (root / "current.json").exists():
+            return
+        try:
+            snapshot = ArchiveSnapshot(historical)
+            manifest = root / (snapshot.manifest["publication_id"] + ".json")
+            accept(manifest)
+            value = {"manifest": str(manifest)}
+            if not cached.exists() or json.loads(cached.read_text()) != value:
+                atomic_json(cached, value)
+        except (OSError, ValueError, KeyError, IntegrityError) as exc:
+            self.event({"event": "ARCHIVE_REFERENCE_FAILED", "error": str(exc)})
+
+    def archive_turn(self):
+        if self.lane != "history":
+            return
+        try:
+            with closing(Archive(self.storage, identity=self.identity)) as archive:
+                result = ArchiveQueue(archive, self.pipelines.live).turn(
+                    policy=self.policy, technical_now=datetime.now(UTC)
+                )
+            self.event(
+                {
+                    "event": "ARCHIVE_TURN",
+                    **{
+                        k: v
+                        for k, v in result.items()
+                        if k in {"status", "rows", "family", "complete", "discovered"}
+                    },
+                }
+            )
+        except Exception as exc:
+            self.event({"event": "ARCHIVE_FAILED", "error": str(exc)})
 
     def record(self, intake, cfg, result, seconds):
         ids, family = cfg.intake_ids, cfg.family
@@ -149,6 +210,8 @@ class PipelineWorker:
 
     def cycle(self, intake, *, phases=PHASES, executor=run_phase):
         """One-shot operation shares intake and confirmation with the continuous scheduler."""
+        self.archive_turn()
+        self.refresh_archive()
         window, captured = self.capture(intake)
         results = {}
         for phase in phases:
@@ -178,6 +241,8 @@ class PipelineWorker:
         with ThreadPoolExecutor(max_workers=self.parallel, thread_name_prefix=self.lane) as pool:
             while not self.stop.is_set():
                 began = time.monotonic()
+                self.archive_turn()
+                self.refresh_archive()
                 window, captured = self.capture(intake)
                 for family, (future, cfg) in list(active.items()):
                     if not future.done():

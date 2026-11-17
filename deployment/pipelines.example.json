@@ -16,7 +16,10 @@
     "stable_wait_seconds": 0.2,
     "capture_attempts": 3,
     "max_file_bytes": 67108864,
-    "archive_batch_rows": 1000
+    "archive_batch_rows": 1000,
+    "archive_publications_per_turn": 256,
+    "read_batch_rows": 8192,
+    "read_max_rows": 1000000
   },
   "live": {
     "bronze": "/pipelines/live/bronze",
