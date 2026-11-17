@@ -1352,16 +1352,12 @@ def _live_anchor(cutoff: datetime) -> datetime:
     return lanes.slot_start(cutoff)
 
 
-def _mark_live_since(output_root: Path, cutoff: datetime) -> tuple[datetime, bool]:
-    """Remember the slot Gold may copy. A mark from an older deployment is moved forward."""
-    anchor = _live_anchor(cutoff)
+def _mark_live_since(output_root: Path, _cutoff: datetime) -> tuple[datetime | None, bool]:
+    """The last Silver slot Gold already copied. The wall clock does not move it."""
     path = output_root / "lanes" / "since.json"
-    if path.exists():
-        stored = datetime.fromisoformat(read_json(path)["since"])
-        if stored >= anchor - timedelta(minutes=10):
-            return stored, False
-    atomic_json(path, {"since": anchor.isoformat()})
-    return anchor, False
+    if not path.exists():
+        return None, False
+    return datetime.fromisoformat(read_json(path)["since"]), False
 
 
 def _read_copied(output_root: Path) -> dict[str, datetime]:
@@ -1375,6 +1371,12 @@ def _remember_copied(output_root: Path, statistics: dict) -> None:
     copied = statistics.get("copied")
     if copied:
         atomic_json(output_root / "lanes" / "copied.json", copied)
+        moments = [datetime.fromisoformat(value) for value in copied.values()]
+        if moments:
+            atomic_json(
+                output_root / "lanes" / "since.json",
+                {"since": max(moments).isoformat()},
+            )
 
 
 def _remember_live(output_root: Path, silver_id: str, publication_id: str | None) -> None:

@@ -87,7 +87,10 @@ def _live(productions, stored_hours, accredited, ceiling, reopen, since, copied)
     seen = set()
     for production in productions:
         cutoff = accredited.get(production["id_produccion"])
-        if cutoff is None or (since is not None and cutoff <= since):
+        if cutoff is None:
+            continue
+        watermark = since if since is None or since <= cutoff else None
+        if watermark is not None and cutoff <= watermark:
             continue
         identity = production["id_produccion"]
         for start in stored_hours.get(identity, {}):
@@ -96,7 +99,7 @@ def _live(productions, stored_hours, accredited, ceiling, reopen, since, copied)
                 continue
             end = start + timedelta(hours=1)
             chunk = _clip(production, start, end, min(end, cutoff))
-            if chunk is not None and _in_horizon(chunk, ceiling) and end > (since or start):
+            if chunk is not None and _in_horizon(chunk, ceiling) and end > (watermark or start):
                 chunks.append(chunk)
                 seen.add(key)
         start, end = _hour_holding(cutoff)
@@ -105,7 +108,7 @@ def _live(productions, stored_hours, accredited, ceiling, reopen, since, copied)
         if cutoff == end:
             chunk = _clip(production, start, end, cutoff)
             if chunk is not None and _in_horizon(chunk, ceiling) and _stale(stored_hours, chunk):
-                left = max(start, since) if since is not None else start
+                left = max(start, watermark) if watermark is not None else start
                 chunks.append(
                     HourChunk(
                         identity,
@@ -117,7 +120,7 @@ def _live(productions, stored_hours, accredited, ceiling, reopen, since, copied)
                 )
             continue
         copied_at = copied.get(identity)
-        left = max(start, copied_at or start, since or start)
+        left = max(start, copied_at or start, watermark or start)
         if left >= cutoff:
             continue
         chunk = _clip(production, start, end, cutoff)
