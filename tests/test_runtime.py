@@ -296,6 +296,7 @@ def test_idle_after_catchup_uses_next_scan_deadline_not_another_full_interval(mo
 
     monkeypatch.setattr(runtime.threading.Event, "wait", wait)
     monkeypatch.setattr(service, "run", unit)
+    monkeypatch.setattr("ingesta_delta_lake.common.history_yields", lambda moment=None: False)
     runtime.worker(600)
     assert calls.count("SIP_MODELO") == 2
     assert any(1 <= delay <= 2 for delay in waits)
