@@ -409,33 +409,7 @@ def capture(
                 / received_at[:10]
                 / f"{sha}.csv"
             )
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                if hashlib.sha256(target.read_bytes()).hexdigest() != sha:
-                    raise IntegrityError(f"Copia Bronze alterada: {target}")
-            else:
-                fd, temporary = tempfile.mkstemp(prefix=".capture-", dir=target.parent)
-                try:
-                    with os.fdopen(fd, "wb") as file:
-                        file.write(data)
-                        file.flush()
-                        os.fsync(file.fileno())
-                    # Crear sin reemplazar una evidencia existente. Solo filesystem local.
-                    os.link(temporary, target)
-                    if os.name != "nt":
-                        directory = target.parent
-                        while directory.is_relative_to(config.bronze_root):
-                            handle = os.open(directory, os.O_RDONLY)
-                            try:
-                                os.fsync(handle)
-                            finally:
-                                os.close(handle)
-                            if directory == config.bronze_root:
-                                break
-                            directory = directory.parent
-                finally:
-                    Path(temporary).unlink(missing_ok=True)
-            return Snapshot(
+            snapshot = Snapshot(
                 origin,
                 str(path),
                 sha,
@@ -445,8 +419,122 @@ def capture(
                 received_at,
                 producer_time,
             )
+            publish_capture(config, snapshot, data)
+            return snapshot
+
         except (OSError, CaptureError) as exc:
             if attempt == config.capture_attempts - 1:
                 raise CaptureError(f"No se pudo estabilizar {path}: {exc}") from exc
             time.sleep(config.stable_wait_seconds * (attempt + 1))
     raise AssertionError("Captura sin resultado")
+
+
+def capture_identity(family, snapshot):
+    return digest([snapshot.origin, family, snapshot.source_path, snapshot.sha256])
+
+
+def _sync_capture_directories(root, directory):
+    if os.name == "nt":
+        return
+    while directory.is_relative_to(root):
+        handle = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(handle)
+        finally:
+            os.close(handle)
+        if directory == root:
+            break
+        directory = directory.parent
+
+
+def publish_capture(config, snapshot, data):
+    """Durable bytes with a recoverable descriptor before publishing the blob."""
+    if snapshot.origin not in dict(config.sources):
+        raise IntegrityError("Capture belongs to an unknown origin")
+    original = Path(snapshot.bronze_path)
+    if original.is_symlink():
+        raise IntegrityError("Capture cannot follow a symlink")
+    target = original.resolve()
+    namespace = (config.bronze_root / config.plant / snapshot.origin / config.family).resolve()
+    if namespace.parent != (config.bronze_root / config.plant / snapshot.origin).resolve():
+        raise IntegrityError("Capture family escapes its origin")
+    if not namespace.is_relative_to(config.bronze_root.resolve()) or not target.is_relative_to(
+        namespace
+    ):
+        raise IntegrityError("Capture escapes its Bronze namespace")
+    if len(data) != snapshot.size or hashlib.sha256(data).hexdigest() != snapshot.sha256:
+        raise IntegrityError("Capture differs from its stable source evidence")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary, fd = None, None
+    try:
+        if not target.exists():
+            fd, temporary = tempfile.mkstemp(prefix=".capture-", dir=target.parent)
+        if config.intake_path is not None:
+            from .runtime import atomic_json
+
+            root = config.intake_path.parent / "capture-intents"
+            root.mkdir(exist_ok=True)
+            descriptor = root / (capture_identity(config.family, snapshot) + ".json")
+            atomic_json(
+                descriptor,
+                {
+                    "family": config.family,
+                    "snapshot": snapshot.descriptor(),
+                    "staging_path": temporary,
+                },
+            )
+            _sync_capture_directories(config.intake_path.parent, root)
+        if temporary is not None:
+            stream = os.fdopen(fd, "wb")
+            fd = None
+            with stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.link(temporary, target)
+        elif (
+            hashlib.sha256(_read_limited(target, config.max_file_bytes)).hexdigest()
+            != snapshot.sha256
+        ):
+            raise IntegrityError(f"Copia Bronze alterada: {target}")
+        _sync_capture_directories(config.bronze_root, target.parent)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
+
+
+def recover_capture(config, document):
+    snapshot = Snapshot(**document["snapshot"])
+    if snapshot.origin not in dict(config.sources):
+        raise IntegrityError("Capture recovery belongs to an unknown origin")
+    target = Path(snapshot.bronze_path)
+    namespace = (config.bronze_root / config.plant / snapshot.origin / config.family).resolve()
+    if namespace.parent != (config.bronze_root / config.plant / snapshot.origin).resolve():
+        raise IntegrityError("Capture recovery family escapes its origin")
+    if not namespace.is_relative_to(
+        config.bronze_root.resolve()
+    ) or not target.resolve().is_relative_to(namespace):
+        raise IntegrityError("Capture recovery escapes its namespace")
+    if target.is_symlink():
+        raise IntegrityError("Capture recovery cannot follow a symlink")
+    staged = Path(document["staging_path"]) if document.get("staging_path") else None
+    if staged is not None and (
+        staged.parent != target.parent
+        or not staged.name.startswith(".capture-")
+        or staged.is_symlink()
+    ):
+        raise IntegrityError("Capture staging file escapes its namespace")
+    candidate = target if target.exists() else staged
+    if candidate is None or not candidate.is_file():
+        raise IntegrityError("Stable capture publication was interrupted before durable bytes")
+    data = _read_limited(candidate, config.max_file_bytes)
+    if len(data) != snapshot.size or hashlib.sha256(data).hexdigest() != snapshot.sha256:
+        raise IntegrityError("Interrupted capture has incomplete or changed bytes")
+    if not target.exists():
+        os.link(staged, target)
+        _sync_capture_directories(config.bronze_root, target.parent)
+    if staged is not None:
+        staged.unlink(missing_ok=True)
+    return snapshot

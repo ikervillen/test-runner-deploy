@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .common import CaptureError, IntegrityError, canonical, digest, now
 from .pipeline_policy import LANES
-from .sources import Snapshot, capture, export_kind, parse_name
+from .sources import Snapshot, capture, capture_identity, export_kind, parse_name, recover_capture
 
 
 @dataclass(frozen=True)
@@ -121,7 +121,7 @@ class Intake:
             )
 
     def remember(self, family, snapshot):
-        identity = digest([snapshot.origin, family, snapshot.source_path, snapshot.sha256])
+        identity = capture_identity(family, snapshot)
         with self.db:
             self.db.execute(
                 "INSERT OR IGNORE INTO inputs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -139,7 +139,60 @@ class Intake:
                     None,
                 ),
             )
+        (self.path.parent / "capture-intents" / (identity + ".json")).unlink(missing_ok=True)
         return identity
+
+    def recover_captures(self, config, *, limit):
+        recovered = 0
+        root = self.path.parent / "capture-intents"
+        for path in sorted(root.glob("*.json"))[:limit]:
+            try:
+                document = json.loads(path.read_text())
+                cfg = replace(config, family=document["family"])
+                snapshot = Snapshot(**document["snapshot"])
+                if path.stem != capture_identity(cfg.family, snapshot):
+                    raise IntegrityError("Capture intention identity differs")
+                snapshot = recover_capture(cfg, document)
+                self.remember(cfg.family, snapshot)
+                recovered += 1
+            except (OSError, ValueError, KeyError, TypeError, IntegrityError, CaptureError) as exc:
+                self.failure(path, str(exc))
+        return recovered
+
+    def publish_captures(self, exchange, *, limit):
+        from .pipeline_publications import immutable_json
+        from .runtime import atomic_json
+
+        root = exchange / "bronze"
+        entries = root / "entries"
+        entries.mkdir(parents=True, exist_ok=True)
+        identity = json.loads(self.setting("identity"))["identity"]
+        cursor = int(self.setting("published_capture_sequence") or 0)
+        if (root / "current.json").exists():
+            previous = json.loads((root / "current.json").read_text())
+            if previous["identity"] != identity or previous["lane"] != self.lane:
+                raise IntegrityError("Bronze exchange belongs to another producer")
+        rows = self.db.execute(
+            "SELECT rowid,* FROM inputs WHERE rowid>? ORDER BY rowid LIMIT ?", (cursor, limit)
+        ).fetchall()
+        for row in rows:
+            payload = {
+                "schema_id": "fenix-bronze-capture-v1",
+                "identity": identity,
+                "lane": self.lane,
+                "sequence": row["rowid"],
+                "input_id": row["input_id"],
+                "family": row["family"],
+                "snapshot": json.loads(row["descriptor"]),
+            }
+            value = {**payload, "capture_id": digest(payload)}
+            immutable_json(entries / (str(row["rowid"]) + ".json"), value)
+            atomic_json(
+                root / "current.json",
+                {k: value[k] for k in ("schema_id", "identity", "lane", "sequence", "capture_id")},
+            )
+            self.set("published_capture_sequence", str(row["rowid"]))
+        return len(rows)
 
     def failure(self, path, reason):
         identity, stamp = digest([str(path), reason]), now()
@@ -151,8 +204,20 @@ class Intake:
             )
 
     def pending(self, family, limit, *, window=None):
-        query = "SELECT input_id FROM inputs WHERE state='CAPTURED' AND family=?"
+        query = "SELECT input_id FROM inputs AS selected WHERE state='CAPTURED' AND family=?"
         params = [family]
+        if self.lane == "live":
+            query += (
+                " AND NOT EXISTS (SELECT 1 FROM inputs AS newer "
+                "WHERE newer.source_path=selected.source_path AND newer.family=selected.family "
+                "AND newer.rowid>selected.rowid)"
+            )
+        else:
+            query += (
+                " AND NOT EXISTS (SELECT 1 FROM inputs AS older "
+                "WHERE older.source_path=selected.source_path AND older.family=selected.family "
+                "AND older.state='CAPTURED' AND older.rowid<selected.rowid)"
+            )
         if window is not None:
             query += (
                 " AND (producer_time IS NULL OR length(producer_time)=10 OR "

@@ -94,6 +94,11 @@ class PipelineWorker:
         print(canonical(value), flush=True)
 
     def capture(self, intake):
+        recovered = intake.recover_captures(
+            self.source, limit=getattr(self.policy, f"{self.lane}_batch_files")
+        )
+        if recovered:
+            self.event({"event": "BRONZE_CAPTURE_RECOVERED", "captures": recovered})
         self.update(phase="DISCOVERING")
         lanes, window, failures = discover_lanes(self.source.sources, self.policy)
         for failure in failures:
@@ -103,6 +108,12 @@ class PipelineWorker:
         self.update(phase="CAPTURING", source_window=bounds)
         self.event({"event": "BRONZE_CAPTURE_STARTED", "candidates": len(lanes[self.lane])})
         captured = intake.capture_turn(self.source, self.policy, lanes[self.lane])
+        try:
+            intake.publish_captures(
+                self.storage.exchange, limit=getattr(self.policy, f"{self.lane}_batch_files")
+            )
+        except Exception as exc:
+            self.event({"event": "BRONZE_PUBLICATION_FAILED", "error": str(exc)})
         self.event({"event": "BRONZE_CAPTURE", **captured})
         return window, captured
 
