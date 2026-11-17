@@ -35,7 +35,7 @@ def decode_config(text):
         values["intake_ids"] = tuple(values["intake_ids"])
     if values.get("runtime_root") is not None:
         values["runtime_root"] = Path(values["runtime_root"])
-    for name in ("archive_root", "archive_manifest"):
+    for name in ("archive_root", "archive_manifest", "publication_root"):
         if values.get(name) is not None:
             values[name] = Path(values[name])
     if values.get("processing_window") is not None:
@@ -63,15 +63,33 @@ def execute(config, result_path, stop_path, lane="all"):
     pa.set_io_thread_count(config.arrow_threads)
     started = time.monotonic()
     try:
-        result = run(
-            config,
-            runtime_owner=True,
-            stop_requested=stop_path.exists,
-            lane=lane,
-            reviews_only=config.reviews_only,
-        )
-        if config.reviews_only and result.get("status") == "REVIEW_WAITING_RECOVERY":
-            result = run(config, runtime_owner=True, stop_requested=stop_path.exists, lane=lane)
+        if config.retirement_job:
+            from datetime import UTC, datetime
+            from types import SimpleNamespace
+
+            from .pipeline_policy import PipelinePolicy
+            from .pipeline_retirement import retire
+
+            result = retire(
+                config,
+                SimpleNamespace(silver=config.silver_root, exchange=config.publication_root),
+                SimpleNamespace(
+                    silver=config.archive_root, exchange=config.archive_manifest.parent.parent
+                ),
+                config.retirement_job["receipt"],
+                policy=PipelinePolicy(**config.retirement_job["policy"]),
+                technical_now=datetime.now(UTC),
+            )
+        else:
+            result = run(
+                config,
+                runtime_owner=True,
+                stop_requested=stop_path.exists,
+                lane=lane,
+                reviews_only=config.reviews_only,
+            )
+            if config.reviews_only and result.get("status") == "REVIEW_WAITING_RECOVERY":
+                result = run(config, runtime_owner=True, stop_requested=stop_path.exists, lane=lane)
     except Exception as exc:
         result = {"status": "FAILED", "error": str(exc), "error_type": type(exc).__name__}
     atomic_json(

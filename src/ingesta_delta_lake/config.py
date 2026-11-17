@@ -46,6 +46,8 @@ class Config:
     archive_root: Path | None = None
     archive_manifest: Path | None = None
     reviews_only: bool = False
+    publication_root: Path | None = None
+    retirement_job: dict | None = None
 
     @property
     def archive_context(self):
@@ -78,6 +80,21 @@ class Config:
         return self.control_root / filename
 
     def validate(self) -> None:
+        if self.publication_root is not None and (
+            not self.publication_root.is_absolute()
+            or self.publication_root != self.publication_root.resolve()
+        ):
+            raise ConfigurationError("Publication root must be a resolved absolute directory")
+        if self.retirement_job is not None and (
+            not isinstance(self.retirement_job, dict)
+            or set(self.retirement_job) != {"receipt", "policy"}
+            or self.publication_root is None
+            or self.pipeline_lane != "live"
+            or not self.archive_context
+        ):
+            raise ConfigurationError(
+                "Retirement job requires its live owner and pinned publication roots"
+            )
         if type(self.reviews_only) is not bool:
             raise ConfigurationError("reviews_only must be boolean")
         if type(self.change_data_feed) is not bool:
@@ -254,7 +271,13 @@ def load_config(path: Path) -> Config:
             if not decision_path.is_absolute():
                 raise ConfigurationError("association_decisions debe ser absoluto")
             data["association_decisions"] = decision_path.resolve()
-        for name in ("intake_path", "runtime_root", "archive_root", "archive_manifest"):
+        for name in (
+            "intake_path",
+            "runtime_root",
+            "archive_root",
+            "archive_manifest",
+            "publication_root",
+        ):
             if data.get(name) is not None:
                 path = Path(data[name])
                 if not path.is_absolute():

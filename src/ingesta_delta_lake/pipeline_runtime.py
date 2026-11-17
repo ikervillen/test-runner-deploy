@@ -23,6 +23,7 @@ from .pipeline_handoff import BronzeHandoff
 from .pipeline_intake import Intake, discover_lanes
 from .pipeline_policy import LANES, STORES, IndependentPipelines
 from .pipeline_publications import publish_family
+from .pipeline_retirement_queue import RetirementQueue
 from .pipeline_view import ArchiveSnapshot
 from .reviews import pending_families
 from .runtime import atomic_json
@@ -55,6 +56,8 @@ class PipelineWorker:
             capture_attempts=self.policy.capture_attempts,
             max_file_bytes=self.policy.max_file_bytes,
             reviews_only=False,
+            publication_root=self.storage.exchange,
+            retirement_job=None,
         )
         self.source.validate()
         self.stop = stop if stop is not None else threading.Event()
@@ -226,7 +229,38 @@ class PipelineWorker:
                 self.event(
                     {"event": "SILVER_PUBLICATION_FAILED", "family": family, "error": str(exc)}
                 )
+        if cfg.retirement_job:
+            RetirementQueue(intake, self.pipelines.history).acknowledge(result)
         self.event({"family": family, "result": result, "seconds": seconds})
+
+    def maintenance_config(self, intake, active, dirty, reviews):
+        if (
+            self.lane != "live"
+            or not self.archive_context
+            or any(cfg.retirement_job for _, cfg in active.values())
+        ):
+            return None
+        try:
+            queue = RetirementQueue(intake, self.pipelines.history)
+            queue.discover(
+                ArchiveSnapshot(
+                    self.pipelines.history, manifest_path=self.archive_context["archive_manifest"]
+                ),
+                policy=self.policy,
+            )
+            unavailable = set(active) | dirty | reviews
+            for phase in PHASES:
+                for family in phase:
+                    if intake.pending(family, 1):
+                        unavailable.add(family)
+            return queue.next_config(
+                replace(self.source, **self.archive_context),
+                policy=self.policy,
+                unavailable=unavailable,
+            )
+        except Exception as exc:
+            self.event({"event": "RETIREMENT_DISCOVERY_FAILED", "error": str(exc)})
+            return None
 
     def release_retries(self, intake, active):
         for row in intake.db.execute(
@@ -329,7 +363,12 @@ class PipelineWorker:
                         "PARTIAL",
                         "BLOCKED",
                         "REVIEWS_CHECKED",
-                    } and (cfg.intake_ids or cfg.reviews_only or result.get("status") == "APPLIED"):
+                        "RETIRED",
+                    } and (
+                        cfg.intake_ids
+                        or cfg.reviews_only
+                        or result.get("status") in {"APPLIED", "RETIRED"}
+                    ):
                         for dependent in families[families.index(family) + 1 :]:
                             intake.release(dependent, "WAITING_REVIEW")
                             dirty.add(dependent)
@@ -365,6 +404,10 @@ class PipelineWorker:
                     dirty.discard(cfg.family)
                     dirty_since.pop(cfg.family, None)
                     active[cfg.family] = pool.submit(self.transform, cfg, executor), cfg
+                if len(active) < self.parallel:
+                    cfg = self.maintenance_config(intake, active, dirty, reviews)
+                    if cfg:
+                        active[cfg.family] = pool.submit(self.transform, cfg, executor), cfg
                 self.update(
                     phase="RUNNING" if active else "IDLE",
                     workers=[{"family": f} for f in active],
