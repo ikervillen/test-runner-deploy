@@ -335,7 +335,7 @@ jobs:
           publish() {
             local remote="$1"
             shift
-            docker build --platform linux/amd64 -t "$remote" "$@" >&2
+            docker buildx build --provenance=false --sbom=false --load --platform linux/amd64 -t "$remote" "$@" >&2
             pushed_ref "$remote"
           }
           airflow="$(publish "ghcr.io/${owner}:gold-airflow-${GOLD_SOURCE_COMMIT}" -f .gold-context/orchestration/airflow/Dockerfile .gold-context)"
