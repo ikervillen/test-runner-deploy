@@ -97,6 +97,10 @@ class Intake:
             CREATE TABLE IF NOT EXISTS failures(
                 failure_id TEXT PRIMARY KEY, source_path TEXT NOT NULL, reason TEXT NOT NULL,
                 first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, attempts INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS live_imports(
+                input_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL,
+                source_path TEXT NOT NULL, producer_time TEXT,
+                family TEXT NOT NULL, eligible INTEGER NOT NULL DEFAULT 0);
         """)
         expected = canonical({"lane": lane, "identity": identity})
         previous = self.setting("identity")
@@ -217,6 +221,10 @@ class Intake:
                 " AND NOT EXISTS (SELECT 1 FROM inputs AS older "
                 "WHERE older.source_path=selected.source_path AND older.family=selected.family "
                 "AND older.state='CAPTURED' AND older.rowid<selected.rowid)"
+            )
+            query += (
+                " AND NOT EXISTS (SELECT 1 FROM live_imports AS imported "
+                "WHERE imported.input_id=selected.input_id AND imported.eligible=0)"
             )
         if window is not None:
             query += (

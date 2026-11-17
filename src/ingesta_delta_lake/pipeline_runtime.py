@@ -18,6 +18,7 @@ from .config import load_config
 from .contracts import CONTRACTS
 from .pipeline_archive import Archive
 from .pipeline_archive_queue import ArchiveQueue
+from .pipeline_handoff import BronzeHandoff
 from .pipeline_intake import Intake, discover_lanes
 from .pipeline_policy import LANES, STORES, IndependentPipelines
 from .pipeline_publications import publish_family
@@ -48,6 +49,9 @@ class PipelineWorker:
             read_max_rows=self.policy.read_max_rows,
             archive_root=None,
             archive_manifest=None,
+            stable_wait_seconds=self.policy.stable_wait_seconds,
+            capture_attempts=self.policy.capture_attempts,
+            max_file_bytes=self.policy.max_file_bytes,
         )
         self.source.validate()
         self.stop = stop if stop is not None else threading.Event()
@@ -108,6 +112,14 @@ class PipelineWorker:
         self.update(phase="CAPTURING", source_window=bounds)
         self.event({"event": "BRONZE_CAPTURE_STARTED", "candidates": len(lanes[self.lane])})
         captured = intake.capture_turn(self.source, self.policy, lanes[self.lane])
+        if self.lane == "history":
+            try:
+                handoff = BronzeHandoff(intake, self.pipelines.live).turn(
+                    self.source, self.policy, window=window
+                )
+                self.event({"event": "BRONZE_HANDOFF", **handoff})
+            except Exception as exc:
+                self.event({"event": "BRONZE_HANDOFF_FAILED", "error": str(exc)})
         try:
             intake.publish_captures(
                 self.storage.exchange, limit=getattr(self.policy, f"{self.lane}_batch_files")
