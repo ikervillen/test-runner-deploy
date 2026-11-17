@@ -9,6 +9,7 @@ from ingesta_delta_lake import pipeline_archive
 from ingesta_delta_lake.pipeline_archive import Archive
 from ingesta_delta_lake.pipeline_intake import Intake
 from ingesta_delta_lake.pipeline_publications import SilverSnapshot
+from ingesta_delta_lake.pipeline_receipts import ArchiveReceipts
 from ingesta_delta_lake.pipeline_runtime import PipelineWorker
 from ingesta_delta_lake.pipeline_view import ArchiveSnapshot, SilverView
 
@@ -47,6 +48,15 @@ def test_archive_copies_then_confirms_without_mutating_live(config, pipeline_con
             snapshot, "SIP_MODELO", policy=pipeline_config.policy, technical_now=due(snapshot)
         )
         assert result["status"] == "ARCHIVED" and result["rows"] == 1
+        receipts = ArchiveReceipts(pipeline_config.history)
+        head = archive.receipt_head()
+        receipt = receipts.read(head, max_rows=10)
+        assert receipt == result["receipt"] and receipt["parent"] is None
+        assert len(receipts.rows(receipt)) == 1
+        from ingesta_delta_lake.common import IntegrityError
+
+        with pytest.raises(IntegrityError, match="proof"):
+            receipts.read({**head, "receipt_hash": "0" * 64}, max_rows=10)
         assert result["receipt"]["source_publication"] == snapshot.manifest["publication_id"]
         assert (
             archive.copy(
@@ -101,6 +111,12 @@ def test_archive_resumes_bounded_batches(config, pipeline_config):
             archive.copy(snapshot, "SIP_MODELO", policy=policy, technical_now=due(snapshot))
         table = DeltaTable(str(archive.target("SIP_MODELO")))
         assert table.count() == 2 and table.version() == 1
+        reader = ArchiveReceipts(pipeline_config.history)
+        latest = reader.read(archive.receipt_head(), max_rows=1)
+        previous = reader.read(latest["parent"], max_rows=1)
+        assert previous["parent"] is None
+        assert latest["rows"] != previous["rows"]
+        assert len(reader.rows(latest)) == len(reader.rows(previous)) == 1
 
 
 def test_independent_conflicting_dictionary_rows_are_exposed_for_review(config, pipeline_config):
