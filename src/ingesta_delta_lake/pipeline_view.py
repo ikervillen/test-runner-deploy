@@ -2,7 +2,7 @@
 
 import json
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pyarrow as pa
 from deltalake import DeltaTable
@@ -68,6 +68,7 @@ class ArchiveSnapshot:
 class ViewResult:
     rows: list[dict]
     conflicts: list[dict]
+    lineages: dict = field(default_factory=dict)
 
 
 class SilverView:
@@ -175,4 +176,17 @@ class SilverView:
         for key in sorted(invalid):
             conflicts.append({"key": key, "reason": "CROSS_LANE_CONTRACT_CONFLICT"})
             rows.pop(key)
-        return ViewResult(list(rows.values()), conflicts)
+        lineages = {
+            key: [
+                {
+                    "source_table": record["source_table"],
+                    "source_version": record["source_version"],
+                    "row_hash": review_hash(family, row),
+                }
+                for record in grouped[key]
+                if record["row"] == row
+                and record.get("change_type", "insert") in {"insert", "update_postimage"}
+            ]
+            for key, row in rows.items()
+        }
+        return ViewResult(list(rows.values()), conflicts, lineages)
