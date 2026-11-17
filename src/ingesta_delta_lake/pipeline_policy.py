@@ -146,6 +146,4 @@ class IndependentPipelines:
         """Durable identity excludes releases, activation tokens and process IDs."""
         from dataclasses import asdict
 
-        return digest(
-            [asdict(self.policy), {k: str(v) for k, v in asdict(self.lane(lane)).items()}]
-        )
+        return digest([lane, {k: str(v) for k, v in asdict(self.lane(lane)).items()}])
