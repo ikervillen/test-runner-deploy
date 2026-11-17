@@ -15,7 +15,7 @@ from deltalake import write_deltalake
 from deltalake.transaction import CommitProperties
 
 from . import __version__
-from .commit_protocol import application_transaction
+from .commit_protocol import application_transaction, delta_configuration
 from .common import IntegrityError, canonical, digest, now
 from .review_adapters import ADMISSION_VERSION, ADMIT, KEEP, REPLACE, adapter, contextual_offers
 
@@ -279,6 +279,7 @@ def _execute(config, control, command, plan):
                     table if table else str(a.store.path),
                     arrow,
                     mode="append" if table else "error",
+                    configuration=delta_configuration(config),
                     commit_properties=props,
                 )
             table = a.store.table()

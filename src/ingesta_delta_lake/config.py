@@ -39,6 +39,7 @@ class Config:
     runtime_root: Path | None = None
     max_parallel_workers: int = 2
     arrow_threads: int = 2
+    change_data_feed: bool = False
 
     @property
     def contract(self):
@@ -61,6 +62,8 @@ class Config:
         return self.control_root / filename
 
     def validate(self) -> None:
+        if type(self.change_data_feed) is not bool:
+            raise ConfigurationError("change_data_feed must be boolean")
         for name in ("max_parallel_workers", "arrow_threads"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ConfigurationError(f"{name} must be a positive integer")

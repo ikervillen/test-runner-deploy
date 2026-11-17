@@ -39,6 +39,7 @@ class PipelineWorker:
             intake_ids=(),
             max_parallel_workers=self.parallel,
             arrow_threads=self.policy.arrow_threads,
+            change_data_feed=True,
         )
         self.source.validate()
         self.stop = stop if stop is not None else threading.Event()

@@ -12,7 +12,7 @@ from deltalake.transaction import CommitProperties
 
 from . import __version__
 from . import topology as t
-from .commit_protocol import application_transaction
+from .commit_protocol import application_transaction, delta_configuration
 from .common import IntegrityError, canonical, digest, now
 from .control import Control
 from .delta import DeltaStore
@@ -188,7 +188,13 @@ class TopologyStore(DeltaStore):
             max_commit_retries=0,
         )
         if table is None:
-            write_deltalake(str(self.path), arrow, mode="error", commit_properties=props)
+            write_deltalake(
+                str(self.path),
+                arrow,
+                mode="error",
+                configuration=delta_configuration(self.config),
+                commit_properties=props,
+            )
         else:
             keys = (
                 ["id_maquina_fenix", "vigente_desde"]
