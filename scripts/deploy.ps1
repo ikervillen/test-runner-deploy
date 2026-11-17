@@ -8,7 +8,7 @@
     [ValidateSet('Deploy', 'Rollback')][string]$Mode = 'Deploy'
 )
 # The plant job checks out this tree with the existing action.
-# This file is part of the develop pipeline. Changes limited to deploy.yml do not start it.
+# Every push validates a candidate so the deployed commit can remain branch HEAD.
 $ErrorActionPreference = 'Stop'
 $projectDirectory = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 

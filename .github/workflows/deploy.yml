@@ -2,12 +2,8 @@ name: Ingesta Delta Lake
 on:
   push:
     branches: [main, develop]
-    paths-ignore:
-      # Airflow and Gold orchestration. The ingestion worker image does not contain these files.
-      - .github/workflows/deploy.yml
-      - deployment/airflow-develop.ps1
-      - deployment/gold_site.py
-      - deployment/compose.gold.develop.yaml
+    # Deployment requires the tested commit to remain branch HEAD. Every push must
+    # validate a replacement, including Gold-only changes that advance that HEAD.
   pull_request:
   workflow_dispatch:
     inputs:
