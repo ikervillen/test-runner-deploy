@@ -17,6 +17,7 @@ from .config import load_config
 from .contracts import CONTRACTS
 from .pipeline_intake import Intake, discover_lanes
 from .pipeline_policy import LANES, STORES, IndependentPipelines
+from .pipeline_publications import publish_family
 from .runtime import atomic_json
 from .workers import PHASES, run_phase
 
@@ -115,7 +116,26 @@ class PipelineWorker:
                 ids = selected[family].intake_ids
                 results[family] = result
                 if result.get("status") != "FAILED" and not result.get("remaining_versions", 0):
-                    intake.acknowledge(ids, result, published_at=now())
+                    try:
+                        if ids or result.get("status") == "APPLIED":
+                            publish_family(
+                                selected[family],
+                                self.storage,
+                                lane=self.lane,
+                                identity=self.identity,
+                                family=family,
+                                captured_ids=ids,
+                            )
+                        intake.acknowledge(ids, result, published_at=now())
+                    except Exception as exc:
+                        result["publication_error"] = str(exc)
+                        self.event(
+                            {
+                                "event": "SILVER_PUBLICATION_FAILED",
+                                "family": family,
+                                "error": str(exc),
+                            }
+                        )
                 changed = changed or bool(ids) and result.get("status") != "FAILED"
                 changed = changed or result.get("status") == "APPLIED"
                 self.event({"family": family, "result": result, "seconds": seconds})
