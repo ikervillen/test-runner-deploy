@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 from deltalake import DeltaTable
-from test_mia_batches import sources as mia_sources
+from test_mia_batches import csv_row
 
 from ingesta_delta_lake import defects_service, sources
 from ingesta_delta_lake.common import ConfigurationError
@@ -42,18 +42,23 @@ def test_backlog_continues_between_scans_without_rediscovery(config, monkeypatch
         input_scan_interval_seconds=600,
         mia_batches_per_turn=1,
     )
-    mia_sources(cfg, 20)
+    for i in range(20):
+        hour = 10 + i // 6
+        minute = (i % 6) * 10
+        stamp = hour * 10000 + minute * 100
+        path = cfg.input_root / "AV21" / f"14102026_{stamp:06d}_{family}.csv"
+        path.write_text(csv_row(family, i), encoding="utf-8")
     first = run(cfg)
-    assert first["remaining_versions"] == 12 and first["input_scan_performed"] is True
+    assert first["remaining_versions"] == 11 and first["input_scan_performed"] is True
     with monkeypatch.context() as patch:
         patch.setattr(defects_service, "discover", lambda *_: pytest.fail("Repeated scan"))
         second, third = run(cfg), run(cfg)
-        assert second["processed_versions"] == 8 and third["processed_versions"] == 4
+        assert second["processed_versions"] == 8 and third["processed_versions"] == 3
         assert second["input_scan_performed"] is False
         assert third["remaining_versions"] == 0 and third["published_rows"] == 20
         replay = run(cfg)
         assert replay["inserted_this_attempt"] == 0
-    assert DeltaTable(str(cfg.table_path)).version() == 2
+    assert DeltaTable(str(cfg.table_path)).version() == 3
 
 
 def test_failed_discovery_retries_immediately_and_retains_captured_revision(

@@ -20,16 +20,17 @@ def test_origin_cursor_and_budget_survive_new_attempts(config, family):
     )
     for _origin, folder in cfg.sources:
         for i in range(10):
-            (folder / f"14102026_{90000 + i}_{family}.csv").write_text(
+            stamp = 100000 + i * 10000
+            (folder / f"14102026_{stamp:06d}_{family}.csv").write_text(
                 csv_row(family, i), encoding="utf-8"
             )
     first = run(cfg)
     assert first["status"] == "BACKLOG_PENDING"
-    assert first["processed_versions"] == 8 and first["remaining_versions"] == 12
-    assert first["pending_by_origin"] == {"AV21": 2, "AV22": 10}
+    assert first["processed_versions"] == 10 and first["remaining_versions"] == 10
+    assert first["pending_by_origin"] == {"AV21": 1, "AV22": 9}
     second = run(cfg)
-    assert second["pending_by_origin"] == {"AV21": 2, "AV22": 2}
-    assert second["published_rows"] == 16
+    assert second["pending_by_origin"] == {"AV21": 1, "AV22": 1}
+    assert second["published_rows"] == 18
     run(cfg)
     final = run(cfg)
     assert final["remaining_versions"] == 0 and final["published_rows"] == 20

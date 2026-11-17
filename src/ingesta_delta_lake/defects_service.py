@@ -161,6 +161,7 @@ def process(
     wrote = recovery_count > 0
     stopped = False
     yielded = False
+    history_count = 0
     # One clock window for every line. An older file on one line is backlog.
     window, origins = shared_bronze_window(config.control_root)
     if window is None:
@@ -217,7 +218,7 @@ def process(
                 lane != "history"
                 and not is_live
                 and config.mia_batches_per_turn
-                and batch_count >= config.mia_batches_per_turn
+                and history_count >= config.mia_batches_per_turn
             ):
                 yielded = True
                 break
@@ -236,7 +237,8 @@ def process(
                 control.set_live_slot(bronze_now)
             recovered.extend(result["recovered_operations"])
             if not is_live:
-                batch_count += bool(batch)
+                history_count += bool(batch)
+            batch_count += bool(batch)
             wrote = wrote or result["status"] == "APPLIED"
             completed += len(batch)
             print(
