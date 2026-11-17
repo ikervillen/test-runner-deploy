@@ -454,6 +454,11 @@ def test_cli_ingest_and_read_only_yield(config, source, tmp_path, capsys):
 
 
 def test_newest_counter_slot_is_stored_before_the_october_queue(config, monkeypatch):
+    from datetime import datetime
+
+    monkeypatch.setattr(
+        "ingesta_delta_lake.common.plant_now", lambda: datetime(2026, 11, 16, 16, 12)
+    )
     folder = config.input_root / "AV21"
     (folder / "19102026_090000_CONT_ZC.csv").write_text(
         line(FECHA="19/10/2026 9:00:00"), encoding="utf-8"
@@ -479,6 +484,11 @@ def test_newest_counter_slot_is_stored_before_the_october_queue(config, monkeypa
 
 
 def test_realtime_waits_for_the_next_slot_and_history_takes_october(config, monkeypatch):
+    from datetime import datetime
+
+    monkeypatch.setattr(
+        "ingesta_delta_lake.common.plant_now", lambda: datetime(2026, 11, 16, 16, 12)
+    )
     folder = config.input_root / "AV21"
     (folder / "19102026_090000_CONT_ZC.csv").write_text(
         line(FECHA="19/10/2026 9:00:00"), encoding="utf-8"

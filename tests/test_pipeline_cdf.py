@@ -47,9 +47,11 @@ def test_counter_reversion_keeps_each_confirmed_revision(config):
             store.insert([{**row, "CONT_ZC_1": value}], f"revision-{version}", version)
     events = changes(config, 0, 2)
     assert {r["_commit_version"] for r in events} == {0, 1, 2}
-    # An overwrite reports the removed and added values, including a return to A.
-    assert any(r["_change_type"] == "delete" for r in events)
-    assert any(r["_change_type"] == "insert" and r["_commit_version"] == 2 for r in events)
+    # CDF reports each previous/new value, including a return to A.
+    assert any(r["_change_type"] == "update_preimage" for r in events)
+    assert any(
+        r["_change_type"] == "update_postimage" and r["_commit_version"] == 2 for r in events
+    )
 
 
 def test_existing_legacy_table_requires_explicit_migration(config, source):

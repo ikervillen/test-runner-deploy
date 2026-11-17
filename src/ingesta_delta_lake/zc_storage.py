@@ -116,33 +116,51 @@ class ZcStore(DeltaStore):
         keys = [zc.key(r) for r in rows]
         if len(set(keys)) != len(keys):
             raise IntegrityError("La inserción duplicaría CONT_ZC")
-        # Same minute: the later record replaces the stored one. One commit
-        # rewrites the confirmed snapshot so the version advances exactly once.
-        merged = dict(existing)
-        for row in rows:
-            merged[zc.key(row)] = {f: row[f] for f in zc.SCHEMA.names}
+        # Update only the accepted minute. Rewriting the complete logical view
+        # would rematerialize retired rows and reset unrelated archive revisions.
         values = []
-        for row in merged.values():
+        for row in rows:
             item = {f: row[f] for f in zc.SCHEMA.names}
             item["FECHA"] = datetime.fromisoformat(item["FECHA"])
             for f in zc.SPEEDS:
                 item[f] = Decimal(zc.speed(item[f]))
             values.append(item)
-        write_deltalake(
-            table if table else str(self.path),
-            pa.Table.from_pylist(values, schema=zc.SCHEMA),
-            mode="overwrite" if table else "error",
-            configuration=delta_configuration(self.config),
-            commit_properties=CommitProperties(
-                custom_metadata={
-                    "ingesta_operation_id": operation,
-                    "ingesta_control_id": self.control_id,
-                    "ingesta_plant": self.plant,
-                    "ingesta_contract": zc.CONTRACT,
-                    "ingesta_release": __version__,
-                    "ingesta_timestamp_policy": "local_naive_test_v1",
-                },
-                app_transactions=application_transaction(self.control_id, before_version),
-                max_commit_retries=0,
-            ),
+        arrow = pa.Table.from_pylist(values, schema=zc.SCHEMA)
+        props = CommitProperties(
+            custom_metadata={
+                "ingesta_operation_id": operation,
+                "ingesta_control_id": self.control_id,
+                "ingesta_plant": self.plant,
+                "ingesta_contract": zc.CONTRACT,
+                "ingesta_release": __version__,
+                "ingesta_timestamp_policy": "local_naive_test_v1",
+            },
+            app_transactions=application_transaction(self.control_id, before_version),
+            max_commit_retries=0,
         )
+        if table is None:
+            write_deltalake(
+                str(self.path),
+                arrow,
+                configuration=delta_configuration(self.config),
+                commit_properties=props,
+            )
+        else:
+            metrics = (
+                table.merge(
+                    arrow,
+                    "t.origen_fenix = s.origen_fenix AND t.MAQ_IS = s.MAQ_IS AND t.FECHA = s.FECHA",
+                    source_alias="s",
+                    target_alias="t",
+                    commit_properties=props,
+                )
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .execute()
+            )
+            if (
+                metrics["num_target_rows_inserted"] + metrics["num_target_rows_updated"]
+                != len(rows)
+                or metrics["num_target_rows_deleted"]
+            ):
+                raise IntegrityError("CONT_ZC merge differs from its accepted minute intentions")
