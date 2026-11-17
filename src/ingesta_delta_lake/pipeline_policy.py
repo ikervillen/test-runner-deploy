@@ -77,6 +77,10 @@ class PipelinePolicy:
             raise ConfigurationError("Live retention must cover at least one source window")
         if self.poll_seconds >= self.latency_seconds:
             raise ConfigurationError("Polling must leave time for capture and publication")
+        if self.live_workers < 2:
+            raise ConfigurationError(
+                "Live needs separate execution slots for intake and derivation"
+            )
         if (
             isinstance(self.stable_wait_seconds, bool)
             or not isinstance(self.stable_wait_seconds, (int, float))

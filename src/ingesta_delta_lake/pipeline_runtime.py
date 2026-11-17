@@ -5,6 +5,7 @@ import json
 import signal
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -19,11 +20,12 @@ from .pipeline_intake import Intake, discover_lanes
 from .pipeline_policy import LANES, STORES, IndependentPipelines
 from .pipeline_publications import publish_family
 from .runtime import atomic_json
+from .sources import SILVER_EXPORTS
 from .workers import PHASES, run_phase
 
 
 class PipelineWorker:
-    def __init__(self, pipelines, lane, source, *, stop=None, exporter=None):
+    def __init__(self, pipelines, lane, source, *, stop=None):
         self.pipelines, self.lane = pipelines, lane
         self.storage, self.policy = pipelines.lane(lane), pipelines.policy
         self.parallel = getattr(self.policy, f"{lane}_workers")
@@ -40,7 +42,6 @@ class PipelineWorker:
         )
         self.source.validate()
         self.stop = stop if stop is not None else threading.Event()
-        self.exporter = exporter
         self.identity = digest(
             [
                 pipelines.identity(lane),
@@ -82,7 +83,7 @@ class PipelineWorker:
             stream.flush()
         print(canonical(value), flush=True)
 
-    def cycle(self, intake, *, phases=PHASES, executor=run_phase):
+    def capture(self, intake):
         self.update(phase="DISCOVERING")
         lanes, window, failures = discover_lanes(self.source.sources, self.policy)
         for failure in failures:
@@ -93,71 +94,70 @@ class PipelineWorker:
         self.event({"event": "BRONZE_CAPTURE_STARTED", "candidates": len(lanes[self.lane])})
         captured = intake.capture_turn(self.source, self.policy, lanes[self.lane])
         self.event({"event": "BRONZE_CAPTURE", **captured})
-        changed, results = False, {}
+        return window, captured
+
+    def selected_config(self, intake, family, window):
+        bounds = (window.start.isoformat(), window.end.isoformat()) if window else None
+        return replace(
+            self.source,
+            family=family,
+            intake_ids=intake.pending(
+                family,
+                getattr(self.policy, f"{self.lane}_batch_files"),
+                window=window if self.lane == "live" else None,
+            ),
+            processing_window=bounds if self.lane == "live" else None,
+        )
+
+    def record(self, intake, cfg, result, seconds):
+        ids, family = cfg.intake_ids, cfg.family
+        if result.get("status") != "FAILED" and not result.get("remaining_versions", 0):
+            try:
+                if ids or result.get("status") == "APPLIED":
+                    manifest = publish_family(
+                        cfg,
+                        self.storage,
+                        lane=self.lane,
+                        identity=self.identity,
+                        family=family,
+                        captured_ids=ids,
+                    )
+                    if result.get("status") == "APPLIED" and manifest is None:
+                        raise IntegrityError("Applied transformation has no confirmed Silver table")
+                intake.acknowledge(ids, result, published_at=now())
+            except Exception as exc:
+                result["publication_error"] = str(exc)
+                self.event(
+                    {"event": "SILVER_PUBLICATION_FAILED", "family": family, "error": str(exc)}
+                )
+        self.event({"family": family, "result": result, "seconds": seconds})
+
+    def transform(self, cfg, executor):
+        events = []
+        executor(
+            self.source,
+            (cfg.family,),
+            self.stop,
+            self.source.runtime_root / "worker.stop",
+            lambda *event: events.append(event),
+            limit=1,
+            lane="live" if self.lane == "live" else "all",
+            configs={cfg.family: cfg},
+        )
+        return events[0][1:] if events else ({"status": "FAILED", "error": "No unit result"}, 0)
+
+    def cycle(self, intake, *, phases=PHASES, executor=run_phase):
+        """One-shot operation shares intake and confirmation with the continuous scheduler."""
+        window, captured = self.capture(intake)
+        results = {}
         for phase in phases:
             if self.stop.is_set():
                 break
-            configs = {
-                family: replace(
-                    self.source,
-                    family=family,
-                    intake_ids=intake.pending(
-                        family,
-                        getattr(self.policy, f"{self.lane}_batch_files"),
-                        window=window if self.lane == "live" else None,
-                    ),
-                    processing_window=bounds if self.lane == "live" else None,
-                )
-                for family in phase
-            }
-
-            def record(family, result, seconds, *, selected=configs):
-                nonlocal changed
-                ids = selected[family].intake_ids
+            for family in phase:
+                cfg = self.selected_config(intake, family, window)
+                result, seconds = self.transform(cfg, executor)
+                self.record(intake, cfg, result, seconds)
                 results[family] = result
-                if result.get("status") != "FAILED" and not result.get("remaining_versions", 0):
-                    try:
-                        if ids or result.get("status") == "APPLIED":
-                            publish_family(
-                                selected[family],
-                                self.storage,
-                                lane=self.lane,
-                                identity=self.identity,
-                                family=family,
-                                captured_ids=ids,
-                            )
-                        intake.acknowledge(ids, result, published_at=now())
-                    except Exception as exc:
-                        result["publication_error"] = str(exc)
-                        self.event(
-                            {
-                                "event": "SILVER_PUBLICATION_FAILED",
-                                "family": family,
-                                "error": str(exc),
-                            }
-                        )
-                changed = changed or bool(ids) and result.get("status") != "FAILED"
-                changed = changed or result.get("status") == "APPLIED"
-                self.event({"family": family, "result": result, "seconds": seconds})
-
-            executor(
-                self.source,
-                phase,
-                self.stop,
-                self.source.runtime_root / "worker.stop",
-                record,
-                lambda units: self.update(phase="TRANSFORMING", workers=units),
-                limit=self.parallel,
-                lane="live" if self.lane == "live" else "all",
-                configs=configs,
-            )
-        if changed and self.exporter is not None and not self.stop.is_set():
-            self.update(phase="PUBLISHING")
-            try:
-                exported = self.exporter(self.source, self.storage)
-            except Exception as exc:
-                exported = {"status": "FAILED", "error": str(exc)}
-            self.event({"event": "SILVER_PUBLICATION", "result": exported})
         self.update(
             phase="IDLE",
             workers=[],
@@ -169,7 +169,69 @@ class PipelineWorker:
         )
         return results
 
-    def run(self, *, once=False):
+    def continuous(self, intake, *, phases=PHASES, executor=run_phase):
+        families = tuple(f for phase in phases for f in phase)
+        dirty, active, retry_at = set(families), {}, {}
+        derived = set(CONTRACTS) - SILVER_EXPORTS
+        dirty_since = {family: time.monotonic() for family in families}
+        with ThreadPoolExecutor(max_workers=self.parallel, thread_name_prefix=self.lane) as pool:
+            while not self.stop.is_set():
+                began = time.monotonic()
+                window, captured = self.capture(intake)
+                for family, (future, cfg) in list(active.items()):
+                    if not future.done():
+                        continue
+                    try:
+                        result, seconds = future.result()
+                    except Exception as exc:
+                        result, seconds = {"status": "FAILED", "error": str(exc)}, 0
+                    self.record(intake, cfg, result, seconds)
+                    del active[family]
+                    if result.get("status") == "FAILED" or result.get("remaining_versions", 0):
+                        dirty.add(family)
+                        dirty_since.setdefault(family, time.monotonic())
+                        retry_at[family] = time.monotonic() + self.policy.poll_seconds
+                    elif cfg.intake_ids or result.get("status") == "APPLIED":
+                        for dependent in families[families.index(family) + 1 :]:
+                            dirty.add(dependent)
+                            dirty_since.setdefault(dependent, time.monotonic())
+                ready = []
+                for family in families:
+                    if family in active or retry_at.get(family, 0) > time.monotonic():
+                        continue
+                    cfg = self.selected_config(intake, family, window)
+                    if cfg.intake_ids or family in dirty:
+                        overdue = time.monotonic() - dirty_since.get(family, time.monotonic())
+                        ready.append(
+                            (
+                                not (overdue >= self.policy.latency_seconds),
+                                not bool(cfg.intake_ids),
+                                families.index(family),
+                                cfg,
+                            )
+                        )
+                for _, _, _, cfg in sorted(ready):
+                    if len(active) >= self.parallel:
+                        break
+                    if (
+                        self.lane == "live"
+                        and cfg.family in derived
+                        and (sum(f in derived for f in active) >= self.parallel - 1)
+                    ):
+                        continue
+                    dirty.discard(cfg.family)
+                    dirty_since.pop(cfg.family, None)
+                    active[cfg.family] = pool.submit(self.transform, cfg, executor), cfg
+                self.update(
+                    phase="RUNNING" if active else "IDLE",
+                    workers=[{"family": f} for f in active],
+                    last_capture=captured,
+                )
+                self.stop.wait(max(0, self.policy.poll_seconds - (time.monotonic() - began)))
+            for future, _ in active.values():
+                future.result()
+
+    def run(self, *, once=False, phases=PHASES, executor=run_phase):
         self.prepare()
         with portalocker.Lock(str(self.storage.checkpoint / "worker.lock"), mode="a", timeout=0):
             (self.source.runtime_root / "worker.stop").unlink(missing_ok=True)
@@ -185,14 +247,10 @@ class PipelineWorker:
                 with closing(
                     Intake(self.source.intake_path, lane=self.lane, identity=self.identity)
                 ) as intake:
-                    while not self.stop.is_set():
-                        started = time.monotonic()
-                        self.cycle(intake)
-                        if once:
-                            break
-                        self.stop.wait(
-                            max(0, self.policy.poll_seconds - (time.monotonic() - started))
-                        )
+                    if once:
+                        self.cycle(intake, phases=phases, executor=executor)
+                    else:
+                        self.continuous(intake, phases=phases, executor=executor)
             finally:
                 stop_heartbeat.set()
                 thread.join()
