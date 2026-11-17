@@ -29,6 +29,14 @@ Este documento complementa los contratos industriales existentes; no los sustitu
 
 ## Archivado y consulta
 
+Bronze publica las capturas estables como un feed inmutable. El histórico copia
+esos bytes a su propio Bronze sin consultar el checkpoint live ni volver a Fenix.
+El bloque operativo actual y la última versión de un alias sin reloj permanecen
+aplazados; al avanzar el bloque o aparecer otra versión del alias, las anteriores
+quedan disponibles para la recuperación histórica. Los contratos de diccionarios
+y topología pueden inicializar referencias en histórico de forma independiente.
+Esta recuperación de fuentes es distinta del archivado de Silver tras ocho horas.
+
 Recuperar archivos antiguos de Fenix y archivar resultados que envejecen en live
 son trabajos diferentes, con progreso independiente. El histórico es el único
 escritor de su almacenamiento. Lee publicaciones live confirmadas, copia de forma
