@@ -95,19 +95,20 @@ def process(config, control, attempt, *, lane="all"):
     for index, batch in enumerate(phases):
         if lane == "history" and index and history_yields():
             break
-        batch = _with_stored_slot(batch, bronze)
+        is_live_batch = bool(live) and batch is live
+        parsing = _with_stored_slot(batch, bronze)
         result = _commit_batch(
             config,
             control,
             attempt,
             store,
-            batch,
+            parsing,
             recovered if index == 0 else [],
             recovered_count if index == 0 else 0,
         )
         inserted += result["inserted_this_attempt"]
         wrote_any = wrote_any or result["status"] == "APPLIED"
-        if live and batch is live:
+        if is_live_batch:
             control.advance_live_until(bronze_now)
         if batch:
             committed.extend(batch)
