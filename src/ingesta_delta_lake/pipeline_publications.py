@@ -6,6 +6,7 @@ from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 
+import portalocker
 import pyarrow as pa
 from deltalake import DeltaTable
 
@@ -66,6 +67,25 @@ class SilverSnapshot:
             raise IntegrityError("Silver pointer differs from its immutable snapshot")
         return cls(storage, manifest)
 
+    def control(self, family):
+        ref = self.manifest.get("controls", {}).get(family)
+        if ref is None:
+            raise IntegrityError("Silver publication has no confirmed control projection")
+        value = _read(_inside(self.storage.exchange / "silver", ref["uri"]))
+        if (
+            digest(value) != ref["hash"]
+            or value.get("schema_id") != "fenix-control-snapshot-v1"
+            or value.get("family") != family
+        ):
+            raise IntegrityError("Control projection differs from its immutable proof")
+        table_ref = self.manifest["tables"].get(family)
+        if table_ref and (
+            value["control_id"] != table_ref["control_id"]
+            or value["version"] != table_ref["version"]
+        ):
+            raise IntegrityError("Control projection differs from its confirmed table")
+        return value
+
     def table(self, family):
         ref = self.manifest["tables"][family]
         table = DeltaTable(str(_inside(self.storage.silver, ref["uri"])), version=ref["version"])
@@ -86,9 +106,17 @@ class SilverSnapshot:
 
 
 def publish_family(config, storage, *, lane, identity, family, captured_ids=()):
+    lock = storage.silver / f".writer-{config.plant}-{family}.lock"
+    with portalocker.Lock(str(lock), mode="a", timeout=0):
+        return _publish_family(
+            config, storage, lane=lane, identity=identity, family=family, captured_ids=captured_ids
+        )
+
+
+def _publish_family(config, storage, *, lane, identity, family, captured_ids=()):
     """Called by the owner only after this family's confirmed transformation."""
     cfg = replace(config, family=family)
-    if not cfg.control_path.exists() or not DeltaTable.is_deltatable(str(cfg.table_path)):
+    if not cfg.control_path.exists():
         return None
     with closing(sqlite3.connect(cfg.control_path.as_uri() + "?mode=ro", uri=True)) as db:
         db.execute("BEGIN")
@@ -97,26 +125,32 @@ def publish_family(config, storage, *, lane, identity, family, captured_ids=()):
         ).fetchone():
             raise IntegrityError("Cannot publish unconfirmed ingestion work")
         settings = dict(db.execute("SELECT key,value FROM settings"))
-        table = DeltaTable(str(cfg.table_path))
-        version = table.version()
-        if settings.get("last_version") != str(version):
+        table = (
+            DeltaTable(str(cfg.table_path))
+            if DeltaTable.is_deltatable(str(cfg.table_path))
+            else None
+        )
+        version = table.version() if table is not None else None
+        if settings.get("last_version", "None") != str(version):
             raise IntegrityError("Silver table does not match its owner's confirmation")
-        accepted = db.execute(
-            "SELECT operation_id,confirmed_at FROM batches WHERE delta_version=? "
-            "AND confirmed_at IS NOT NULL ORDER BY confirmed_at LIMIT 1",
-            (version,),
-        ).fetchone()
-        if accepted is None:
-            raise IntegrityError("Silver version lacks an owner's receipt")
         control_id = settings["control_id"]
-        operation, confirmed_at = accepted
-        commit = table.history(1)[0]
-        if commit.get("ingesta_operation_id") != operation or (
-            commit.get("ingesta_control_id") != control_id
-            or commit.get("ingesta_contract") != cfg.contract.name
-            or commit.get("ingesta_plant") != cfg.plant
-        ):
-            raise IntegrityError("Silver commit provenance differs from its owner's receipt")
+        operation, confirmed_at = None, None
+        if table is not None:
+            accepted = db.execute(
+                "SELECT operation_id,confirmed_at FROM batches WHERE delta_version=? "
+                "AND confirmed_at IS NOT NULL ORDER BY confirmed_at LIMIT 1",
+                (version,),
+            ).fetchone()
+            if accepted is None:
+                raise IntegrityError("Silver version lacks an owner's receipt")
+            operation, confirmed_at = accepted
+            commit = table.history(1)[0]
+            if commit.get("ingesta_operation_id") != operation or (
+                commit.get("ingesta_control_id") != control_id
+                or commit.get("ingesta_contract") != cfg.contract.name
+                or commit.get("ingesta_plant") != cfg.plant
+            ):
+                raise IntegrityError("Silver commit provenance differs from its owner's receipt")
         horizons = {
             name: json.loads(settings.get(name) or "{}")
             for name in ("observed_until", "live_until")
@@ -126,42 +160,72 @@ def publish_family(config, storage, *, lane, identity, family, captured_ids=()):
         ]
         if cfg.read_max_rows is not None and len(rejected) > cfg.read_max_rows:
             raise IntegrityError("Review publication exceeds its explicit row budget")
+        from .pipeline_control import confirmed_control
+
+        cases, meta, extra = confirmed_control(cfg, db, settings, version, allow_empty=True)
+        if (
+            cfg.read_max_rows is not None
+            and len(cases) + len(extra.get("composition", {})) > cfg.read_max_rows
+        ):
+            raise IntegrityError("Control publication exceeds its explicit row budget")
+        control_payload = {
+            "schema_id": "fenix-control-snapshot-v1",
+            "family": family,
+            "control_id": control_id,
+            "version": version,
+            "cases": cases,
+            "meta": meta,
+            "extra": extra,
+            "archive_context": cfg.archive_context,
+            "processing_window": cfg.processing_window,
+        }
     root = storage.exchange / "silver"
     root.mkdir(parents=True, exist_ok=True)
-    refs, parent = {}, None
+    refs, controls, parent = {}, {}, None
     if (root / "current.json").exists():
         previous = SilverSnapshot.open(storage)
         if previous.manifest["identity"] != identity or previous.manifest["lane"] != lane:
             raise IntegrityError("Silver publication belongs to another lane")
         refs = dict(previous.manifest["tables"])
+        controls = dict(previous.manifest.get("controls", {}))
         parent = previous.manifest["publication_id"]
-    previous_ref = refs.get(family, {})
-    owner_confirmed_at = confirmed_at
-    confirmed_at = (
-        previous_ref.get("confirmed_at") if previous_ref.get("version") == version else now()
-    )
-    if not captured_ids and previous_ref.get("version") == version:
-        captured_ids = previous_ref.get("captured_ids", ())
-    refs[family] = {
-        "uri": cfg.table_path.relative_to(storage.silver).as_posix(),
-        "table_id": table.metadata().id,
-        "version": version,
-        "control_id": control_id,
-        "operation_id": operation,
-        "confirmed_at": confirmed_at,
-        "owner_confirmed_at": owner_confirmed_at,
-        "schema_id": schema_hash(pa.schema(table.schema().to_arrow())),
-        "captured_ids": list(captured_ids),
-        "rejected_hashes": rejected,
-        **horizons,
-    }
-    if parent and refs == previous.manifest["tables"]:
+    proof = digest(control_payload)
+    (root / "controls").mkdir(exist_ok=True)
+    immutable_json(root / "controls" / (proof + ".json"), control_payload)
+    controls[family] = {"hash": proof, "uri": "controls/" + proof + ".json"}
+    if table is not None:
+        previous_ref = refs.get(family, {})
+        owner_confirmed_at = confirmed_at
+        confirmed_at = (
+            previous_ref.get("confirmed_at") if previous_ref.get("version") == version else now()
+        )
+        if not captured_ids and previous_ref.get("version") == version:
+            captured_ids = previous_ref.get("captured_ids", ())
+        refs[family] = {
+            "uri": cfg.table_path.relative_to(storage.silver).as_posix(),
+            "table_id": table.metadata().id,
+            "version": version,
+            "control_id": control_id,
+            "operation_id": operation,
+            "confirmed_at": confirmed_at,
+            "owner_confirmed_at": owner_confirmed_at,
+            "schema_id": schema_hash(pa.schema(table.schema().to_arrow())),
+            "captured_ids": list(captured_ids),
+            "rejected_hashes": rejected,
+            **horizons,
+        }
+    if (
+        parent
+        and refs == previous.manifest["tables"]
+        and controls == previous.manifest.get("controls", {})
+    ):
         return previous.manifest
     payload = {
         "schema_id": "fenix-silver-snapshot-v1",
         "lane": lane,
         "identity": identity,
         "tables": refs,
+        "controls": controls,
         "parent": parent,
     }
     publication_id = digest(payload)
