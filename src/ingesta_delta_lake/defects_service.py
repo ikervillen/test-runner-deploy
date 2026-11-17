@@ -135,7 +135,9 @@ def process(
     wrote = recovery_count > 0
     stopped = False
     # One clock window for every line. An older file on one line is backlog.
-    window, origins = shared_bronze_window(config.control_root)
+    window, origins = shared_bronze_window(
+        config.control_root, selected_window=config.processing_window
+    )
     if window is None:
         live, backlog, bronze_now = [], list(pending), {}
     else:
@@ -144,7 +146,7 @@ def process(
         )
     if lane != "history" and not live:
         control.set_live_slot(bronze_now)
-    if lane == "history" and history_yields():
+    if lane == "history" and config.intake_path is None and history_yields():
         remaining = list(backlog)
         return {
             "status": "BACKLOG_PENDING" if remaining else "NO_INPUTS",
@@ -173,7 +175,7 @@ def process(
         for batch in selected:
             if result is not None and (
                 (stop_requested is not None and stop_requested())
-                or (lane == "history" and history_yields())
+                or (lane == "history" and config.intake_path is None and history_yields())
             ):
                 stopped = True
                 break

@@ -132,7 +132,7 @@ def _family_captures(control_root, family: str):
                 yield item.get("origin"), item.get("producer_time")
 
 
-def shared_bronze_window(control_root):
+def shared_bronze_window(control_root, *, selected_window=None):
     """The last ten-minute slot Bronze has copied, shared by every family and line.
 
     The slot is the filename clock of that copy. It is never the wall clock and
@@ -147,6 +147,8 @@ def shared_bronze_window(control_root):
             bucket = slot_stamp(stamp)
             if bucket and (slot is None or bucket > slot):
                 slot = bucket
+    if selected_window is not None:
+        return tuple(selected_window), origins
     if slot is None:
         return None, origins
     start = datetime.fromisoformat(slot)

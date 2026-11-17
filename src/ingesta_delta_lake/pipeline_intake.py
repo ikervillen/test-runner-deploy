@@ -186,13 +186,12 @@ class Intake:
         started = clock()
         counts = {"captured": 0, "failed": 0, "unchanged": 0, "lane": self.lane}
         selected = sorted(candidates, key=lambda c: c.order)
-        if self.lane == "history":
-            cursor = json.loads(self.setting("cursor") or "null")
-            if cursor:
-                selected = [c for c in selected if c.order > tuple(cursor)] or selected
-            selected = selected[: policy.history_batch_files]
+        cursor = json.loads(self.setting("cursor") or "null")
+        if cursor:
+            selected = [c for c in selected if c.order > tuple(cursor)] or selected
+        selected = selected[: getattr(policy, f"{self.lane}_batch_files")]
         for item in selected:
-            if self.lane == "history" and clock() - started >= policy.history_turn_seconds:
+            if clock() - started >= getattr(policy, f"{self.lane}_turn_seconds"):
                 break
             try:
                 snapshot = capture(
@@ -213,8 +212,7 @@ class Intake:
             except (OSError, CaptureError, IntegrityError) as exc:
                 self.failure(item.path, str(exc))
                 counts["failed"] += 1
-            if self.lane == "history":
-                self.set("cursor", canonical(item.order))
+            self.set("cursor", canonical(item.order))
         return counts
 
 

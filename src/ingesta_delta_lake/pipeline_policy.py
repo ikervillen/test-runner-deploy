@@ -39,8 +39,13 @@ class PipelinePolicy:
     retention_seconds: int
     latency_seconds: int
     poll_seconds: int
+    live_batch_files: int
+    live_turn_seconds: int
     history_batch_files: int
     history_turn_seconds: int
+    live_workers: int
+    history_workers: int
+    arrow_threads: int
     stable_wait_seconds: float
     capture_attempts: int
     max_file_bytes: int
@@ -56,8 +61,13 @@ class PipelinePolicy:
             "retention_seconds",
             "latency_seconds",
             "poll_seconds",
+            "live_batch_files",
+            "live_turn_seconds",
             "history_batch_files",
             "history_turn_seconds",
+            "live_workers",
+            "history_workers",
+            "arrow_threads",
             "capture_attempts",
             "max_file_bytes",
             "archive_batch_rows",

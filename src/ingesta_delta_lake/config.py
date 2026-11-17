@@ -35,6 +35,10 @@ class Config:
     control_format: int = 2
     intake_path: Path | None = None
     intake_ids: tuple[str, ...] = ()
+    processing_window: tuple[str, str] | None = None
+    runtime_root: Path | None = None
+    max_parallel_workers: int = 2
+    arrow_threads: int = 2
 
     @property
     def contract(self):
@@ -57,6 +61,22 @@ class Config:
         return self.control_root / filename
 
     def validate(self) -> None:
+        for name in ("max_parallel_workers", "arrow_threads"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ConfigurationError(f"{name} must be a positive integer")
+        if self.runtime_root is not None and (
+            not self.runtime_root.is_absolute() or self.runtime_root != self.runtime_root.resolve()
+        ):
+            raise ConfigurationError("Runtime must be a resolved absolute path")
+        if self.processing_window is not None:
+            from datetime import datetime
+
+            try:
+                start, end = map(datetime.fromisoformat, self.processing_window)
+                if start.tzinfo is not None or end.tzinfo is not None or start >= end:
+                    raise ValueError("Invalid bounds")
+            except (TypeError, ValueError) as exc:
+                raise ConfigurationError("Invalid selected source window") from exc
         if self.intake_path is not None:
             if (
                 not self.intake_path.is_absolute()
