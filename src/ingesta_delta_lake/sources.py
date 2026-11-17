@@ -269,21 +269,22 @@ def mirror_exports(config: Config, lane: str = "all") -> dict:
     for item in found:
         if item["slot"] and item["slot"] != newest:
             older.setdefault(item["slot"], []).append(item)
-    groups: list[list] = []
-    if lane in {"live", "all"}:
-        groups.append(live)
-    if lane in {"history", "all"} and not (lane == "history" and history_yields()):
-        for slot in sorted(older):
-            if history_yields():
-                break
-            groups.append(older[slot])
     counts.update({"copied": 0, "skipped": 0, "lane": lane})
-    for group in groups:
+
+    def copy_group(group: list) -> None:
         for item in group:
             outcome = _copy_one(config, index, item)
             if outcome == "unchanged":
                 continue
             counts[outcome] = counts.get(outcome, 0) + 1
+
+    if lane in {"live", "all"}:
+        copy_group(live)
+    if lane in {"history", "all"} and not (lane == "history" and history_yields()):
+        for slot in sorted(older):
+            if history_yields():
+                break
+            copy_group(older[slot])
     if counts["copied"] or not index_path.exists():
         config.control_root.mkdir(parents=True, exist_ok=True)
         temporary = index_path.with_suffix(".json.tmp")

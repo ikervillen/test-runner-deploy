@@ -87,11 +87,11 @@ def test_live_copies_the_newest_slot_and_history_walks_the_older_ones(
     assert kinds == {"CONT_GEN", "SIP_MODELO"}
     calls = {"n": 0}
 
-    def stop_before_the_second_slot(moment=None):
+    def stop_after_one_slot(moment=None):
         calls["n"] += 1
         return calls["n"] > 2
 
-    monkeypatch.setattr("ingesta_delta_lake.sources.history_yields", stop_before_the_second_slot)
+    monkeypatch.setattr("ingesta_delta_lake.sources.history_yields", stop_after_one_slot)
     assert mirror_exports(config, lane="history")["copied"] == 1
     assert len(list(config.bronze_root.rglob("*.csv"))) == 3
     monkeypatch.setattr("ingesta_delta_lake.sources.history_yields", lambda moment=None: False)
