@@ -40,6 +40,21 @@ class Config:
     max_parallel_workers: int = 2
     arrow_threads: int = 2
     change_data_feed: bool = False
+    read_batch_rows: int = 8192
+    read_max_rows: int | None = None
+    pipeline_lane: str | None = None
+    archive_root: Path | None = None
+    archive_manifest: Path | None = None
+
+    @property
+    def archive_context(self):
+        if self.archive_manifest is None:
+            return None
+        return {
+            "root": str(self.archive_root),
+            "manifest": str(self.archive_manifest),
+            "lane": self.pipeline_lane,
+        }
 
     @property
     def contract(self):
@@ -64,9 +79,19 @@ class Config:
     def validate(self) -> None:
         if type(self.change_data_feed) is not bool:
             raise ConfigurationError("change_data_feed must be boolean")
-        for name in ("max_parallel_workers", "arrow_threads"):
+        for name in ("max_parallel_workers", "arrow_threads", "read_batch_rows"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ConfigurationError(f"{name} must be a positive integer")
+        if (self.archive_root is None) != (self.archive_manifest is None):
+            raise ConfigurationError("Archive context requires a root and immutable manifest")
+        if self.archive_root is not None:
+            if type(self.read_max_rows) is not int or self.read_max_rows < 1:
+                raise ConfigurationError("Archive reads require an explicit positive row budget")
+            for path in (self.archive_root, self.archive_manifest):
+                if not path.is_absolute() or path != path.resolve():
+                    raise ConfigurationError("Archive references must be resolved absolute paths")
+            if self.pipeline_lane not in {"live", "history"}:
+                raise ConfigurationError("Archive context requires an independent pipeline owner")
         if self.runtime_root is not None and (
             not self.runtime_root.is_absolute() or self.runtime_root != self.runtime_root.resolve()
         ):
@@ -226,11 +251,12 @@ def load_config(path: Path) -> Config:
             if not decision_path.is_absolute():
                 raise ConfigurationError("association_decisions debe ser absoluto")
             data["association_decisions"] = decision_path.resolve()
-        if data.get("intake_path") is not None:
-            intake_path = Path(data["intake_path"])
-            if not intake_path.is_absolute():
-                raise ConfigurationError("Intake debe ser absoluto")
-            data["intake_path"] = intake_path.resolve()
+        for name in ("intake_path", "runtime_root", "archive_root", "archive_manifest"):
+            if data.get(name) is not None:
+                path = Path(data[name])
+                if not path.is_absolute():
+                    raise ConfigurationError(f"{name} debe ser absoluto")
+                data[name] = path.resolve()
         if "intake_ids" in data:
             data["intake_ids"] = tuple(data["intake_ids"])
         config = Config(**{**data, **roots, "sources": sources})

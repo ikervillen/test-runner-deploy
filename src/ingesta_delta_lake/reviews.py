@@ -177,6 +177,7 @@ def _plan(config, control, command):
             close.append(row[0])
     return {
         "before_version": version,
+        "archive_context": config.archive_context,
         "scope": scope,
         "old": old,
         "candidate": candidate,
@@ -189,6 +190,7 @@ def _plan(config, control, command):
 
 def _execute(config, control, command, plan):
     a = adapter(config, control.control_id)
+    a.store.read_context = plan.get("archive_context")
     if plan["scope"]:
         a.store.set_scope(plan["scope"])
     operation = digest(["review-v1", control.control_id, command["decision_id"]])
