@@ -21,7 +21,7 @@ from .common import (
     slot_stamp,
     split_live_backlog,
 )
-from .defects_service import chunks
+from .defects_service import slot_commits
 from .service import _apply
 from .sources import capture_inputs
 from .zc_storage import ZcStore
@@ -84,21 +84,20 @@ def process(config, control, attempt, *, lane="all"):
             "committed_captures": [],
             "remaining_versions": len(backlog),
         }
-    if lane == "history":
-        phases = list(chunks(backlog)) or [[]]
-    elif lane == "live":
+    if lane == "live":
         phases = [live] if live else [[]]
     else:
-        history = _bounded(backlog, config.mia_batches_per_turn)
-        phases = [batch for batch in (live, history) if batch] or [[]]
+        history = list(slot_commits(backlog))
+        phases = ([live] if live and lane != "history" else []) + history or [[]]
     result = None
     inserted = 0
     wrote_any = False
     committed = []
     for index, batch in enumerate(phases):
-        if lane == "history" and index and history_yields():
+        upcoming_live = bool(live) and batch is live
+        if index and not upcoming_live and history_yields():
             break
-        is_live_batch = bool(live) and batch is live
+        is_live_batch = upcoming_live
         parsing = _with_stored_slot(batch, bronze)
         result = _commit_batch(
             config,
@@ -144,18 +143,6 @@ def _with_stored_slot(batch, bronze):
         and (item.origin, slot_stamp(item.producer_time)) in slots
     ]
     return [*batch, *company]
-
-
-def _bounded(backlog, limit):
-    """Same history budget as defectos and rechazos: N batches, not the whole queue."""
-    if not limit:
-        return backlog
-    chosen = []
-    for index, batch in enumerate(chunks(backlog)):
-        if index >= limit:
-            break
-        chosen.extend(batch)
-    return chosen
 
 
 def _commit_batch(config, control, attempt, store, snapshots, recovered, recovered_count):

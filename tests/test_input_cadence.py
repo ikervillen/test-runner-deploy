@@ -49,16 +49,16 @@ def test_backlog_continues_between_scans_without_rediscovery(config, monkeypatch
         path = cfg.input_root / "AV21" / f"14102026_{stamp:06d}_{family}.csv"
         path.write_text(csv_row(family, i), encoding="utf-8")
     first = run(cfg)
-    assert first["remaining_versions"] == 11 and first["input_scan_performed"] is True
+    assert first["processed_versions"] == 20 and first["remaining_versions"] == 0
+    assert first["input_scan_performed"] is True and first["published_rows"] == 20
     with monkeypatch.context() as patch:
         patch.setattr(defects_service, "discover", lambda *_: pytest.fail("Repeated scan"))
-        second, third = run(cfg), run(cfg)
-        assert second["processed_versions"] == 8 and third["processed_versions"] == 3
-        assert second["input_scan_performed"] is False
-        assert third["remaining_versions"] == 0 and third["published_rows"] == 20
+        second = run(cfg)
+        assert second["processed_versions"] == 0 and second["input_scan_performed"] is False
+        assert second["published_rows"] == 20
         replay = run(cfg)
         assert replay["inserted_this_attempt"] == 0
-    assert DeltaTable(str(cfg.table_path)).version() == 3
+    assert DeltaTable(str(cfg.table_path)).version() == 19
 
 
 def test_failed_discovery_retries_immediately_and_retains_captured_revision(

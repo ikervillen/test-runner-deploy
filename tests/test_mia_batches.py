@@ -41,31 +41,29 @@ def query(config, sql):
         return db.execute(sql).fetchall()
 
 
-def test_bounded_parse_and_consumed_hashes_skip_replay_but_keep_alias_receipts(mia, monkeypatch):
+def test_one_slot_is_one_commit_and_an_alias_does_not_replay(mia, monkeypatch):
     paths = sources(mia, 5)
-    monkeypatch.setattr(batching, "BATCH_FILES", 2)
     model = __import__(f"ingesta_delta_lake.{mia.family.lower()}", fromlist=["parse"])
     original = model.parse
     seen = []
 
     def parse(snapshots, encoding):
         seen.append(len(snapshots))
-        assert len(snapshots) <= 2
         return original(snapshots, encoding)
 
     monkeypatch.setattr(model, "parse", parse)
     first = run(mia)
-    assert seen == [2, 2, 1]
-    assert first["processed_versions"] == 5 and first["completed_batches"] == 3
+    assert seen == [5]
+    assert first["processed_versions"] == 5 and first["completed_batches"] == 1
     assert first["remaining_versions"] == 0 and first["published_rows"] == 5
     table = DeltaTable(str(mia.table_path))
-    assert table.version() == 2
+    assert table.version() == 0
     alias = paths[0].with_name(f"14102026_100000_{mia.family}.csv")
     alias.write_bytes(paths[0].read_bytes())
     seen.clear()
     second = run(mia)
     assert second["status"] == "NO_CHANGE" and second["processed_versions"] == 0
-    assert seen == [0] and DeltaTable(str(mia.table_path)).version() == 2
+    assert seen == [0] and DeltaTable(str(mia.table_path)).version() == 0
     assert query(mia, "SELECT count(*) FROM consumed_inputs") == [(5,)]
     assert query(mia, "SELECT count(*) FROM receipts") == [(11,)]
 
@@ -73,7 +71,6 @@ def test_bounded_parse_and_consumed_hashes_skip_replay_but_keep_alias_receipts(m
 @pytest.mark.parametrize("after_ack", [False, True])
 def test_failure_around_input_ack_never_loses_or_duplicates_rows(mia, monkeypatch, after_ack):
     sources(mia, 5)
-    monkeypatch.setattr(batching, "BATCH_FILES", 2)
     original = DefectsControl.acknowledge_inputs
 
     def fail(self, batch_id, snapshots):
@@ -86,17 +83,22 @@ def test_failure_around_input_ack_never_loses_or_duplicates_rows(mia, monkeypatc
         with pytest.raises(OSError):
             run(mia)
     assert DeltaTable(str(mia.table_path)).version() == 0
-    assert query(mia, "SELECT count(*) FROM consumed_inputs") == [(2 if after_ack else 0,)]
+    assert query(mia, "SELECT count(*) FROM consumed_inputs") == [(5 if after_ack else 0,)]
     result = run(mia)
     assert result["published_rows"] == 5 and result["remaining_versions"] == 0
     table = DeltaTable(str(mia.table_path))
-    assert table.version() == 2 and table.to_pyarrow_table().num_rows == 5
+    assert table.version() == 0
+    assert table.to_pyarrow_table().num_rows == 5
     assert query(mia, "SELECT count(*) FROM consumed_inputs") == [(5,)]
 
 
-def test_stop_between_committed_batches_resumes_remaining_versions(mia, monkeypatch):
-    sources(mia, 5)
-    monkeypatch.setattr(batching, "BATCH_FILES", 2)
+def test_stop_between_slots_resumes_the_older_copy(mia, monkeypatch):
+    folder = mia.input_root / "AV21"
+    slots = (("090000", 0), ("090100", 1), ("090200", 2), ("091000", 10), ("091100", 11))
+    for name, minute in slots:
+        (folder / f"14102026_{name}_{mia.family}.csv").write_text(
+            csv_row(mia.family, minute), encoding="utf-8"
+        )
     calls = []
     original = DefectsControl.acknowledge_inputs
 
@@ -113,13 +115,14 @@ def test_stop_between_committed_batches_resumes_remaining_versions(mia, monkeypa
     assert second["processed_versions"] == 3 and second["published_rows"] == 5
 
 
-def test_conflict_across_batches_keeps_original_and_quarantines_variant(mia, monkeypatch):
+def test_conflict_across_slots_keeps_original_and_quarantines_variant(mia):
     paths = sources(mia, 2)
-    paths[1].write_text(csv_row(mia.family, 0, rejected=13), encoding="utf-8")
-    monkeypatch.setattr(batching, "BATCH_FILES", 1)
+    later = paths[1].with_name(f"14102026_091000_{mia.family}.csv")
+    paths[1].rename(later)
+    later.write_text(csv_row(mia.family, 0, rejected=13), encoding="utf-8")
     result = run(mia)
     assert result["status"] == "PARTIAL" and result["published_rows"] == 1
-    assert DeltaTable(str(mia.table_path)).to_pyarrow_table()["RECH"].to_pylist() == [12]
+    assert DeltaTable(str(mia.table_path)).to_pyarrow_table()["RECH"].to_pylist() == [13]
     cases = [json.loads(row[0]) for row in query(mia, "SELECT payload_json FROM issues")]
     assert any(case["reason"] == "ROW_CONFLICT" for case in cases)
     module = "rejections_service" if mia.family == "LISTA_RECH" else "defects_service"
@@ -129,11 +132,17 @@ def test_conflict_across_batches_keeps_original_and_quarantines_variant(mia, mon
     assert query(mia, "SELECT count(*) FROM consumed_inputs") == [(2,)]
 
 
-def test_chunk_byte_budget_and_single_oversize_file(monkeypatch):
-    monkeypatch.setattr(batching, "BATCH_BYTES", 10)
-    items = [SimpleNamespace(size=size) for size in [6, 6, 12, 1, 1]]
-    batches = list(batching.chunks(items))
-    assert [[item.size for item in batch] for batch in batches] == [[6], [6], [12], [1, 1]]
+def test_one_commit_is_the_ten_minute_copy_not_a_file_count():
+    same = "2026-10-14T09:00:00"
+    nxt = "2026-10-14T09:10:00"
+    items = [
+        SimpleNamespace(producer_time=same, size=6, origin="AV21"),
+        SimpleNamespace(producer_time=same, size=6, origin="AV22"),
+        SimpleNamespace(producer_time=nxt, size=12, origin="AV21"),
+        SimpleNamespace(producer_time=None, size=1, origin="AV21"),
+    ]
+    batches = list(batching.slot_commits(items))
+    assert [[item.size for item in batch] for batch in batches] == [[6, 6], [12], [1]]
 
 
 def test_overwrite_with_same_size_and_mtime_is_still_detected(mia):

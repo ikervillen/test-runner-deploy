@@ -25,15 +25,11 @@ def test_origin_cursor_and_budget_survive_new_attempts(config, family):
                 csv_row(family, i), encoding="utf-8"
             )
     first = run(cfg)
-    assert first["status"] == "BACKLOG_PENDING"
-    assert first["processed_versions"] == 10 and first["remaining_versions"] == 10
-    assert first["pending_by_origin"] == {"AV21": 1, "AV22": 9}
+    assert first["status"] == "APPLIED"
+    assert first["processed_versions"] == 20 and first["remaining_versions"] == 0
+    assert first["completed_batches"] == 10 and first["published_rows"] == 20
     second = run(cfg)
-    assert second["pending_by_origin"] == {"AV21": 1, "AV22": 1}
-    assert second["published_rows"] == 18
-    run(cfg)
-    final = run(cfg)
-    assert final["remaining_versions"] == 0 and final["published_rows"] == 20
+    assert second["processed_versions"] == 0 and second["published_rows"] == 20
 
 
 def test_the_clock_slot_is_written_and_the_backlog_keeps_its_budget(config):
@@ -49,11 +45,11 @@ def test_the_clock_slot_is_written_and_the_backlog_keeps_its_budget(config):
             csv_row("LISTA_DEFECTOS", i), encoding="utf-8"
         )
     (folder / "14102026_100000_LISTA_DEFECTOS.csv").write_text(
-        csv_row("LISTA_DEFECTOS", 99), encoding="utf-8"
+        csv_row("LISTA_DEFECTOS", 10), encoding="utf-8"
     )
     nxt = run(cfg)
-    assert (nxt["processed_versions"], nxt["remaining_versions"]) == (9, 2)
-    assert nxt["status"] == "PARTIAL_BACKLOG"
+    assert (nxt["processed_versions"], nxt["remaining_versions"]) == (11, 0)
+    assert nxt["completed_batches"] == 2 and nxt["status"] == "APPLIED"
 
 
 def test_dictionary_alias_replay_has_no_stability_wait_but_detects_same_stat_overwrite(

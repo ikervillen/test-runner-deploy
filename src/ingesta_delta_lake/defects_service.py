@@ -4,7 +4,7 @@ import json
 import sqlite3
 import sys
 import time
-from collections import Counter, deque
+from collections import Counter
 from contextlib import closing
 from dataclasses import replace
 
@@ -18,6 +18,7 @@ from .common import (
     history_yields,
     horizon_marks,
     shared_bronze_window,
+    slot_stamp,
     split_live_backlog,
 )
 from .defects_storage import DefectsStore
@@ -25,52 +26,28 @@ from .mia_scope import files, group_holds, scope_for
 from .service import _apply
 from .sources import discover, input_scan, orphan_captures, stable_capture
 
-BATCH_FILES = 8
-BATCH_BYTES = 4 * 1024 * 1024
 MAX_FILE_BYTES = 8 * 1024 * 1024
 POLICY = "bounded-context-v2"
 
 
-def chunks(snapshots):
-    """Bound parsed input; a single file remains subject to the capture size limit."""
-    batch, size = [], 0
+def slot_commits(snapshots):
+    """One commit is every file Bronze copied in the same ten-minute slot.
+
+    The filename clock decides the slot. A file count or a byte size does not.
+    Files with no clock stay together so a capture without a time is still stored.
+    """
+    groups = {}
+    loose = []
     for snapshot in snapshots:
-        if batch and (len(batch) >= BATCH_FILES or size + snapshot.size > BATCH_BYTES):
-            yield batch
-            batch, size = [], 0
-        batch.append(snapshot)
-        size += snapshot.size
-    if batch:
-        yield batch
-
-
-def _restore_origin(control, origin):
-    """A live file must not move the backlog's origin cursor."""
-    with control.db:
-        if origin is None:
-            control.db.execute("DELETE FROM settings WHERE key='last_mia_origin'")
-        else:
-            control.db.execute(
-                "INSERT INTO settings VALUES('last_mia_origin',?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (origin,),
-            )
-
-
-def turns(pending, last_origin):
-    """FIFO within each origin; rotate origins only between durable batches."""
-    queues = {}
-    for snapshot in pending:
-        queues.setdefault(snapshot.origin, []).append(snapshot)
-    origins = sorted(queues)
-    order = [o for o in origins if o > last_origin] + [o for o in origins if o <= last_origin]
-    ready = deque((origin, iter(chunks(queues[origin]))) for origin in order)
-    while ready:
-        origin, batches = ready.popleft()
-        batch = next(batches, None)
-        if batch is not None:
-            yield batch
-            ready.append((origin, batches))
+        slot = slot_stamp(getattr(snapshot, "producer_time", None))
+        if slot is None:
+            loose.append(snapshot)
+            continue
+        groups.setdefault(slot, []).append(snapshot)
+    for slot in sorted(groups):
+        yield groups[slot]
+    if loose:
+        yield loose
 
 
 def reconcile_pending(config, control, store_class):
@@ -160,8 +137,6 @@ def process(
     )
     wrote = recovery_count > 0
     stopped = False
-    yielded = False
-    history_count = 0
     # One clock window for every line. An older file on one line is backlog.
     window, origins = shared_bronze_window(config.control_root)
     if window is None:
@@ -190,22 +165,13 @@ def process(
             "completed_batches": 0,
             "stats_scope": "sum_of_processed_batches",
         }
-    saved_origin = control.setting("last_mia_origin")
-
-    def ordered(items):
-        if not items:
-            return
-        yield from (
-            turns(items, saved_origin or "") if config.mia_batches_per_turn else chunks(items)
-        )
-
     phases = []
     if lane != "history" and live:
-        phases.append((True, ordered(live)))
+        phases.append((True, [live]))
     if lane != "live" and backlog:
-        phases.append((False, ordered(backlog)))
+        phases.append((False, slot_commits(backlog)))
     if not phases:
-        phases = [(False, iter([[]]))]
+        phases = [(False, [[]])]
     for is_live, selected in phases:
         for batch in selected:
             if result is not None and (
@@ -213,14 +179,6 @@ def process(
                 or (lane == "history" and history_yields())
             ):
                 stopped = True
-                break
-            if (
-                lane != "history"
-                and not is_live
-                and config.mia_batches_per_turn
-                and history_count >= config.mia_batches_per_turn
-            ):
-                yielded = True
                 break
             started = time.monotonic()
             result = process_batch(
@@ -236,8 +194,6 @@ def process(
             if is_live:
                 control.set_live_slot(bronze_now)
             recovered.extend(result["recovered_operations"])
-            if not is_live:
-                history_count += bool(batch)
             batch_count += bool(batch)
             wrote = wrote or result["status"] == "APPLIED"
             completed += len(batch)
@@ -259,24 +215,20 @@ def process(
             )
             for key in cumulative:
                 totals[key] = totals.get(key, 0) + result[key]
-        if is_live and live and backlog:
-            _restore_origin(control, saved_origin)
-        if stopped or yielded:
+        if stopped:
             break
     status = result["status"]
     if result["complete"]:
         status = "APPLIED" if wrote else "NO_CHANGE" if snapshots else "NO_INPUTS"
     if stopped:
         status = "STOPPED_AFTER_BATCH"
-    if yielded:
-        status = "BACKLOG_PENDING" if result["complete"] else "PARTIAL_BACKLOG"
     acknowledged = control.consumed_inputs()
     remaining = [s for s in pending if (s.origin, s.sha256) not in acknowledged]
     return {
         **result,
         **totals,
         "status": status,
-        "complete": result["complete"] and not stopped and not yielded,
+        "complete": result["complete"] and not stopped,
         "quality_complete": result["complete"],
         "source_files": len(snapshots),
         "processed_versions": completed,

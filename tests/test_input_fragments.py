@@ -58,15 +58,8 @@ def test_large_mia_capture_acknowledges_parent_only_after_fragments(config, monk
     path.write_text("".join(csv_row(config.family, i) for i in range(10)), encoding="utf-8")
     parent_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     monkeypatch.setattr(batching, "MAX_FILE_BYTES", 100)
-    monkeypatch.setattr(batching, "BATCH_FILES", 1)
     result = run(config)
-    assert result["remaining_versions"] > 0
-    with closing(RejectionsControl(config)) as control:
-        assert ("AV21", parent_hash) not in control.consumed_inputs()
-    for _ in range(15):
-        result = run(config)
-        if not result["remaining_versions"]:
-            break
+    assert result["remaining_versions"] == 0
     assert result["published_rows"] == result["resolved_groups"] == 10
     with closing(RejectionsControl(config)) as control:
         assert ("AV21", parent_hash) in control.consumed_inputs()
