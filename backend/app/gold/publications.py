@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -223,6 +224,64 @@ def reference(
     }
 
 
+def promote_cas(root: Path, our_refs: list[dict], *, lock_timeout: float = 60, **kwargs) -> dict:
+    """Point the current publication at our commits without hiding the other lane.
+
+    The pointer is the registry. It is swapped only while this process holds it,
+    for the write itself. If another lane committed a later version of a table we
+    also wrote, the caller repeats the merge. The score is not rebuilt.
+    """
+    our = {ref["name"]: ref for ref in our_refs}
+    deadline = time.monotonic() + lock_timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise portalocker.exceptions.LockException("The publication pointer stayed busy")
+        with portalocker.Lock(root / "writer.lock", timeout=min(5, remaining)):
+            kwargs.pop("dependencies", None)
+            kwargs.pop("generation", None)
+            kwargs.pop("previous", None)
+            if not (root / "current.json").exists():
+                return promote(
+                    root, list(our.values()), generation=1, previous=None, **kwargs
+                )
+            pointer, manifest = envelope(root)
+            latest = {ref["name"]: ref for ref in manifest["tables"]}
+            merged = dict(latest)
+            for name, ref in our.items():
+                target = root / "tables" / name
+                if (target / "_delta_log").exists() and DeltaTable(str(target)).version() != ref[
+                    "delta_version"
+                ]:
+                    raise CommitConflict(name)
+                merged[name] = ref
+            from .contracts import CONTRACTS
+
+            dependencies = [
+                {
+                    "table": name,
+                    "input_versions": {
+                        parent: merged[parent]["delta_version"]
+                        for parent in CONTRACTS[name].parents
+                        if parent in merged
+                    },
+                }
+                for name in sorted(merged)
+            ]
+            return promote(
+                root,
+                list(merged.values()),
+                generation=pointer["generation"] + 1,
+                previous=pointer["publication_id"],
+                dependencies=dependencies,
+                **kwargs,
+            )
+
+
+class CommitConflict(IntegrityError):
+    """Our hour landed, then another commit moved that table. Repeat the merge."""
+
+
 def promote(
     root: Path,
     refs: list[dict],
@@ -412,8 +471,8 @@ class Publisher:
         ):
             raise IntegrityError("Input environment/plant does not match Gold configuration")
         self.root.mkdir(parents=True, exist_ok=True)
-        with portalocker.Lock(self.root / "writer.lock", timeout=lock_timeout):
-            return self._publish(
+        # Delta commits run outside this lock. Only the publication pointer is swapped here.
+        return self._publish(
                 snapshot,
                 tables,
                 config_id,
@@ -522,7 +581,7 @@ class Publisher:
                 for p in (self.root / "operations").glob("*.json")
                 if read_json(p)["state"] != "ACKNOWLEDGED"
             ]
-            if pending:
+            if pending and not (hours or fact_bounds):
                 raise IntegrityError(
                     "Recover the pending operation before publishing another input"
                 )
@@ -550,7 +609,8 @@ class Publisher:
                             "Existing output has no published owner; "
                             "restore its pointer before writing"
                         )
-                    if current.version() != accepted["delta_version"]:
+                    same_version = current.version() == accepted["delta_version"]
+                    if not same_version and not (hours or fact_bounds):
                         raise IntegrityError(
                             "Output changed outside the pending confirmed operation"
                         )
@@ -605,7 +665,33 @@ class Publisher:
                         if predicate is not None:
                             delete = merge.when_not_matched_by_source_delete
                             merge = delete() if predicate == "" else delete(predicate=predicate)
-                        merge.execute()
+                        from deltalake.exceptions import CommitFailedError
+
+                        for _attempt in range(8):
+                            try:
+                                merge.execute()
+                                break
+                            except CommitFailedError:
+                                if _attempt == 7:
+                                    raise
+                                current = DeltaTable(str(target))
+                                merge = (
+                                    current.merge(
+                                        data,
+                                        join,
+                                        source_alias="s",
+                                        target_alias="t",
+                                        commit_properties=properties,
+                                        streamed_exec=True,
+                                    )
+                                    .when_matched_update_all(predicate=changed)
+                                    .when_not_matched_insert_all()
+                                )
+                                if predicate is not None:
+                                    delete = merge.when_not_matched_by_source_delete
+                                    merge = (
+                                        delete() if predicate == "" else delete(predicate=predicate)
+                                    )
                         after = DeltaTable(str(target))
                         if after.version() == before_version:
                             if name not in prior_refs:
@@ -623,7 +709,7 @@ class Publisher:
         for ref in prior_refs.values():
             Snapshot(self.root, {"tables": [ref]}).table(ref["name"])
         self.failpoint("verified")
-        manifest = promote(
+        manifest = promote_cas(
             self.root,
             list(prior_refs.values()),
             environment=self.environment,
@@ -762,7 +848,7 @@ class Publisher:
                 for p in (self.root / "operations").glob("*.json")
                 if read_json(p)["state"] != "ACKNOWLEDGED"
             ]
-            if pending:
+            if pending and not (hours or fact_bounds):
                 raise IntegrityError(
                     "Recover the pending operation before publishing another input"
                 )
@@ -812,7 +898,8 @@ class Publisher:
                             "Existing output has no published owner; "
                             "restore its pointer before writing"
                         )
-                    if current.version() != accepted["delta_version"]:
+                    same_version = current.version() == accepted["delta_version"]
+                    if not same_version and not (hours or fact_bounds):
                         raise IntegrityError(
                             "Output changed outside the pending confirmed operation"
                         )
@@ -884,7 +971,7 @@ class Publisher:
         for ref in prior_refs.values():
             Snapshot(self.root, {"tables": [ref]}).table(ref["name"])
         self.failpoint("verified")
-        manifest = promote(
+        manifest = promote_cas(
             self.root,
             list(prior_refs.values()),
             environment=self.environment,

@@ -42,7 +42,7 @@ from .fingerprint import source_fingerprint
 from .freshness import source_freshness
 from .incremental import Prepared
 from .metrics import Window, ar_bases, live_windows, production_windows, zc_bases
-from .publications import Publisher, Snapshot, commit_scope
+from .publications import CommitConflict, Publisher, Snapshot, commit_scope
 from .schemas import KEYS, SCHEMAS, check_row, make_table
 from .scoring import ScoreResult, calculate, validate_config
 from .spill import FactStore
@@ -117,7 +117,7 @@ REUSED_TABLES = (
 REFERENCE_TABLES = ("mia_reference_sets", "mia_reference_members", "mia_reference_values")
 DIMENSION_TABLES = ("dim_machine", "dim_model", "dim_defect", "dim_date")
 LIVE_FAMILIES = {"LISTA_RECH", "LISTA_DEFECTOS", "LISTA_AR", "CONT_ZC"}
-# Scoring runs outside this wait. The wait only covers the other lane's commit.
+# Scoring runs outside this wait. The pointer swap is the only shared step.
 COMMIT_WAIT_SECONDS = 30
 ZC_LINK_STATUSES = {
     "ASSIGNED",
@@ -1348,16 +1348,8 @@ def _live_receipt(output_root: Path) -> dict | None:
 
 
 def _live_anchor(cutoff: datetime) -> datetime:
-    """Start of the ten-minute slot that the next filename clock must pass.
-
-    A run at 16:10 is the slot that closes then. The anchor is 16:00, so a
-    file named 16:10 is copied and a file Silver already stored at 16:00 is not.
-    Between ticks, 16:07 keeps the same anchor: the slot that will enter is 16:10.
-    """
-    floored = cutoff.replace(minute=(cutoff.minute // 10) * 10, second=0, microsecond=0)
-    if cutoff == floored:
-        return floored - timedelta(minutes=10)
-    return floored
+    """Start of the ten-minute slot live copies. Same clock as Silver."""
+    return lanes.slot_start(cutoff)
 
 
 def _mark_live_since(output_root: Path, cutoff: datetime) -> tuple[datetime, bool]:
@@ -1455,30 +1447,58 @@ def _run(
         caught_up = _live_caught_up(input_root, output_root)
         if caught_up is not None:
             return caught_up
-    # The full build keeps the lock for the whole run, so two manuals cannot interleave.
-    # A lane scores outside it and waits only for the other lane's commit.
-    hold = (
-        portalocker.Lock(output_root / "pipeline.lock", timeout=0)
-        if lane == "all"
+    if lane == "history":
+        try:
+            held = portalocker.Lock(output_root / "live.priority.lock", timeout=0)
+            held.acquire()
+        except portalocker.exceptions.LockException:
+            return {"status": "UNCHANGED", "lane": "history", "reason": "LIVE_PRIORITY"}
+        else:
+            held.release()
+    priority = (
+        portalocker.Lock(output_root / "live.priority.lock", timeout=0)
+        if lane == "live"
         else nullcontext()
     )
-    with hold:
-        snap = Snapshot.open(input_root)
-        code_id = digest([source_fingerprint(__name__), ("python", platform.python_version())])
-        immutable_json(
-            output_root / "configs" / f"{digest([config, bundle])}.json",
-            {"schema_id": "quality-effective-config-v1", "score": config, "catalogs": bundle},
+    with priority:
+        # A lane scores outside it and waits only for the other lane's commit.
+        hold = (
+            portalocker.Lock(output_root / "pipeline.lock", timeout=0)
+            if lane == "all"
+            else nullcontext()
         )
-        # A full build is one operation. A lane is not: the next chunk must still run
-        # after this one is stored, so its receipt is not a reason to skip the lane.
-        if lane == "all":
-            work_id = digest([snap.publication_id, bundle, config, cutoff, code_id, recalculation])
-            state_path = output_root / "runs" / f"{work_id}.json"
-            if state_path.exists():
-                state = read_json(state_path)
+        with hold:
+            snap = Snapshot.open(input_root)
+            code_id = digest([source_fingerprint(__name__), ("python", platform.python_version())])
+            immutable_json(
+                output_root / "configs" / f"{digest([config, bundle])}.json",
+                {"schema_id": "quality-effective-config-v1", "score": config, "catalogs": bundle},
+            )
+            # A full build is one operation. A lane is not: the next chunk must still run
+            # after this one is stored, so its receipt is not a reason to skip the lane.
+            if lane == "all":
+                work_id = digest(
+                    [snap.publication_id, bundle, config, cutoff, code_id, recalculation]
+                )
+                state_path = output_root / "runs" / f"{work_id}.json"
+                if state_path.exists():
+                    state = read_json(state_path)
+                else:
+                    state = {
+                        "work_id": work_id,
+                        "calculation_time": utc_now(),
+                        "status": "PREPARED",
+                        "code_id": code_id,
+                        "input_publication_id": snap.publication_id,
+                        "config_id": digest([config, bundle]),
+                        "python": platform.python_version(),
+                        "recalculation": recalculation,
+                        "lane": lane,
+                    }
+                    atomic_json(state_path, state)
             else:
                 state = {
-                    "work_id": work_id,
+                    "work_id": digest([snap.publication_id, cutoff.isoformat(), lane, utc_now()]),
                     "calculation_time": utc_now(),
                     "status": "PREPARED",
                     "code_id": code_id,
@@ -1488,145 +1508,146 @@ def _run(
                     "recalculation": recalculation,
                     "lane": lane,
                 }
+                state_path = output_root / "runs" / f"{state['work_id']}.json"
                 atomic_json(state_path, state)
-        else:
-            state = {
-                "work_id": digest([snap.publication_id, cutoff.isoformat(), lane, utc_now()]),
-                "calculation_time": utc_now(),
-                "status": "PREPARED",
-                "code_id": code_id,
-                "input_publication_id": snap.publication_id,
-                "config_id": digest([config, bundle]),
-                "python": platform.python_version(),
-                "recalculation": recalculation,
-                "lane": lane,
-            }
-            state_path = output_root / "runs" / f"{state['work_id']}.json"
-            atomic_json(state_path, state)
-        source = source_freshness(snap.manifest, LIVE_FAMILIES)
-        if lane == "all" and state["status"] == "ACKNOWLEDGED":
-            Snapshot.open(
-                output_root, publication_id=state["publication_id"], require_gold_contract=True
+            source = source_freshness(snap.manifest, LIVE_FAMILIES)
+            if lane == "all" and state["status"] == "ACKNOWLEDGED":
+                Snapshot.open(
+                    output_root, publication_id=state["publication_id"], require_gold_contract=True
+                )
+                return {
+                    "status": "UNCHANGED",
+                    "publication_id": state["publication_id"],
+                    "source": source,
+                }
+            calculation_time = datetime.fromisoformat(state["calculation_time"]).replace(
+                tzinfo=None
             )
-            return {
-                "status": "UNCHANGED",
-                "publication_id": state["publication_id"],
-                "source": source,
-            }
-        calculation_time = datetime.fromisoformat(state["calculation_time"]).replace(tzinfo=None)
-        previous = Snapshot.open(output_root) if (output_root / "current.json").exists() else None
-        since = copied_until = None
-        if lane == "live":
-            since, _ = _mark_live_since(output_root, cutoff)
-            copied_until = _read_copied(output_root)
-        statistics: dict[str, Any] = {}
-        tables, coverage = build(
-            snap,
-            bundle=bundle,
-            config=config,
-            cutoff=cutoff,
-            previous=previous,
-            calculation_time=calculation_time,
-            max_rows_per_source=max_rows_per_source,
-            max_total_rows=max_total_rows,
-            statistics=statistics,
-            recalculate_closed_ids=set(recalculate_closed_ids or []),
-            lane=lane,
-            since=since,
-            copied_until=copied_until,
-        )
-        if tables is None:
-            state.update(status="IDLE", lane=lane)
-            atomic_json(state_path, state)
-            _remember_ar(output_root, statistics)
-            _remember_copied(output_root, statistics)
-            published_id = previous.publication_id if previous is not None else None
-            if lane == "live" and statistics.get("horizon_complete"):
-                _remember_live(output_root, snap.publication_id, published_id)
-            return {
-                "status": "UNCHANGED",
-                "lane": lane,
-                "publication_id": published_id,
-                "source": source,
-                "incremental": statistics,
-                "chunk_productions": [],
-            }
-        commit = (
-            nullcontext()
-            if lane == "all"
-            else portalocker.Lock(output_root / "pipeline.lock", timeout=COMMIT_WAIT_SECONDS)
-        )
-        try:
-            with commit:
-                # Bounded first snapshot; the writer also supports explicit per-scope replacement.
-                publication_config = digest([bundle, config, code_id, recalculation])
-                replace_ids = getattr(tables, "replace_ids", None)
-                hours = getattr(tables, "hours", None)
-                result_ids = getattr(tables, "result_ids", None)
-                publication_id = digest(
-                    [
-                        "gold-v1",
-                        snap.publication_id,
-                        publication_config,
-                        cutoff.isoformat(),
-                        commit_scope(replace_ids, hours),
-                    ]
-                )
-                if "quality_scores" not in getattr(tables, "spilled", ()):
-                    for row in tables["quality_scores"]:
-                        if row.get("basis_publication_id") is None:
-                            row["basis_publication_id"] = publication_id
-                result = Publisher(
-                    output_root, environment=environment, plant=plant, failpoint=failpoint
-                ).publish(
-                    snap,
-                    tables,
-                    config_id=publication_config,
-                    cutoff=cutoff.isoformat(),
-                    replace_ids=replace_ids,
-                    hours=hours,
-                    result_ids=result_ids,
-                    fact_bounds=getattr(tables, "fact_bounds", None),
-                    lock_timeout=0 if lane == "all" else COMMIT_WAIT_SECONDS,
-                    coverage=[
-                        {
-                            "source": "publication_scope_status",
-                            "source_discovery_at": min(
-                                (
-                                    r["last_successful_discovery"].isoformat()
-                                    for r in coverage
-                                    if r["last_successful_discovery"]
-                                ),
-                                default=None,
-                            ),
-                            "rows": len(coverage),
-                            "estado": "READY"
-                            if all(r["estado"] == "READY" for r in coverage)
-                            else "WAITING_DEPENDENCY",
-                        }
-                    ],
-                )
-                state.update(status="ACKNOWLEDGED", publication_id=result["publication_id"])
-                state["incremental"] = statistics
+            previous = (
+                Snapshot.open(output_root) if (output_root / "current.json").exists() else None
+            )
+            since = copied_until = None
+            if lane == "live":
+                since, _ = _mark_live_since(output_root, cutoff)
+                copied_until = _read_copied(output_root)
+            statistics: dict[str, Any] = {}
+            tables, coverage = build(
+                snap,
+                bundle=bundle,
+                config=config,
+                cutoff=cutoff,
+                previous=previous,
+                calculation_time=calculation_time,
+                max_rows_per_source=max_rows_per_source,
+                max_total_rows=max_total_rows,
+                statistics=statistics,
+                recalculate_closed_ids=set(recalculate_closed_ids or []),
+                lane=lane,
+                since=since,
+                copied_until=copied_until,
+            )
+            if tables is None:
+                state.update(status="IDLE", lane=lane)
                 atomic_json(state_path, state)
                 _remember_ar(output_root, statistics)
                 _remember_copied(output_root, statistics)
+                published_id = previous.publication_id if previous is not None else None
                 if lane == "live" and statistics.get("horizon_complete"):
-                    _remember_live(output_root, snap.publication_id, result["publication_id"])
-                spilled = getattr(tables, "spilled", ())
+                    _remember_live(output_root, snap.publication_id, published_id)
                 return {
-                    **result,
-                    "rows": {
-                        name: tables.store.count(name) if name in spilled else len(tables[name])
-                        for name in tables
-                    },
-                    "pending_scopes": sum(r["estado"] != "READY" for r in coverage),
-                    "incremental": statistics,
+                    "status": "UNCHANGED",
+                    "lane": lane,
+                    "publication_id": published_id,
                     "source": source,
-                    "coverage": coverage_summary(coverage, cutoff),
+                    "incremental": statistics,
+                    "chunk_productions": [],
                 }
-        finally:
-            tables.close()
+            commit = (
+                portalocker.Lock(output_root / "pipeline.lock", timeout=0)
+                if lane == "all"
+                else nullcontext()
+            )
+            try:
+                with commit:
+                    # Bounded first snapshot; the writer also supports explicit
+                    # per-scope replacement.
+                    publication_config = digest([bundle, config, code_id, recalculation])
+                    replace_ids = getattr(tables, "replace_ids", None)
+                    hours = getattr(tables, "hours", None)
+                    result_ids = getattr(tables, "result_ids", None)
+                    publication_id = digest(
+                        [
+                            "gold-v1",
+                            snap.publication_id,
+                            publication_config,
+                            cutoff.isoformat(),
+                            commit_scope(replace_ids, hours),
+                        ]
+                    )
+                    if "quality_scores" not in getattr(tables, "spilled", ()):
+                        for row in tables["quality_scores"]:
+                            if row.get("basis_publication_id") is None:
+                                row["basis_publication_id"] = publication_id
+                    for _attempt in range(5):
+                        try:
+                            result = Publisher(
+                                output_root,
+                                environment=environment,
+                                plant=plant,
+                                failpoint=failpoint,
+                            ).publish(
+                                snap,
+                                tables,
+                                config_id=publication_config,
+                                cutoff=cutoff.isoformat(),
+                                replace_ids=replace_ids,
+                                hours=hours,
+                                result_ids=result_ids,
+                                fact_bounds=getattr(tables, "fact_bounds", None),
+                                lock_timeout=0 if lane == "all" else 60,
+                                coverage=[
+                                    {
+                                        "source": "publication_scope_status",
+                                        "source_discovery_at": min(
+                                            (
+                                                r["last_successful_discovery"].isoformat()
+                                                for r in coverage
+                                                if r["last_successful_discovery"]
+                                            ),
+                                            default=None,
+                                        ),
+                                        "rows": len(coverage),
+                                        "estado": "READY"
+                                        if all(r["estado"] == "READY" for r in coverage)
+                                        else "WAITING_DEPENDENCY",
+                                    }
+                                ],
+                            )
+                            break
+                        except CommitConflict:
+                            if _attempt == 4:
+                                raise
+                    state.update(status="ACKNOWLEDGED", publication_id=result["publication_id"])
+                    state["incremental"] = statistics
+                    atomic_json(state_path, state)
+                    _remember_ar(output_root, statistics)
+                    _remember_copied(output_root, statistics)
+                    if lane == "live" and statistics.get("horizon_complete"):
+                        _remember_live(output_root, snap.publication_id, result["publication_id"])
+                    spilled = getattr(tables, "spilled", ())
+                    return {
+                        **result,
+                        "rows": {
+                            name: tables.store.count(name) if name in spilled else len(tables[name])
+                            for name in tables
+                        },
+                        "pending_scopes": sum(r["estado"] != "READY" for r in coverage),
+                        "incremental": statistics,
+                        "source": source,
+                        "coverage": coverage_summary(coverage, cutoff),
+                    }
+            finally:
+                tables.close()
 
 
 def run(input_root, output_root, **kwargs):

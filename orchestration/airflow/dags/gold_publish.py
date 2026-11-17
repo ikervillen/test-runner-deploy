@@ -2,8 +2,7 @@
 
 The run writes the open clock hour when Silver has published a new cutoff, and
 exits before reading facts when that publication is already scored. The backlog
-of closed hours is `gold_history`. The two lanes score at the same time; only
-the commit takes the writer lock.
+of closed hours is `gold_history`, which stops before this tick.
 """
 
 from __future__ import annotations

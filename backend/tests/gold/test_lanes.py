@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 
-from app.gold.lanes import HORIZON, plan
+from app.gold.lanes import plan
 from app.gold.publications import chunk_delete_predicate
 
 FAMILIES = ("LISTA_DEFECTOS", "LISTA_RECH", "LISTA_AR", "CONT_ZC")
@@ -30,7 +30,7 @@ def _production(identity: str, start: datetime, end: datetime | None = None) -> 
     }
 
 
-def test_live_writes_only_the_open_hour_and_history_the_newest_hour_outside_it():
+def test_live_writes_only_the_open_hour_and_history_the_hour_before_the_slot():
     recent = _production("recent", datetime(2026, 11, 10, 6, 0))
     older = _production("older", datetime(2026, 7, 3, 6, 0))
     productions = [older, recent]
@@ -43,9 +43,8 @@ def test_live_writes_only_the_open_hour_and_history_the_newest_hour_outside_it()
     ]
     history = plan(productions, {}, coverage, CEILING, "history")
     assert [(c.production_id, c.start, c.end) for c in history] == [
-        ("older", datetime(2026, 11, 10, 3, 0), datetime(2026, 11, 10, 4, 0)),
+        ("older", datetime(2026, 7, 3, 6, 0), datetime(2026, 7, 3, 7, 0)),
     ]
-    assert history[0].end <= CEILING - HORIZON
     assert plan(productions, {}, coverage, CEILING, "all") is None
 
 

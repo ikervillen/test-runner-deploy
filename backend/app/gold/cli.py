@@ -16,7 +16,7 @@ from .failures import PERMANENT, exit_code
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Confirmed Silver → Gold, isolated local validation"
+        description="Confirmed Silver ??? Gold, isolated local validation"
     )
     commands = parser.add_subparsers(dest="command", required=True)
     freeze = commands.add_parser("freeze-legacy")
@@ -250,6 +250,26 @@ def main(argv=None):
                         configured("output_root"),
                         attempt_cutoff(datetime.fromisoformat(args.at)),
                     )
+                elif args.command == "publish" and getattr(args, "lane", "all") == "history":
+                    from zoneinfo import ZoneInfo
+
+                    from .lanes import history_yields
+
+                    def plant_now():
+                        return datetime.now(ZoneInfo("Europe/Madrid")).replace(tzinfo=None)
+
+                    cutoff = attempt_cutoff(datetime.fromisoformat(args.at))
+                    steps = []
+                    result = {"status": "UNCHANGED", "lane": "history"}
+                    while not history_yields(plant_now()):
+                        result = execute(cutoff)
+                        steps.append(result.get("status"))
+                        if (
+                            result.get("status") == "UNCHANGED"
+                            or result.get("reason") == "LIVE_PRIORITY"
+                        ):
+                            break
+                    result = {**result, "history_steps": steps}
                 elif args.command == "publish":
                     result = execute(attempt_cutoff(datetime.fromisoformat(args.at)))
                 else:

@@ -1,9 +1,10 @@
 """Hour partitions for the live window and the historical backlog.
 
-Live copies the new ten-minute slot into the open hour and does not score it.
-The score is written once, when that clock hour closes. History writes one
-closed hour that is already outside the last eight hours. A late stop reopens
-only the hour it overlaps. Totals that span several hours are a later read.
+Live copies the clock's ten-minute slot into the open hour and does not score it.
+The score is written once, when that clock hour closes. History writes one hour
+that ends at or before that slot. The eight-hour window is a display choice,
+not a limit on what gets calculated. A late stop reopens only the hour it
+overlaps. Totals that span several hours are a later read.
 """
 
 from __future__ import annotations
@@ -125,38 +126,41 @@ def _live(productions, stored_hours, accredited, ceiling, reopen, since, copied)
     return chunks
 
 
+def slot_start(moment: datetime) -> datetime:
+    """Start of the ten-minute slot the live phase owns at `moment`."""
+    floored = moment.replace(minute=(moment.minute // 10) * 10, second=0, microsecond=0)
+    on_tick = moment.second == 0 and moment.microsecond == 0 and moment.minute % 10 == 0
+    return floored - timedelta(minutes=10) if on_tick else floored
+
+
+def history_yields(moment: datetime) -> bool:
+    """History gives the disk back 20 seconds before the next live tick."""
+    floored = moment.replace(minute=(moment.minute // 10) * 10, second=0, microsecond=0)
+    tick = floored if moment == floored else floored + timedelta(minutes=10)
+    return tick - moment <= timedelta(seconds=20)
+
+
 def _history(productions, stored_hours, accredited, ceiling, reopen) -> list[HourChunk]:
-    boundary = ceiling - HORIZON
-    chosen = None
-    for production in productions:
-        cutoff = accredited.get(production["id_produccion"])
-        if cutoff is None:
-            continue
-        identity = production["id_produccion"]
-        for start in stored_hours.get(identity, {}):
-            if (identity, start) not in reopen:
-                continue
-            end = start + timedelta(hours=1)
-            chunk = _clip(production, start, end, min(end, cutoff, boundary))
-            if (
-                chunk is not None
-                and chunk.end <= boundary
-                and (chosen is None or chunk.start > chosen.start)
-            ):
-                chosen = chunk
-    if chosen is not None:
-        return [chosen]
-    for production in sorted(productions, key=_started, reverse=True):
+    """The oldest hour that still ends at or before the live slot.
+
+    The checkpoint moves forward. A later hole waits until this one is stored.
+    """
+    boundary = slot_start(ceiling)
+    reopen = reopen or set()
+    for production in sorted(productions, key=_started):
         cutoff = accredited.get(production["id_produccion"])
         if cutoff is None or _started(production) == datetime.min:
             continue
-        cursor = _newest_closed_start(production, cutoff, boundary)
-        while cursor + timedelta(hours=1) > _started(production):
+        cursor = _floor_hour(_started(production))
+        while cursor < boundary:
             end = cursor + timedelta(hours=1)
             chunk = _clip(production, cursor, end, min(end, cutoff, boundary))
-            if chunk is not None and chunk.end <= boundary and _stale(stored_hours, chunk):
+            stale = chunk is not None and (
+                (chunk.production_id, chunk.start) in reopen or _stale(stored_hours, chunk)
+            )
+            if chunk is not None and chunk.cutoff <= boundary and stale:
                 return [chunk]
-            cursor -= timedelta(hours=1)
+            cursor = end
     return []
 
 
@@ -168,16 +172,6 @@ def _open_chunk(production, cutoff, ceiling) -> HourChunk | None:
     if chunk is None or not _in_horizon(chunk, ceiling):
         return None
     return chunk
-
-
-def _newest_closed_start(production, cutoff, boundary) -> datetime:
-    """The newest clock hour whose end is already outside the live window."""
-    finished = production.get("fecha_fin_zf")
-    finished = stamp(finished) if finished is not None else None
-    limit = min(cutoff, finished) if finished is not None else cutoff
-    if limit > boundary:
-        return _floor_hour(boundary) - timedelta(hours=1)
-    return _hour_holding(limit)[0]
 
 
 def _hours(production: dict, accredited: datetime | None, ceiling: datetime):

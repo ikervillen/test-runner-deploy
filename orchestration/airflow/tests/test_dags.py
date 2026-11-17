@@ -27,7 +27,7 @@ def test_dags_import_cleanly(dagbag):
     ("dag_id", "cron"),
     [
         ("gold_publish", "*/10 * * * *"),
-        ("gold_history", "0,30 * * * *"),
+        ("gold_history", "3-59/10 * * * *"),
         ("gold_nightly", "30 2 * * *"),
         ("gold_restore_drill", "30 4 * * 0"),
     ],
@@ -72,7 +72,7 @@ def test_live_stays_short_and_history_is_one_chunk(dagbag):
     assert publish.execution_timeout == timedelta(minutes=20)
     assert publish.retries == 0
     assert publish.pool == backlog.pool == "default_pool"
-    assert backlog.execution_timeout == timedelta(minutes=45)
+    assert backlog.execution_timeout == timedelta(minutes=8)
     assert backlog.retries == 2
     assert sensor.execution_timeout == timedelta(minutes=20)
     assert sensor.retries == 0

@@ -32,7 +32,7 @@ def local_moment(moment: datetime, zone: tzinfo = PLANT_TIMEZONE) -> str:
 
 
 def publish_command(run_after: datetime, lane: str = "live") -> list[str]:
-    """Live is the open hour. History is one closed hour outside the eight-hour window."""
+    """Live is the open slot. History walks older hours and stops before the next tick."""
     if lane not in {"live", "history", "all"}:
         raise ValueError(f"Unknown lane: {lane}")
     return [
