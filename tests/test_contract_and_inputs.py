@@ -64,9 +64,29 @@ def test_discovery_is_scoped(config, source):
 
 
 def test_unknown_selected_name_is_not_silently_ignored(config, source):
-    (source.parent / "bad_SIP_MODELO.csv").write_bytes(source.read_bytes())
+    (source.parent / "32102026_92028_SIP_MODELO.csv").write_bytes(source.read_bytes())
     with pytest.raises(CaptureError):
         discover(config)
+
+
+def test_mirror_copies_every_csv_and_silver_ignores_the_other_suffixes(config, source):
+    from dataclasses import replace
+
+    from ingesta_delta_lake.sources import mirror_exports
+
+    folder = source.parent
+    (folder / "17112026_144005_CONT_GEN.csv").write_text("gen\n", encoding="utf-8")
+    (folder / "17112026_144005_MP9_LISTA_DEFECTOS_ZC.csv").write_text("mp9\n", encoding="utf-8")
+    (folder / "17112026_144004_LISTA_DEFECTOS.csv").write_text("defecto\n", encoding="utf-8")
+    first = mirror_exports(config)
+    assert first["copied"] == 4 and first["failed"] == 0
+    assert len(list(config.bronze_root.rglob("*.csv"))) == 4
+    second = mirror_exports(config)
+    assert second["copied"] == 0 and second["unchanged"] == 4
+    defects = replace(config, family="LISTA_DEFECTOS")
+    assert [path.name for _, path, _ in discover(defects)] == ["17112026_144004_LISTA_DEFECTOS.csv"]
+    assert discover(replace(config, family="CONT_GEN")) == []
+    assert discover(replace(config, family="MP9_LISTA_DEFECTOS_ZC")) == []
 
 
 def test_discovery_resolves_root_once_instead_of_every_ordinary_file(config, source, monkeypatch):

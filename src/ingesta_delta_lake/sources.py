@@ -7,7 +7,7 @@ import re
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -15,6 +15,23 @@ from .common import CaptureError, IntegrityError, canonical, digest, now
 from .config import Config
 
 FAMILY = "SIP_MODELO"
+# Silver reads these exports only. Bronze keeps every other CSV Fenix drops.
+SILVER_EXPORTS = frozenset(
+    {
+        "LISTA_DEFECTOS",
+        "LISTA_RECH",
+        "CONT_ZC",
+        "LISTA_AR",
+        "MP9_CAMBIO_MODELO",
+        "SIP_MODELO",
+        "SIP_DEFECTO",
+        "SIP_DEFECTO_STATUS",
+        "SIP_DEFECTO_AR",
+        "SIP_MAQUINA_MOLDEO",
+        "SIP_LINEA_ZF",
+    }
+)
+_EXPORT_NAME = re.compile(r"^(?:\d{8}(?:_\d{5,6})?_)?(.+)\.csv$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -64,6 +81,12 @@ def orphan_captures(config, known):
             )
 
 
+def export_kind(name: str) -> str | None:
+    """Suffix of a Fenix CSV. The match is the whole suffix, not a shared ending."""
+    match = _EXPORT_NAME.fullmatch(name)
+    return match.group(1).upper() if match else None
+
+
 def parse_name(name: str, family: str = FAMILY) -> str | None:
     match = re.fullmatch(
         rf"^(?:(\d{{8}})(?:_(\d{{5,6}}))?_)?{re.escape(family)}\.csv$", name, re.IGNORECASE
@@ -93,6 +116,9 @@ def parse_name(name: str, family: str = FAMILY) -> str | None:
 
 
 def discover(config: Config) -> list[tuple[str, Path, str | None]]:
+    """Files of this Silver family. A longer or different suffix is another export."""
+    if config.family.upper() not in SILVER_EXPORTS:
+        return []
     result = []
     for origin, folder in config.sources:
         root = folder.resolve()
@@ -100,12 +126,7 @@ def discover(config: Config) -> list[tuple[str, Path, str | None]]:
         # filename adds thousands of cross-WSL calls; only links need realpath.
         with os.scandir(root) as entries:
             selected = sorted(
-                (
-                    e
-                    for e in entries
-                    if e.name.lower().endswith(".csv")
-                    and e.name[:-4].upper().endswith(config.family)
-                ),
+                (e for e in entries if export_kind(e.name) == config.family.upper()),
                 key=lambda e: e.name,
             )
         for entry in selected:
@@ -157,6 +178,64 @@ def input_scan(config, control):
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (canonical({"signature": signature, "started": started}),),
             )
+
+
+def mirror_exports(config: Config) -> dict:
+    """Copy every CSV Fenix has left in the line folder. One failure does not stop the rest.
+
+    Unchanged files are not read again. A file that is still being written is left
+    for the next pass. Silver later opens only the families it knows.
+    """
+    index_path = config.control_root / "bronze-mirror.json"
+    index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {}
+    copied = unchanged = skipped = failed = 0
+    for origin, folder in config.sources:
+        root = folder.resolve()
+        if not root.is_dir():
+            failed += 1
+            continue
+        with os.scandir(root) as entries:
+            names = sorted(e.name for e in entries if e.name.lower().endswith(".csv"))
+        for name in names:
+            path = root / name
+            try:
+                stat = path.stat()
+            except OSError:
+                failed += 1
+                continue
+            previous = index.get(str(path))
+            if (
+                previous
+                and previous.get("size") == stat.st_size
+                and previous.get("mtime_ns") == stat.st_mtime_ns
+            ):
+                unchanged += 1
+                continue
+            kind = export_kind(name) or "OTROS"
+            try:
+                stamp = None if kind == "OTROS" else parse_name(name, kind)
+            except CaptureError:
+                stamp = None
+            try:
+                snapshot = capture(replace(config, family=kind), origin, path, stamp)
+            except CaptureError:
+                skipped += 1
+                continue
+            except (OSError, IntegrityError):
+                failed += 1
+                continue
+            index[str(path)] = {
+                "size": snapshot.size,
+                "mtime_ns": snapshot.mtime_ns,
+                "sha256": snapshot.sha256,
+            }
+            copied += 1
+    if copied or not index_path.exists():
+        config.control_root.mkdir(parents=True, exist_ok=True)
+        temporary = index_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(index, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, index_path)
+    return {"copied": copied, "unchanged": unchanged, "skipped": skipped, "failed": failed}
 
 
 def capture_inputs(config, control, attempt):

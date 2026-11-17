@@ -286,6 +286,19 @@ def worker(interval=600):
                 raise IntegrityError("Activación de otra instancia")
             while not stop.is_set():
                 cycle_started = time.monotonic()
+                try:
+                    from .sources import mirror_exports
+
+                    mirrored = mirror_exports(base)
+                except Exception as exc:
+                    mirrored = {
+                        "copied": 0,
+                        "unchanged": 0,
+                        "skipped": 0,
+                        "failed": 1,
+                        "error": str(exc),
+                    }
+                print(canonical({"event": "BRONZE_MIRROR", "time": now(), **mirrored}), flush=True)
                 backlog = False
                 failed = False
                 next_scans = []
