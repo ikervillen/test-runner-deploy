@@ -69,9 +69,7 @@ def test_unknown_selected_name_is_not_silently_ignored(config, source):
         discover(config)
 
 
-def test_live_copies_the_newest_slot_and_history_walks_the_older_ones(
-    config, source, monkeypatch
-):
+def test_live_copies_the_newest_slot_and_history_walks_the_older_ones(config, source, monkeypatch):
     from ingesta_delta_lake.sources import mirror_exports
 
     folder = source.parent

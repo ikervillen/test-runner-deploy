@@ -284,6 +284,7 @@ def worker(interval=600):
                 pass
             if activation.exists() and json.loads(activation.read_text()) != {"token": token}:
                 raise IntegrityError("Activación de otra instancia")
+
             def mirror(lane):
                 try:
                     from .sources import mirror_exports
