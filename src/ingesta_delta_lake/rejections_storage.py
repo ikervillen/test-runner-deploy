@@ -8,7 +8,7 @@ from deltalake.transaction import CommitProperties
 
 from . import __version__
 from . import lista_rech as rech
-from .commit_protocol import application_transaction
+from .commit_protocol import application_transaction, delta_configuration
 from .common import IntegrityError
 from .defects_control import DefectsControl
 from .delta import DeltaStore
@@ -88,6 +88,7 @@ class RejectionsStore(ScopedRead, DeltaStore):
             table if table else str(self.path),
             pa.Table.from_pylist(values, schema=rech.SCHEMA),
             mode="append" if table else "error",
+            configuration=delta_configuration(self.config),
             commit_properties=CommitProperties(
                 custom_metadata={
                     "ingesta_operation_id": operation,

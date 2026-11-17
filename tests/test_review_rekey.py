@@ -18,8 +18,13 @@ from ingesta_delta_lake.service import run
 
 @pytest.mark.parametrize("family", ["LISTA_DEFECTOS", "LISTA_RECH"])
 @pytest.mark.parametrize("crash", [False, True])
-def test_inspection_count_key_change_is_atomic_and_recovers(config, family, crash, monkeypatch):
-    config = replace(config, family=family, timestamp_policy="local_naive_test_v1")
+@pytest.mark.parametrize("cdf", [False, True])
+def test_inspection_count_key_change_is_atomic_and_recovers(
+    config, family, crash, cdf, monkeypatch
+):
+    config = replace(
+        config, family=family, timestamp_policy="local_naive_test_v1", change_data_feed=cdf
+    )
     line = defect_line if family == "LISTA_DEFECTOS" else rech_line
     control_class = DefectsControl if family == "LISTA_DEFECTOS" else RejectionsControl
     path = config.input_root / "AV21" / f"{family}.csv"

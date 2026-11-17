@@ -8,7 +8,7 @@ from deltalake.transaction import CommitProperties
 
 from . import __version__
 from . import lista_defectos as defects
-from .commit_protocol import application_transaction
+from .commit_protocol import application_transaction, delta_configuration
 from .common import IntegrityError
 from .delta import DeltaStore
 from .mia_scope import ScopedRead
@@ -72,6 +72,7 @@ class DefectsStore(ScopedRead, DeltaStore):
             table if table else str(self.path),
             pa.Table.from_pylist(values, schema=defects.SCHEMA),
             mode="append" if table else "error",
+            configuration=delta_configuration(self.config),
             commit_properties=CommitProperties(
                 custom_metadata={
                     "ingesta_operation_id": operation,

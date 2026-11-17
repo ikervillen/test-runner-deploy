@@ -12,7 +12,7 @@ from deltalake.transaction import CommitProperties
 
 from . import __version__
 from . import lista_ar as ar
-from .commit_protocol import application_transaction
+from .commit_protocol import application_transaction, delta_configuration
 from .common import IntegrityError, canonical, digest
 from .delta import DeltaStore
 
@@ -151,7 +151,13 @@ class ArStore(DeltaStore):
             max_commit_retries=0,
         )
         if table is None:
-            write_deltalake(str(self.path), arrow, mode="error", commit_properties=props)
+            write_deltalake(
+                str(self.path),
+                arrow,
+                mode="error",
+                configuration=delta_configuration(self.config),
+                commit_properties=props,
+            )
         else:
             parts = []
             for f in ("origen_fenix", *ar.KEY_FIELDS):

@@ -35,6 +35,13 @@ escritor de su almacenamiento. Lee publicaciones live confirmadas, copia de form
 idempotente y publica un recibo verificable. Solo después el propietario live puede
 retirar su copia. Nunca borrar primero ni modificar desde histórico el control live.
 
+Las tablas nuevas de los caminos independientes habilitan Change Data Feed de
+Delta desde su creación. Se conservan inserciones, valores anteriores y posteriores
+y eliminaciones con su versión real. No se habilita sobre tablas antiguas mediante
+una actualización implícita. La limpieza automática del log queda deshabilitada:
+no ejecutar VACUUM ni eliminar evidencia referenciada hasta disponer de una
+política de limpieza que compruebe todos los recibos y lectores pendientes.
+
 La consulta fija una publicación de cada camino y combina identidades y revisiones
 confirmadas. Durante el traspaso puede haber copias en ambos caminos; el lector no
 duplica observaciones. Las correcciones posteriores también deben conservarse.

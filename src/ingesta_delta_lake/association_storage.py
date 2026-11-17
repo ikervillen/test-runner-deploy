@@ -17,7 +17,7 @@ from . import __version__, topology
 from . import associations as a
 from .ar_storage import ArStore
 from .catalog_storage import CatalogStore
-from .commit_protocol import application_transaction
+from .commit_protocol import application_transaction, delta_configuration
 from .common import IntegrityError, canonical, digest, now
 from .control import Control
 from .defects_storage import DefectsStore
@@ -435,7 +435,13 @@ class AssociationStore(DeltaStore):
             max_commit_retries=0,
         )
         if table is None:
-            write_deltalake(str(self.path), arrow, mode="error", commit_properties=props)
+            write_deltalake(
+                str(self.path),
+                arrow,
+                mode="error",
+                configuration=delta_configuration(self.config),
+                commit_properties=props,
+            )
         else:
             m = (
                 table.merge(
