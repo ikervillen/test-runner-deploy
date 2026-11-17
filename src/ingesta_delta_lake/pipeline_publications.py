@@ -9,7 +9,7 @@ from pathlib import Path
 import pyarrow as pa
 from deltalake import DeltaTable
 
-from .common import IntegrityError, digest
+from .common import IntegrityError, digest, now
 from .runtime import atomic_json
 
 
@@ -136,6 +136,10 @@ def publish_family(config, storage, *, lane, identity, family, captured_ids=()):
         refs = dict(previous.manifest["tables"])
         parent = previous.manifest["publication_id"]
     previous_ref = refs.get(family, {})
+    owner_confirmed_at = confirmed_at
+    confirmed_at = (
+        previous_ref.get("confirmed_at") if previous_ref.get("version") == version else now()
+    )
     if not captured_ids and previous_ref.get("version") == version:
         captured_ids = previous_ref.get("captured_ids", ())
     refs[family] = {
@@ -145,6 +149,7 @@ def publish_family(config, storage, *, lane, identity, family, captured_ids=()):
         "control_id": control_id,
         "operation_id": operation,
         "confirmed_at": confirmed_at,
+        "owner_confirmed_at": owner_confirmed_at,
         "schema_id": schema_hash(pa.schema(table.schema().to_arrow())),
         "captured_ids": list(captured_ids),
         "rejected_hashes": rejected,

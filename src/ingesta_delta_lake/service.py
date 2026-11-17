@@ -281,17 +281,7 @@ def _process(
     }
 
 
-def run(
-    config: Config,
-    *,
-    runtime_owner: bool = False,
-    stop_requested=None,
-    reviews_only=False,
-    lane="all",
-) -> dict:
-    config.validate()
-    for path in (config.bronze_root, config.silver_root, config.control_root):
-        path.mkdir(parents=True, exist_ok=True)
+def control_type(config):
     control_class = Control
     if config.family in {"SIP_MAQUINA_MOLDEO", "SIP_LINEA_ZF"}:
         from .topology_storage import TopologyControl
@@ -325,6 +315,21 @@ def run(
         from .defects_control import DefectsControl
 
         control_class = DefectsControl
+    return control_class
+
+
+def run(
+    config: Config,
+    *,
+    runtime_owner: bool = False,
+    stop_requested=None,
+    reviews_only=False,
+    lane="all",
+) -> dict:
+    config.validate()
+    for path in (config.bronze_root, config.silver_root, config.control_root):
+        path.mkdir(parents=True, exist_ok=True)
+    control_class = control_type(config)
     # El bloqueo sigue al destino Silver, no a un nombre de fichero de entrada.
     # Dos configuraciones con controles distintos tampoco pueden escribir a la vez.
     try:
@@ -344,6 +349,9 @@ def run(
                 )
             )
             with closing(control_class(config)) as control:
+                from .pipeline_retirement import recover
+
+                recover(config, control)
                 from . import retry_control
 
                 if reviews_only:
