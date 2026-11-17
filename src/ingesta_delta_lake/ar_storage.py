@@ -12,7 +12,7 @@ from deltalake.transaction import CommitProperties
 
 from . import __version__
 from . import lista_ar as ar
-from .commit_protocol import application_transaction, delta_configuration
+from .commit_protocol import application_transaction, delta_configuration, merge_counts_match
 from .common import IntegrityError, canonical, digest
 from .delta import DeltaStore
 
@@ -182,9 +182,5 @@ class ArStore(DeltaStore):
                 .when_not_matched_insert_all()
                 .execute()
             )
-            if (
-                metrics["num_target_rows_inserted"] != len(inserts)
-                or metrics["num_target_rows_updated"] != len(updates)
-                or metrics["num_target_rows_deleted"] != 0
-            ):
+            if not merge_counts_match(metrics, inserts, updates, self.config):
                 raise IntegrityError("MERGE AR distinto de las intenciones")

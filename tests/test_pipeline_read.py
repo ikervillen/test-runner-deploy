@@ -133,7 +133,13 @@ def test_scoped_mia_reads_reuse_archived_evidence_with_dictionary_decoding(confi
         metadata.update(
             ingesta_maintenance="archive-retirement", ingesta_operation_id="test-retire"
         )
+        original = store.table().to_pyarrow_table().to_pylist()
         store.table().delete(commit_properties=CommitProperties(custom_metadata=metadata))
+        from ingesta_delta_lake.pipeline_retired import logical_rows, register
+
+        with control.db:
+            register(control, original, store.table().version())
+        assert logical_rows(control, store.table()) == 2
         store.set_scope([["AV21", "2026-10-14T00:01:00", "2026-10-14T00:01:00"]])
         rows = list(store.read()[1].values())
         assert len(rows) == 1 and rows[0]["FECHA"] == "2026-10-14T00:01:00"

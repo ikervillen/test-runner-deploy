@@ -12,7 +12,7 @@ from deltalake.transaction import CommitProperties
 
 from . import __version__
 from . import topology as t
-from .commit_protocol import application_transaction, delta_configuration
+from .commit_protocol import application_transaction, delta_configuration, merge_counts_match
 from .common import IntegrityError, canonical, digest, now
 from .control import Control
 from .delta import DeltaStore
@@ -216,11 +216,7 @@ class TopologyStore(DeltaStore):
                 .when_not_matched_insert_all()
                 .execute()
             )
-            if (
-                metrics["num_target_rows_inserted"] != len(inserts)
-                or metrics["num_target_rows_updated"] != len(updates)
-                or metrics["num_target_rows_deleted"]
-            ):
+            if not merge_counts_match(metrics, inserts, updates, self.config):
                 raise IntegrityError("MERGE de topología distinto de lo preparado")
 
 
