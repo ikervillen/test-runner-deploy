@@ -130,6 +130,9 @@ def publish_family(config, storage, *, lane, identity, family, captured_ids=()):
             raise IntegrityError("Silver publication belongs to another lane")
         refs = dict(previous.manifest["tables"])
         parent = previous.manifest["publication_id"]
+    previous_ref = refs.get(family, {})
+    if not captured_ids and previous_ref.get("version") == version:
+        captured_ids = previous_ref.get("captured_ids", ())
     refs[family] = {
         "uri": cfg.table_path.relative_to(storage.silver).as_posix(),
         "table_id": table.metadata().id,

@@ -3,6 +3,7 @@
 import argparse
 import json
 import signal
+import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +24,7 @@ from .pipeline_intake import Intake, discover_lanes
 from .pipeline_policy import LANES, STORES, IndependentPipelines
 from .pipeline_publications import publish_family
 from .pipeline_view import ArchiveSnapshot
+from .reviews import pending_families
 from .runtime import atomic_json
 from .sources import SILVER_EXPORTS
 from .workers import PHASES, run_phase
@@ -52,6 +54,7 @@ class PipelineWorker:
             stable_wait_seconds=self.policy.stable_wait_seconds,
             capture_attempts=self.policy.capture_attempts,
             max_file_bytes=self.policy.max_file_bytes,
+            reviews_only=False,
         )
         self.source.validate()
         self.stop = stop if stop is not None else threading.Event()
@@ -129,7 +132,7 @@ class PipelineWorker:
         self.event({"event": "BRONZE_CAPTURE", **captured})
         return window, captured
 
-    def selected_config(self, intake, family, window):
+    def selected_config(self, intake, family, window, *, reviews_only=False):
         bounds = (window.start.isoformat(), window.end.isoformat()) if window else None
         return replace(
             self.source,
@@ -140,6 +143,7 @@ class PipelineWorker:
                 window=window if self.lane == "live" else None,
             ),
             processing_window=bounds if self.lane == "live" else None,
+            reviews_only=reviews_only,
             **self.archive_context,
         )
 
@@ -196,26 +200,54 @@ class PipelineWorker:
 
     def record(self, intake, cfg, result, seconds):
         ids, family = cfg.intake_ids, cfg.family
+        if result.get("status") in {"RETRY_WAIT", "PAUSED_RETRY_EXHAUSTED"}:
+            intake.defer(ids, result)
+            self.event({"family": family, "result": result, "seconds": seconds})
+            return
         if result.get("status") != "FAILED" and not result.get("remaining_versions", 0):
             try:
-                if ids or result.get("status") == "APPLIED":
-                    manifest = publish_family(
-                        cfg,
-                        self.storage,
-                        lane=self.lane,
-                        identity=self.identity,
-                        family=family,
-                        captured_ids=ids,
-                    )
-                    if result.get("status") == "APPLIED" and manifest is None:
-                        raise IntegrityError("Applied transformation has no confirmed Silver table")
-                intake.acknowledge(ids, result, published_at=now())
+                manifest = publish_family(
+                    cfg,
+                    self.storage,
+                    lane=self.lane,
+                    identity=self.identity,
+                    family=family,
+                    captured_ids=ids,
+                )
+                if result.get("status") == "APPLIED" and manifest is None:
+                    raise IntegrityError("Applied transformation has no confirmed Silver table")
+                if ids:
+                    intake.acknowledge(ids, result, published_at=now())
+                    intake.defer(ids, result)
             except Exception as exc:
                 result["publication_error"] = str(exc)
                 self.event(
                     {"event": "SILVER_PUBLICATION_FAILED", "family": family, "error": str(exc)}
                 )
         self.event({"family": family, "result": result, "seconds": seconds})
+
+    def release_retries(self, intake, active):
+        for row in intake.db.execute(
+            "SELECT DISTINCT family FROM inputs WHERE state='WAITING_RETRY'"
+        ).fetchall():
+            family = row[0]
+            if family in active:
+                continue
+            cfg = replace(self.source, family=family)
+            try:
+                with closing(
+                    sqlite3.connect(cfg.control_path.as_uri() + "?mode=ro", uri=True, timeout=0)
+                ) as db:
+                    row = db.execute(
+                        "SELECT value FROM settings WHERE key='retry_state'"
+                    ).fetchone()
+                state = json.loads(row[0]) if row else None
+                if state is None or (not state["paused"] and state["next_at"] <= time.time()):
+                    intake.release(family, "WAITING_RETRY")
+            except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
+                self.event(
+                    {"event": "RETRY_STATE_UNAVAILABLE", "family": family, "error": str(exc)}
+                )
 
     def transform(self, cfg, executor):
         events = []
@@ -236,6 +268,9 @@ class PipelineWorker:
         self.archive_turn()
         self.refresh_archive()
         window, captured = self.capture(intake)
+        self.release_retries(intake, set())
+        for family in pending_families(f for phase in phases for f in phase):
+            intake.release(family, "WAITING_REVIEW")
         results = {}
         for phase in phases:
             if self.stop.is_set():
@@ -267,6 +302,12 @@ class PipelineWorker:
                 self.archive_turn()
                 self.refresh_archive()
                 window, captured = self.capture(intake)
+                self.release_retries(intake, active)
+                reviews = pending_families(families)
+                for family in reviews - active.keys():
+                    intake.release(family, "WAITING_REVIEW")
+                    dirty.add(family)
+                    dirty_since.setdefault(family, time.monotonic())
                 for family, (future, cfg) in list(active.items()):
                     if not future.done():
                         continue
@@ -280,26 +321,37 @@ class PipelineWorker:
                         dirty.add(family)
                         dirty_since.setdefault(family, time.monotonic())
                         retry_at[family] = time.monotonic() + self.policy.poll_seconds
-                    elif cfg.intake_ids or result.get("status") == "APPLIED":
+                    elif result.get("status") in {
+                        "APPLIED",
+                        "NO_CHANGE",
+                        "PARTIAL",
+                        "BLOCKED",
+                        "REVIEWS_CHECKED",
+                    } and (cfg.intake_ids or cfg.reviews_only or result.get("status") == "APPLIED"):
                         for dependent in families[families.index(family) + 1 :]:
+                            intake.release(dependent, "WAITING_REVIEW")
                             dirty.add(dependent)
                             dirty_since.setdefault(dependent, time.monotonic())
                 ready = []
                 for family in families:
                     if family in active or retry_at.get(family, 0) > time.monotonic():
                         continue
-                    cfg = self.selected_config(intake, family, window)
+                    cfg = self.selected_config(
+                        intake, family, window, reviews_only=family in reviews
+                    )
                     if cfg.intake_ids or family in dirty:
-                        overdue = time.monotonic() - dirty_since.get(family, time.monotonic())
+                        first_seen = dirty_since.setdefault(family, time.monotonic())
+                        overdue = time.monotonic() - first_seen
                         ready.append(
                             (
                                 not (overdue >= self.policy.latency_seconds),
                                 not bool(cfg.intake_ids),
+                                first_seen,
                                 families.index(family),
                                 cfg,
                             )
                         )
-                for _, _, _, cfg in sorted(ready):
+                for _, _, _, _, cfg in sorted(ready):
                     if len(active) >= self.parallel:
                         break
                     if (

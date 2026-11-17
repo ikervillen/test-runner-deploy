@@ -109,6 +109,62 @@ def test_runtime_paths_remain_within_own_lane(config, pipeline_config):
     assert not pipeline_config.history.control.exists()
 
 
+@pytest.mark.parametrize(
+    "status,state",
+    [
+        ("PARTIAL", "WAITING_REVIEW"),
+        ("BLOCKED", "WAITING_REVIEW"),
+        ("RETRY_WAIT", "WAITING_RETRY"),
+        ("PAUSED_RETRY_EXHAUSTED", "WAITING_RETRY"),
+    ],
+)
+def test_waiting_work_remains_durable_and_can_be_released(config, pipeline_config, status, state):
+    (config.sources[0][1] / "SIP_MODELO.csv").write_text("2;3082/360;1;\n")
+    worker = PipelineWorker(pipeline_config, "live", config)
+    worker.prepare()
+    with closing(
+        Intake(worker.source.intake_path, lane="live", identity=worker.identity)
+    ) as intake:
+        window, _ = worker.capture(intake)
+        cfg = worker.selected_config(intake, "SIP_MODELO", window)
+        worker.record(intake, cfg, {"status": status}, 0)
+        assert not intake.pending("SIP_MODELO", 10)
+        assert tuple(intake.db.execute("SELECT state,published_at FROM inputs").fetchone()) == (
+            state,
+            None,
+        )
+        intake.release("SIP_MODELO", state)
+        assert intake.pending("SIP_MODELO", 10) == cfg.intake_ids
+
+
+def test_retry_queue_respects_native_pause_and_due_time(config, pipeline_config):
+    import sqlite3
+
+    (config.sources[0][1] / "SIP_MODELO.csv").write_text("2;3082/360;1;\n")
+    worker = PipelineWorker(pipeline_config, "live", config)
+    worker.prepare()
+    with closing(
+        Intake(worker.source.intake_path, lane="live", identity=worker.identity)
+    ) as intake:
+        window, _ = worker.capture(intake)
+        ids = worker.selected_config(intake, "SIP_MODELO", window).intake_ids
+        with sqlite3.connect(worker.source.control_path) as db:
+            db.execute("CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT)")
+            for paused, due, expected in [
+                (True, 0, False),
+                (False, time.time() + 100, False),
+                (False, 0, True),
+            ]:
+                intake.defer(ids, {"status": "RETRY_WAIT"})
+                db.execute(
+                    "INSERT OR REPLACE INTO settings VALUES('retry_state',?)",
+                    (json.dumps({"paused": paused, "next_at": due}),),
+                )
+                db.commit()
+                worker.release_retries(intake, set())
+                assert bool(intake.pending("SIP_MODELO", 10)) == expected
+
+
 def test_slow_derivation_does_not_hold_up_next_live_publication(config, pipeline_config):
     from ingesta_delta_lake.workers import run_phase
 
