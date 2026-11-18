@@ -1,5 +1,6 @@
 """Shared business identities and conservative reconciliation of accepted versions."""
 
+from collections import defaultdict
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -109,3 +110,26 @@ def reconcile(family, versions):
         if all(accepted_extension(family, other["row"], candidate["row"]) for other in candidates):
             return candidate["row"]
     raise IntegrityError("CROSS_LANE_CONFLICT: accepted versions require explicit review")
+
+
+def conflicting_keys(family, rows):
+    contract = CONTRACTS[family]
+    invalid = set()
+    if isinstance(contract, DictionaryContract):
+        codes = defaultdict(list)
+        for key, row in rows.items():
+            codes[contract.code(contract.value(row))].append(key)
+        invalid.update(key for keys in codes.values() if len(keys) > 1 for key in keys)
+    if family in {"LISTA_DEFECTOS", "LISTA_RECH"}:
+        model = lista_defectos if family == "LISTA_DEFECTOS" else lista_rech
+        for grouping in (model.signature, model.group):
+            groups = defaultdict(list)
+            for key, row in rows.items():
+                groups[grouping(row)].append((key, row["INSPECC"]))
+            invalid.update(
+                key
+                for group in groups.values()
+                if len({v for _, v in group}) > 1
+                for key, _ in group
+            )
+    return invalid

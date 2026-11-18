@@ -7,12 +7,11 @@ from dataclasses import dataclass, field
 import pyarrow as pa
 from deltalake import DeltaTable
 
-from . import lista_defectos, lista_rech
 from .common import IntegrityError, digest
-from .contracts import CONTRACTS, DictionaryContract
+from .contracts import CONTRACTS
 from .pipeline_archive import META
 from .pipeline_publications import _inside, schema_hash
-from .pipeline_rows import business_key, payload_hash, reconcile, review_hash
+from .pipeline_rows import business_key, conflicting_keys, payload_hash, reconcile, review_hash
 
 
 class ArchiveSnapshot:
@@ -154,25 +153,7 @@ class SilverView:
                     rows[key] = row
             except IntegrityError as exc:
                 conflicts.append({"key": key, "reason": str(exc)})
-        contract = CONTRACTS[family]
-        invalid = set()
-        if isinstance(contract, DictionaryContract):
-            codes = defaultdict(list)
-            for key, row in rows.items():
-                codes[contract.code(contract.value(row))].append(key)
-            invalid.update(key for keys in codes.values() if len(keys) > 1 for key in keys)
-        if family in {"LISTA_DEFECTOS", "LISTA_RECH"}:
-            model = lista_defectos if family == "LISTA_DEFECTOS" else lista_rech
-            for grouping in (model.signature, model.group):
-                groups = defaultdict(list)
-                for key, row in rows.items():
-                    groups[grouping(row)].append((key, row["INSPECC"]))
-                invalid.update(
-                    key
-                    for group in groups.values()
-                    if len({v for _, v in group}) > 1
-                    for key, _ in group
-                )
+        invalid = conflicting_keys(family, rows)
         for key in sorted(invalid):
             conflicts.append({"key": key, "reason": "CROSS_LANE_CONTRACT_CONFLICT"})
             rows.pop(key)
