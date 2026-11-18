@@ -232,18 +232,23 @@ def promote_cas(root: Path, our_refs: list[dict], *, lock_timeout: float = 60, *
     also wrote, the caller repeats the merge. The score is not rebuilt.
     """
     our = {ref["name"]: ref for ref in our_refs}
+    declared_dependencies = kwargs.pop("dependencies", [])
     deadline = time.monotonic() + lock_timeout
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise portalocker.exceptions.LockException("The publication pointer stayed busy")
         with portalocker.Lock(root / "writer.lock", timeout=min(5, remaining)):
-            kwargs.pop("dependencies", None)
             kwargs.pop("generation", None)
             kwargs.pop("previous", None)
             if not (root / "current.json").exists():
                 return promote(
-                    root, list(our.values()), generation=1, previous=None, **kwargs
+                    root,
+                    list(our.values()),
+                    generation=1,
+                    previous=None,
+                    dependencies=declared_dependencies,
+                    **kwargs,
                 )
             pointer, manifest = envelope(root)
             latest = {ref["name"]: ref for ref in manifest["tables"]}
@@ -273,7 +278,7 @@ def promote_cas(root: Path, our_refs: list[dict], *, lock_timeout: float = 60, *
                 list(merged.values()),
                 generation=pointer["generation"] + 1,
                 previous=pointer["publication_id"],
-                dependencies=dependencies,
+                dependencies=dependencies + [d for d in declared_dependencies if d.get("kind")],
                 **kwargs,
             )
 
@@ -473,17 +478,17 @@ class Publisher:
         self.root.mkdir(parents=True, exist_ok=True)
         # Delta commits run outside this lock. Only the publication pointer is swapped here.
         return self._publish(
-                snapshot,
-                tables,
-                config_id,
-                cutoff,
-                coverage,
-                replacement_scopes or {},
-                replace_ids,
-                hours,
-                result_ids,
-                fact_bounds,
-            )
+            snapshot,
+            tables,
+            config_id,
+            cutoff,
+            coverage,
+            replacement_scopes or {},
+            replace_ids,
+            hours,
+            result_ids,
+            fact_bounds,
+        )
 
     def _publish_stream(
         self,
@@ -729,7 +734,8 @@ class Publisher:
                     },
                 }
                 for name in sorted(prior_refs)
-            ],
+            ]
+            + independent_dependencies(self.root, snapshot),
             contract=expected_contract,
         )
         self.failpoint("promoted")
@@ -991,7 +997,8 @@ class Publisher:
                     },
                 }
                 for name in sorted(prior_refs)
-            ],
+            ]
+            + independent_dependencies(self.root, snapshot),
             contract=expected_contract,
         )
         self.failpoint("promoted")
@@ -1039,3 +1046,38 @@ def _validate_scopes(rows, scopes):
                 raise IntegrityError("Scope values must be exact strings or integers")
         if any(any(r[k] not in v for k, v in scope.items()) for r in rows[name]):
             raise IntegrityError("Output row falls outside its declared replacement scope")
+
+
+def independent_dependencies(root, snapshot):
+    """A Gold pointer can refer only to evidence already copied and verified locally."""
+    if (
+        not hasattr(snapshot, "document")
+        or snapshot.document.get("schema_id") != "quality-independent-input-v1"
+    ):
+        return []
+    from ingesta_delta_lake.association_cas import publish
+
+    from .evidence import SCHEMA, Evidence
+
+    target = root / "evidence"
+    target.mkdir(parents=True, exist_ok=True)
+    for ref in snapshot.document["tables"]:
+        source = within(snapshot.root, ref["uri"])
+        destination = within(target, ref["uri"])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        data = source.read_bytes()
+        if hashlib.sha256(data).hexdigest() != ref["hash"]:
+            raise IntegrityError("Gold publication cannot confirm altered input evidence")
+        publish(destination, data)
+    immutable_json(target / f"{snapshot.publication_id}.json", snapshot.document)
+    copied = Evidence.open(target, snapshot.publication_id)
+    if copied.document["schema_id"] != SCHEMA:
+        raise IntegrityError("Gold copied evidence schema differs")
+    return [
+        {
+            "kind": "independent-input",
+            "input_versions": {},
+            "evidence_id": snapshot.publication_id,
+            "lane": snapshot.document["lane"],
+        }
+    ]

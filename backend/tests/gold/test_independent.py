@@ -88,3 +88,31 @@ def test_registry_never_resolves_same_revision_by_arrival(native):
     values = [{"a": {"revision": 1}}, {"a": {"revision": 1, "actor": "other"}}]
     with pytest.raises(IntegrityError, match="revisions"):
         registry([{"registry": r, "registry_hash": digest(r)} for r in values])
+
+
+def test_independent_gold_publishes_self_contained_evidence(independent, tmp_path):
+    from datetime import datetime
+
+    from app.gold.common import read_json
+    from app.gold.independent_inputs import export, published_evidence
+    from app.gold.pipeline import run
+    from app.gold.publications import Snapshot
+
+    plan, cfg = independent
+    evidence = export(plan, "live", cfg)
+    root = plan.live.gold / "published"
+    from .test_pipeline import bundle
+
+    kwargs = dict(
+        confirmed_input=evidence,
+        bundle=bundle(),
+        config=read_json(Path(__file__).parents[3] / "config/customer_score.json"),
+        cutoff=datetime(2026, 11, 17, 16, 40),
+        environment=cfg.environment,
+        plant=cfg.plant,
+    )
+    result = run(evidence.root, root, **kwargs)
+    assert result["status"] == "PUBLISHED"
+    assert published_evidence(root).publication_id == evidence.publication_id
+    assert Snapshot.open(root, require_gold_contract=True).rows("productions") == []
+    assert run(evidence.root, root, **kwargs)["status"] == "UNCHANGED"
