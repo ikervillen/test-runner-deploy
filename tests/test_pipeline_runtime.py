@@ -212,3 +212,13 @@ def test_slow_derivation_does_not_hold_up_next_live_publication(config, pipeline
         release.set()
         thread.join(15)
     assert not thread.is_alive() and not errors
+
+
+def test_ingestion_does_not_claim_or_modify_the_gold_owners_store(config, pipeline_config):
+    pipeline_config.live.gold.mkdir(parents=True)
+    marker = pipeline_config.live.gold / "already-owned-by-gold.json"
+    marker.write_text("gold owner")
+    worker = PipelineWorker(pipeline_config, "live", config)
+    worker.prepare()
+    assert marker.read_text() == "gold owner"
+    assert worker.source.runtime_root.exists()

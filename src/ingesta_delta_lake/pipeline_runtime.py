@@ -80,11 +80,11 @@ class PipelineWorker:
             if json.loads(marker.read_text()) != {"lane": self.lane, "identity": self.identity}:
                 raise IntegrityError("Lane storage identity differs from the worker")
         else:
-            for name in STORES:
+            for name in (store for store in STORES if store != "gold"):
                 path = getattr(self.storage, name)
                 if path.exists() and any(path.iterdir()):
                     raise IntegrityError("Cannot implicitly adopt a nonempty lane store")
-            for name in STORES:
+            for name in (store for store in STORES if store != "gold"):
                 getattr(self.storage, name).mkdir(parents=True, exist_ok=True)
             atomic_json(marker, {"lane": self.lane, "identity": self.identity})
         self.source.runtime_root.mkdir(parents=True, exist_ok=True)
