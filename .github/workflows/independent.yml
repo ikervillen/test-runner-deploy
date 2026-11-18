@@ -1,6 +1,8 @@
 name: Independent pipelines validation
 
 on:
+  push:
+    branches: [develop, release/independent-pipelines-candidate]
   pull_request:
   workflow_dispatch:
 
@@ -12,6 +14,34 @@ env:
   GOLD_SOURCE_COMMIT: ad88dc3d0bdedfbc4da3de06da74e3801b9b64f7
 
 jobs:
+  contracts-and-delta:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+      - name: Install pinned uv
+        shell: pwsh
+        run: |
+          "UV_PROJECT_ENVIRONMENT=$env:RUNNER_TEMP/ingesta-delta-venv" >> $env:GITHUB_ENV
+          python -m pip install uv==0.11.6
+      - name: Install locked dependencies
+        run: uv sync --locked --python 3.12
+      - name: Lint
+        run: uv run --locked ruff check .
+      - name: Format
+        run: uv run --locked ruff format --check .
+      - name: Contracts and real Delta transactions on synthetic inputs
+        run: uv run --locked python -m pytest --cov=ingesta_delta_lake --cov=deployment --cov-report=term-missing --cov-fail-under=85
+
   gold-native-contracts:
     strategy:
       fail-fast: false
@@ -55,7 +85,6 @@ jobs:
           path: .quality-context/independent-gold.xml
 
   independent-image:
-    needs: gold-native-contracts
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -95,4 +124,11 @@ jobs:
           "${candidate[@]}" --entrypoint python "$image" -m app.gold.independent_runtime --help
           "${candidate[@]}" --entrypoint python "$image" -m deployment.independent --help
           "${candidate[@]}" --entrypoint python "$image" -c 'import importlib.metadata as m; from app.factory import create_app; from ingesta_delta_lake.pipeline_runtime import PipelineWorker; assert m.version("deltalake") == "1.6.6"'
-      # There is deliberately no push, self-hosted runner, deployment or activation job.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+      - name: Exercise the Compose stack on synthetic data
+        run: |
+          python -m pip install uv==0.11.6
+          uv run --locked --no-dev python -m scripts.smoke_independent_compose fenix-independent:validation .quality-context
+      # Hosted validation only. No image publication or server deployment.

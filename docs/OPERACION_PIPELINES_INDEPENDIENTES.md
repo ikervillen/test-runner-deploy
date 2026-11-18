@@ -2,8 +2,10 @@
 
 Esta entrega prepara código, pruebas y configuración. No ejecuta la activación,
 no migra los volúmenes del servidor y no sustituye los servicios existentes.
-Los PR de ingesta y de Gold están encadenados por pasos; no fusionar una entrega
-intermedia en `develop`/`main`, porque su workflow vigente despliega al hacer push.
+Los PR de ingesta y Gold están encadenados. La rama
+`release/independent-pipelines-candidate` reúne la cadena de ingesta y retira los
+workflows anteriores de despliegue y mantenimiento. Se integrará cuando se dé
+la orden de fusionar. Las ramas intermedias conservan los workflows anteriores.
 
 ## Procesos y propiedad de los datos
 
@@ -78,6 +80,13 @@ Las lecturas y resultados tienen presupuestos configurados; superar un presupues
 produce un error explícito y requiere ajustar capacidad/selección, no truncar datos.
 
 ## Archivos y configuración
+
+La validación de la candidata y de `develop` usa
+`.github/workflows/independent.yml` en runners hospedados. El contexto Gold y el
+código fuente Gold quedan fijados por SHA, y el workflow verifica `GOLD_REVISION`
+antes de construir `Dockerfile.independent`. La prueba Compose usa directorios
+sintéticos, un proyecto temporal y la imagen local del job. El arranque del
+servidor queda como operación manual separada.
 
 | Pieza | Responsabilidad |
 | --- | --- |

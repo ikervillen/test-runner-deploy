@@ -1,9 +1,8 @@
 # Ingesta Delta Lake
 
-**GitHub/CI/CD y Docker:** [guía de operación Windows/WSL2](docs/GITHUB_CICD.md).
-El workflow sustituye la prueba de Nginx de `ikervillen/test-runner-deploy`: CI en PR y
-despliegue automático independiente por rama `main`/`develop`, con volúmenes persistentes,
-imagen por digest, validación aislada, drenaje y recuperación. El runner existente se reutiliza.
+**Validación y operación:** [guía de los procesos independientes](docs/OPERACION_PIPELINES_INDEPENDIENTES.md).
+GitHub comprueba ingesta, Gold y la imagen con datos sintéticos. El arranque en el
+servidor se realiza por separado con el Compose independiente.
 
 Proyecto independiente de `calidad_serie`. El código, configuración de ejemplo, pruebas,
 scripts y workflow de esta ingesta residen aquí. Los datos, controles operativos y entorno
@@ -54,10 +53,10 @@ uv run --locked ruff format --check .
 ```
 
 En Linux, usar una ruta de entorno externa al checkout y `uv sync --locked --python 3.12`.
-Las pruebas usan entradas sintéticas y directorios temporales. Actions ya ejecuta la CI
-Windows/Linux y la validación de imagen en el repositorio; el diagnóstico del motor y
-montaje real está verificado. El despliegue de ingesta queda pendiente del merge a develop.
-El estado de cada comprobación se consulta en la PR, sin confundir CI con aceptación real.
+Las pruebas usan entradas sintéticas y directorios temporales. Actions ejecuta la CI
+Windows/Linux y comprueba la imagen y el Compose en un runner hospedado.
+El estado de cada comprobación se consulta en Actions. La aceptación en el servidor
+se realiza en el momento de la activación manual.
 
 ## Ejecución controlada
 
