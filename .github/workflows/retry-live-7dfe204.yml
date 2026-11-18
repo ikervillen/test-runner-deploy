@@ -1,0 +1,59 @@
+name: Retry the validated Bronze live update
+
+on:
+  push:
+    branches: [develop]
+    paths: [.github/workflows/retry-live-7dfe204.yml]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  rollout-live:
+    if: github.repository == 'ikervillen/test-runner-deploy' && github.event.before == '7dfe20409c00c8530d0a9f3776e7c9d81f6ec832'
+    runs-on: [self-hosted, Windows, X64, fenix-ingesta]
+    environment: develop
+    timeout-minutes: 45
+    concurrency:
+      group: ingesta-deploy-${{ github.repository }}-develop
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          github-token: ${{ github.token }}
+          run-id: '44297311783'
+          pattern: live-image-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/fenix-image-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Apply the already validated image to live
+        shell: powershell
+        env:
+          FENIX_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
+          FENIX_INPUT_BIND: ${{ vars.INGESTA_INPUT_BIND }}
+          FENIX_DOCKER_CONTEXT: ${{ vars.INGESTA_DOCKER_CONTEXT }}
+          GOLD_CATALOGS_GZIP_B64: ${{ secrets.GOLD_CATALOGS_GZIP_B64 }}
+          REVISION: 7dfe20409c00c8530d0a9f3776e7c9d81f6ec832
+          GOLD_REVISION: ad88dc3d0bdedfbc4da3de06da74e3801b9b64f7
+          DIGEST: sha256:a58a1cabad4b5749a76b7e344bdff6fcb744bd5c4450dc71644005c6f6c3ed15
+        run: |
+          $bundle = Join-Path $env:RUNNER_TEMP "fenix-image-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $file = Join-Path $bundle 'image.json'
+          try {
+            $proof = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+            if ($proof.registry_ref -cne "fenix-independent@$env:DIGEST" -or
+                $proof.local_tag -cne "fenix-independent:sha-$env:REVISION") {
+              throw 'El artefacto original no coincide con la imagen aprobada.'
+            }
+            $image = "ghcr.io/ikervillen/test-runner-deploy@$env:DIGEST"
+            $proof.registry_ref = $image
+            $encoding = [Text.UTF8Encoding]::new($false)
+            [IO.File]::WriteAllText($file, ($proof | ConvertTo-Json -Compress), $encoding)
+            ./scripts/start_independent.ps1 -LiveOnly -Site $env:FENIX_SITE -Bundle $bundle `
+              -Image $image -Revision $env:REVISION -GoldRevision $env:GOLD_REVISION
+          } finally {
+            Remove-Item -LiteralPath (Join-Path $bundle 'image.tar.gz'), $file -ErrorAction SilentlyContinue
+          }

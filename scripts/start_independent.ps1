@@ -9,9 +9,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $encoding = [Text.UTF8Encoding]::new($false)
-if ($Revision -notmatch '^[0-9a-f]{40}$' -or $GoldRevision -notmatch '^[0-9a-f]{40}$' -or
-    $Image -cnotmatch '^ghcr\.io/ikervillen/test-runner-deploy@sha256:[0-9a-f]{64}$') {
-    throw 'La imagen y ambas revisiones deben estar fijadas.'
+if ($Revision -cnotmatch '^[0-9a-f]{40}$') { throw 'La revisión de ingesta debe ser un SHA completo.' }
+if ($GoldRevision -cnotmatch '^[0-9a-f]{40}$') { throw 'La revisión Gold debe ser un SHA completo.' }
+if ($Image -cnotmatch '^ghcr\.io/ikervillen/test-runner-deploy@sha256:[0-9a-f]{64}$') {
+    throw 'Se requiere el digest de la imagen publicada en GHCR.'
 }
 $existingSite = Test-Path -LiteralPath $Site -PathType Leaf
 $siteFile = if ($existingSite) { $Site } else { Join-Path $root 'deployment/site.example.json' }

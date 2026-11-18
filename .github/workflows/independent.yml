@@ -178,8 +178,11 @@ jobs:
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           trap 'docker logout ghcr.io >/dev/null' EXIT
           docker push "$image"
-          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$image")
-          [[ "$digest" =~ @sha256:[0-9a-f]{64}$ ]]
+          digest=$(docker image inspect --format '{{json .RepoDigests}}' "$image" |
+            jq -er --arg repo "${image%:*}" '
+              [.[] | select(startswith($repo + "@sha256:"))]
+              | if length == 1 then .[0] else error("Expected one digest from GHCR") end')
+          [[ "$digest" =~ ^ghcr\.io/[a-z0-9_./-]+@sha256:[0-9a-f]{64}$ ]]
           jq -n --arg registry_ref "$digest" --arg local_tag "$tag" \
             --arg image_id "$(docker image inspect "$tag" --format '{{.Id}}')" \
             --arg archive_sha256 "$(sha256sum bundle/image.tar.gz | cut -d' ' -f1)" \
