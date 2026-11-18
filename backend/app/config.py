@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     data_root: Path
     data_backend: Literal["legacy", "gold"] = "legacy"
     gold_root: Path | None = None
+    gold_history_root: Path | None = None
     gold_query_max_rows: int = Field(default=250_000, ge=1, le=1_000_000)
     gold_query_total_rows: int = Field(default=500_000, ge=1, le=2_000_000)
     log_level: str = "INFO"
@@ -46,6 +47,20 @@ class Settings(BaseSettings):
     segment_dar_profiles_path: Path | None = None
     inspected_totals_root: Path | None = None
     quality_aggregate_root: Path | None = None
+
+    @model_validator(mode="after")
+    def independent_gold_stores(self) -> Settings:
+        if self.gold_history_root is not None:
+            live = self.resolved_gold_root
+            history = self.gold_history_root.expanduser().resolve()
+            if (
+                live.is_relative_to(history)
+                or history.is_relative_to(live)
+                or (live.exists() and history.exists() and live.samefile(history))
+            ):
+                raise ValueError("Live and historical Gold stores must be physically independent")
+            self.gold_history_root = history
+        return self
 
     @field_validator("data_root")
     @classmethod

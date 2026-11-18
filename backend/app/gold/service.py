@@ -40,6 +40,15 @@ class GoldService:
         self.catalog_cache = LruCache(1)
 
     def query(self):
+        if self.settings.gold_history_root is not None:
+            from .combined_query import CombinedQuery
+
+            return CombinedQuery(
+                self.settings.resolved_gold_root,
+                self.settings.gold_history_root.resolve(),
+                max_rows=self.settings.gold_query_max_rows,
+                total_rows=self.settings.gold_query_total_rows,
+            )
         return Query(
             self.settings.resolved_gold_root,
             max_rows=self.settings.gold_query_max_rows,

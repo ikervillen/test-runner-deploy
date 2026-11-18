@@ -193,7 +193,12 @@ def combine(left, right, *, max_rows):
     """Reconcile raw accepted evidence, then reuse the single attribution implementation."""
     from ingesta_delta_lake.common import IntegrityError as NativeIntegrityError
     from ingesta_delta_lake.contracts import CONTRACTS
-    from ingesta_delta_lake.pipeline_rows import business_key, reconcile, review_hash
+    from ingesta_delta_lake.pipeline_rows import (
+        business_key,
+        conflicting_keys,
+        reconcile,
+        review_hash,
+    )
 
     if left.document["plant"] != right.document["plant"] or (
         left.document["environment"] != right.document["environment"]
@@ -248,6 +253,11 @@ def combine(left, right, *, max_rows):
                         ]
                 except NativeIntegrityError as exc:
                     conflicts.append({"family": name, "key": key, "reason": str(exc)})
+            invalid = conflicting_keys(name, {business_key(name, row): row for row in accepted})
+            conflicts.extend(
+                {"family": name, "key": key, "reason": "CROSS_LANE_CONTRACT_CONFLICT"}
+                for key in sorted(invalid)
+            )
             tables[name] = pa.Table.from_pylist(accepted, schema=schema)
         else:
             tables[name] = pa.Table.from_pylist([v[0] for v in groups.values()], schema=schema)
@@ -308,7 +318,7 @@ def combine(left, right, *, max_rows):
         for family in CONTRACTS
     }
     doc["bundle"] = {**doc["bundle"], "catalog_composition": composition, "cases": cases}
-    doc["coverage"] = [*left.document["coverage"], *right.document["coverage"]]
+    doc["coverage"] = combined_coverage([*left.document["coverage"], *right.document["coverage"]])
     tables.update(attribution(doc, tables))
     result = left.derived(tables, identity=digest([left.publication_id, right.publication_id]))
     result.document = {**doc, "lineages": proof_map}
@@ -318,3 +328,38 @@ def combine(left, right, *, max_rows):
         "tables": [{"name": n, "delta_version": 0} for n in tables],
     }
     return result
+
+
+def combined_coverage(rows):
+    """Join accredited adjacent intervals; never bridge an unobserved gap."""
+    groups = defaultdict(list)
+    for row in rows:
+        groups[(row["source"], row.get("origin"), row.get("id_produccion"))].append(row)
+    output = []
+    for values in groups.values():
+        ready = [dict(r) for r in values if r["estado"] == "READY" and not r.get("reason_code")]
+        output.extend(
+            r
+            for r in values
+            if r["estado"] != "READY"
+            and (r.get("reason_code") or r["estado"] != "WAITING_INPUT" or not ready)
+        )
+        output.extend(r for r in values if r["estado"] == "READY" and r.get("reason_code"))
+        merged = []
+        for row in sorted(ready, key=lambda r: r.get("covered_from") or ""):
+            if merged and (
+                merged[-1].get("covered_until") is None
+                or row.get("covered_from") is None
+                or row["covered_from"] <= merged[-1]["covered_until"]
+            ):
+                before = merged[-1]
+                ends = [before.get("covered_until"), row.get("covered_until")]
+                before["covered_until"] = max(ends) if all(ends) else None
+                for key in ("live_until", "last_successful_discovery"):
+                    available = [r[key] for r in (before, row) if r.get(key)]
+                    if available:
+                        before[key] = max(available)
+            else:
+                merged.append(row)
+        output.extend(merged)
+    return output

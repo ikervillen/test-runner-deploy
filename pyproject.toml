@@ -20,6 +20,7 @@ gold = [
   "pyarrow>=21,<24",
   "portalocker>=3.2,<4",
   "ijson>=3.3,<4",
+  "tzdata>=2025.2,<2027",
 ]
 
 [dependency-groups]

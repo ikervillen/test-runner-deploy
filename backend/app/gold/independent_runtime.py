@@ -10,7 +10,7 @@ from pathlib import Path
 import portalocker
 import pyarrow as pa
 
-from .common import IntegrityError, atomic_json, digest, read_json
+from .common import IntegrityError, atomic_json, canonical, digest, read_json
 from .independent_inputs import cutoff, export
 from .pipeline import run
 from .publications import Snapshot
@@ -83,6 +83,20 @@ class Worker:
             max_total_rows=self.policy.read_max_rows,
         )
 
+    def health(self):
+        marker = read_json(self.root / "checkpoint" / "identity.json")
+        if marker["lane"] != self.lane:
+            raise IntegrityError("Gold health belongs to another lane")
+        try:
+            with portalocker.Lock(self.root / "checkpoint" / "worker.lock", timeout=0):
+                raise IntegrityError("Gold owner is not running")
+        except portalocker.exceptions.LockException:
+            path = self.root / "checkpoint" / "health.json"
+            result = read_json(path) if path.exists() else {"status": "STARTING", "lane": self.lane}
+            if result["status"] == "FAILED":
+                raise IntegrityError("Gold owner reports a failed cycle") from None
+            return result
+
     def run(self, *, once=False):
         from .common import utc_now
 
@@ -99,7 +113,7 @@ class Worker:
                     }
                 result.update(lane=self.lane, time=utc_now())
                 atomic_json(self.root / "checkpoint" / "health.json", result)
-                print(result, flush=True)
+                print(canonical(result).decode("utf-8"), flush=True)
                 if once:
                     if result["status"] == "FAILED":
                         raise IntegrityError(result["error"])
@@ -118,17 +132,21 @@ def main(argv=None):
     parser.add_argument("--score", type=Path, required=True)
     parser.add_argument("--catalogs", type=Path, required=True)
     parser.add_argument("--once", action="store_true")
+    parser.add_argument("--health", action="store_true")
     args = parser.parse_args(argv)
     worker = Worker(
         IndependentPipelines.load(args.pipelines),
         args.lane,
-        load_config(args.source),
+        load_config(args.source, require_inputs=False),
         score=read_json(args.score),
         catalogs=read_json(args.catalogs),
     )
     signal.signal(signal.SIGINT, lambda *_: worker.stop.set())
     signal.signal(signal.SIGTERM, lambda *_: worker.stop.set())
-    worker.run(once=args.once)
+    if args.health:
+        print(canonical(worker.health()).decode("utf-8"))
+    else:
+        worker.run(once=args.once)
 
 
 if __name__ == "__main__":

@@ -231,9 +231,7 @@ def check_row(name: str, row: dict) -> dict:
     expected = SCHEMAS[name]
     if name in _ROW_ADDITIONS:
         row = dict.fromkeys(_ROW_ADDITIONS[name]) | row
-    row = (
-        dict.fromkeys(_DIMENSION_COLUMNS) | row if name in DIMENSIONAL_FACTS else dict(row)
-    )
+    row = dict.fromkeys(_DIMENSION_COLUMNS) | row if name in DIMENSIONAL_FACTS else dict(row)
     enums = {
         "estado_produccion": {"OPEN", "CLOSED", "UNKNOWN"},
         "estado_dato": {"VALID", "PENDING", "REVIEW"},

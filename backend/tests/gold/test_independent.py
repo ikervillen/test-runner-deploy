@@ -14,9 +14,6 @@ from app.gold.evidence import Evidence, registry, save
 
 @pytest.fixture
 def native(monkeypatch):
-    candidate = Path(__file__).resolve().parents[4] / "Ingesta_Delta_Lake-isolation" / "src"
-    if candidate.exists():
-        monkeypatch.syspath_prepend(str(candidate))
     return pytest.importorskip("ingesta_delta_lake")
 
 
@@ -116,3 +113,345 @@ def test_independent_gold_publishes_self_contained_evidence(independent, tmp_pat
     assert published_evidence(root).publication_id == evidence.publication_id
     assert Snapshot.open(root, require_gold_contract=True).rows("productions") == []
     assert run(evidence.root, root, **kwargs)["status"] == "UNCHANGED"
+
+
+def industrial_evidence(root, lane, *, recent, native):
+    from copy import deepcopy
+    from datetime import timedelta
+    from decimal import Decimal
+
+    from ingesta_delta_lake.contracts import CONTRACTS
+    from ingesta_delta_lake.pipeline_rows import business_key, portable, review_hash
+
+    from app.gold.evidence import attribution
+    from app.gold.producer import FAMILIES, auxiliary
+
+    from .test_pipeline import CUTOFF, START, inputs
+
+    data = deepcopy(inputs())
+    for row in data["CATALOGO_PRODUCCIONES"]:
+        row["id_modelo_fenix"] = 10
+    data["SIP_DEFECTO_AR"][0]["descripcion"] = "INSPECTION ZF"
+    for family in ("LISTA_RECH", "LISTA_DEFECTOS"):
+        for row in data[family]:
+            if not recent:
+                row["FECHA"] -= timedelta(minutes=10)
+                row["INSPECC"] = 500
+    tables, lineages = {}, {}
+    for family in FAMILIES:
+        schema = CONTRACTS[family].schema
+        rows = []
+        for original in data.get(family, []):
+            row = dict(original)
+            for field in schema:
+                if field.name not in row:
+                    row[field.name] = (
+                        None
+                        if field.nullable
+                        else 0
+                        if pa.types.is_integer(field.type)
+                        else Decimal("0")
+                        if pa.types.is_decimal(field.type)
+                        else START
+                        if pa.types.is_timestamp(field.type)
+                        else ""
+                    )
+            rows.append(row)
+        table = pa.Table.from_pylist(rows, schema=schema)
+        tables[family] = table
+        lineages[family] = {
+            business_key(family, r): [
+                {
+                    "source_table": "owner-" + family,
+                    "source_version": 2 if recent else 1,
+                    "row_hash": review_hash(family, r),
+                }
+            ]
+            for r in table.to_pylist()
+        }
+    registry, composition = {}, {}
+    for n, row in enumerate(data["CATALOGO_PRODUCCIONES"]):
+        identity = row["id_produccion"]
+        spans = [
+            portable(r) for r in data["MP9_CAMBIO_MODELO"] if r["ID"] in {n * 2 + 1, n * 2 + 2}
+        ]
+        composition[identity] = {"coverage": "VALID", "root": spans[0], "zf": [spans[1]]}
+        for zone, kind in (("ZF", "ZF_ASSOCIATION"), ("ZC", "ZC_PRESENCE")):
+            key = f"{zone}-{n}"
+            registry[key] = {
+                "id": key,
+                "kind": kind,
+                "origin": "AV23",
+                "production": identity,
+                "start": spans[0]["FECHA_ON"],
+                "end": spans[0]["FECHA_OFF"],
+                "revision": 1,
+                "actor": "approved fixture",
+                ("branch" if zone == "ZF" else "machine"): 1 if zone == "ZF" else 23,
+            }
+    document = {
+        "lane": lane,
+        "environment": "test",
+        "plant": "AV",
+        "row_budget": 100000,
+        "confirmed_at": CUTOFF.isoformat(),
+        "lineages": lineages,
+        "rejections": {},
+        "registry": registry,
+        "lines": {"AV23": "AV23"},
+        "association_cases": [],
+        "bundle": {
+            "plant": "AV",
+            "topology_enabled": False,
+            "line_codes": {},
+            "catalog_composition": composition,
+            "cases": {f: [] for f in FAMILIES},
+        },
+        "coverage": [
+            {
+                "source": f,
+                "origin": "AV23",
+                "estado": "READY",
+                "covered_from": START.isoformat(),
+                "covered_until": CUTOFF.isoformat(),
+                "live_until": CUTOFF.isoformat(),
+            }
+            for f in FAMILIES
+        ],
+    }
+    tables.update(attribution(document, tables))
+    tables.update(
+        auxiliary(
+            root,
+            (),
+            captures=(),
+            initial={
+                "production_parameters": data["production_parameters"],
+                "gobs_dictionary": data["gobs_dictionary"],
+                "machine_gobs": data["machine_gobs"],
+            },
+        )
+    )
+    return save(root, document, tables)
+
+
+def test_cross_boundary_facts_recalculate_the_same_as_one_complete_input(tmp_path, native):
+    from app.gold.common import read_json
+    from app.gold.evidence import combine
+    from app.gold.pipeline import build
+
+    from .test_pipeline import CUTOFF, bundle
+
+    live = industrial_evidence(tmp_path / "live", "live", recent=True, native=native)
+    history = industrial_evidence(tmp_path / "history", "history", recent=False, native=native)
+    source = combine(live, history, max_rows=100000)
+    assert len(source.rows("LISTA_RECH")) == 8
+    assert len(source.rows("SIP_MODELO")) == 1
+    tables, _ = build(
+        source,
+        bundle=bundle(),
+        config=read_json(Path(__file__).parents[3] / "config/customer_score.json"),
+        cutoff=CUTOFF,
+        calculation_time=CUTOFF,
+    )
+    try:
+        exposures = [r for r in tables["mia_window_exposures"] if r["tipo_ventana"] == "PRODUCTION"]
+        assert len(exposures) == 4
+        assert {r["inspeccionadas"] for r in exposures} == {1500}
+        assert len(tables["mia_inspections"]) == 8
+        # 40 + 40 rejections over 500 + 1000 inspected: amounts are combined before division.
+        amounts = [
+            r
+            for r in tables["mia_window_bases"]
+            if r["tipo_ventana"] == "PRODUCTION" and r["id_produccion"] == "production-3"
+        ]
+        assert sum(r["rechazos"] for r in amounts) == 80
+    finally:
+        tables.close()
+
+
+def test_combined_gold_never_counts_a_capture_twice(tmp_path, native):
+    from app.gold.evidence import combine
+
+    first = industrial_evidence(tmp_path / "live", "live", recent=True, native=native)
+    again = industrial_evidence(tmp_path / "history", "history", recent=True, native=native)
+    combined = combine(first, again, max_rows=100000)
+    assert len(combined.rows("LISTA_RECH")) == 4
+    with pytest.raises(IntegrityError, match="budget"):
+        combine(first, again, max_rows=1)
+
+
+def test_combined_query_pins_both_publications_and_recalculates(tmp_path, native):
+    from app.gold.combined_query import CombinedQuery
+    from app.gold.common import read_json
+    from app.gold.pipeline import run
+
+    from .test_pipeline import CUTOFF, bundle
+
+    roots = {}
+    for lane, recent in (("live", True), ("history", False)):
+        source = industrial_evidence(tmp_path / lane / "inputs", lane, recent=recent, native=native)
+        roots[lane] = tmp_path / lane / "published"
+        result = run(
+            source.root,
+            roots[lane],
+            confirmed_input=source,
+            bundle=bundle(),
+            config=read_json(Path(__file__).parents[3] / "config/customer_score.json"),
+            cutoff=CUTOFF,
+            environment="test",
+            plant="AV",
+        )
+        assert result["status"] == "PUBLISHED"
+    query = CombinedQuery(roots["live"], roots["history"], max_rows=100000, total_rows=100000)
+    # A later broken pointer cannot mix versions into the already pinned query.
+    (roots["history"] / "current.json").write_text("corrupt")
+    exposures = query.rows("mia_window_exposures")
+    assert {r["inspeccionadas"] for r in exposures if r["tipo_ventana"] == "PRODUCTION"} == {1500}
+    assert len(query.rows("mia_inspections")) == 8
+    assert query.fork(None) is query
+
+
+def test_live_gold_keeps_facts_until_historical_gold_confirms_them(independent, native):
+    from app.gold.common import read_json
+    from app.gold.independent_inputs import OPERATIONS, retain_live
+    from app.gold.pipeline import run
+
+    from .test_pipeline import CUTOFF, bundle
+
+    plan, _cfg = independent
+    previous = industrial_evidence(plan.live.gold / "inputs", "live", recent=True, native=native)
+    empty = {f: previous.table(f, max_rows=100000).slice(0, 0) for f in OPERATIONS}
+    document = {"lineages": {}, "rejections": {f: [] for f in OPERATIONS}}
+    retain_live(plan, empty, document)
+    assert empty["LISTA_RECH"].num_rows == 4
+    assert not plan.history.gold.exists()
+    copy = industrial_evidence(plan.history.gold / "inputs", "history", recent=True, native=native)
+    run(
+        copy.root,
+        plan.history.gold / "published",
+        confirmed_input=copy,
+        bundle=bundle(),
+        config=read_json(Path(__file__).parents[3] / "config/customer_score.json"),
+        cutoff=CUTOFF,
+        environment="test",
+        plant="AV",
+    )
+    empty = {f: previous.table(f, max_rows=100000).slice(0, 0) for f in OPERATIONS}
+    document = {"lineages": {}, "rejections": {f: [] for f in OPERATIONS}}
+    retain_live(plan, empty, document)
+    assert all(t.num_rows == 0 for t in empty.values())
+
+
+def revised_evidence(source, root, family, mutate):
+    from ingesta_delta_lake.pipeline_rows import business_key, review_hash
+
+    tables = {
+        r["name"]: source.table(r["name"], max_rows=100000)
+        for r in source.document["tables"]
+        if r["name"] != "__lineage"
+    }
+    rows = tables[family].to_pylist()
+    mutate(rows)
+    tables[family] = pa.Table.from_pylist(rows, schema=tables[family].schema)
+    proofs = source.proofs(max_rows=100000)
+    proofs[family] = {
+        business_key(family, row): [
+            {
+                "source_table": "owner-" + family,
+                "source_version": 3,
+                "row_hash": review_hash(family, row),
+            }
+        ]
+        for row in rows
+    }
+    return save(root, {**source.document, "lineages": proofs}, tables)
+
+
+def test_cross_store_contract_conflicts_are_not_hidden(tmp_path, native):
+    from app.gold.evidence import combine
+
+    history = industrial_evidence(tmp_path / "history", "history", recent=True, native=native)
+    live = revised_evidence(
+        history, tmp_path / "live", "SIP_MODELO", lambda rows: rows[0].update(id_modelo_fenix=20)
+    )
+    with pytest.raises(IntegrityError, match="CROSS_LANE_CONTRACT_CONFLICT"):
+        combine(live, history, max_rows=100000)
+
+
+def test_mia_rekey_requires_verified_exclusion_of_the_old_group(tmp_path, native):
+    from ingesta_delta_lake.pipeline_rows import review_hash
+
+    from app.gold.evidence import combine
+
+    history = industrial_evidence(tmp_path / "history", "history", recent=True, native=native)
+    live = revised_evidence(
+        history, tmp_path / "live", "LISTA_RECH", lambda rows: rows[0].update(INSPECC=500)
+    )
+    with pytest.raises(IntegrityError, match="CROSS_LANE_CONTRACT_CONFLICT"):
+        combine(live, history, max_rows=100000)
+    before = history.table("LISTA_RECH", max_rows=100000).to_pylist()[0]
+    live.document["rejections"] = {"LISTA_RECH": [review_hash("LISTA_RECH", before)]}
+    accepted = combine(live, history, max_rows=100000)
+    assert len(accepted.rows("LISTA_RECH")) == 4
+
+
+def test_coverage_merges_adjacent_periods_without_inventing_gap_coverage():
+    from app.gold.evidence import combined_coverage
+
+    def interval(start, end):
+        return {
+            "source": "LISTA_RECH",
+            "origin": "AV23",
+            "estado": "READY",
+            "covered_from": start,
+            "covered_until": end,
+        }
+
+    first = interval("2026-11-17T10:00:00", "2026-11-17T11:00:00")
+    second = interval("2026-11-17T11:00:00", "2026-11-17T12:00:00")
+    values = combined_coverage([first, second])
+    assert len(values) == 1 and values[0]["covered_until"] == second["covered_until"]
+    assert values[0]["covered_from"] == first["covered_from"]
+    second["covered_from"] = "2026-11-17T11:10:00"
+    assert len(combined_coverage([first, second])) == 2
+    blocked = {
+        "source": "LISTA_RECH",
+        "origin": "AV23",
+        "estado": "WAITING_DEPENDENCY",
+        "reason_code": "MANUAL_REVIEW",
+    }
+    assert blocked in combined_coverage([first, blocked])
+
+
+def test_independent_gold_worker_has_a_private_identity_and_durable_failure_status(
+    independent, monkeypatch
+):
+    from app.gold.common import read_json
+    from app.gold.independent_runtime import Worker
+
+    plan, cfg = independent
+    # This fixture already created bridge inputs. Use the still-empty historical Gold store.
+    worker = Worker(plan, "history", cfg, score={}, catalogs={})
+    identity = worker.prepare()
+    assert worker.prepare() == identity
+    monkeypatch.setattr(worker, "cycle", lambda: (_ for _ in ()).throw(ValueError("input pending")))
+    with pytest.raises(IntegrityError, match="input pending"):
+        worker.run(once=True)
+    health = read_json(plan.history.gold / "checkpoint/health.json")
+    assert health["status"] == "FAILED" and health["lane"] == "history"
+    assert worker.historical_reference() is None
+
+
+def test_gold_health_observes_its_owner_lock_without_waiting_on_history(independent):
+    import portalocker
+
+    from app.gold.independent_runtime import Worker
+
+    plan, cfg = independent
+    worker = Worker(plan, "live", cfg, score={}, catalogs={})
+    worker.prepare()
+    with pytest.raises(IntegrityError, match="not running"):
+        worker.health()
+    with portalocker.Lock(worker.root / "checkpoint/worker.lock", timeout=0):
+        assert worker.health() == {"status": "STARTING", "lane": "live"}
