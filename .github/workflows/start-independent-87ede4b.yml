@@ -7,11 +7,51 @@ on:
 
 permissions:
   contents: read
-  packages: read
+
+env:
+  IMAGE: ghcr.io/ikervillen/test-runner-deploy@sha256:ccc4b48f0f11da0596a8030ccc081702bb5d06eea24a8afcc2cdf2932b5ee77e
+  REVISION: 87ede4b001b6cdd6dc47488e427fc7ee88c3e035
+  GOLD_REVISION: ad88dc3d0bdedfbc4da3de06da74e3801b9b64f7
 
 jobs:
+  bundle:
+    if: github.repository == 'ikervillen/test-runner-deploy' && github.event.before == 'd7556be89d8dd7464890ae53e2f3c4ccb6b9d0b6'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    timeout-minutes: 20
+    steps:
+      - name: Export the approved image and its verification manifest
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null' EXIT
+          docker pull --platform linux/amd64 "$IMAGE"
+          labels=$(docker image inspect "$IMAGE" --format '{{json .Config.Labels}}')
+          jq -e --arg revision "$REVISION" --arg gold "$GOLD_REVISION" '
+            .["org.opencontainers.image.revision"] == $revision and
+            .["es.fenix.ingesta.gold.revision"] == $gold' <<<"$labels" >/dev/null
+          tag="fenix-independent:sha-$REVISION"
+          docker image tag "$IMAGE" "$tag"
+          mkdir -p bundle
+          docker image save "$tag" | gzip -1 > bundle/image.tar.gz
+          jq -n --arg registry_ref "$IMAGE" --arg local_tag "$tag" \
+            --arg image_id "$(docker image inspect "$IMAGE" --format '{{.Id}}')" \
+            --arg archive_sha256 "$(sha256sum bundle/image.tar.gz | cut -d' ' -f1)" \
+            '{$registry_ref,$local_tag,$image_id,$archive_sha256}' > bundle/image.json
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: independent-image-bundle
+          path: bundle/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+          overwrite: true
+
   start:
-    if: github.repository == 'ikervillen/test-runner-deploy' && github.event.before == '87ede4b001b6cdd6dc47488e427fc7ee88c3e035'
+    needs: bundle
     runs-on: [self-hosted, Windows, X64, fenix-ingesta]
     environment: develop
     timeout-minutes: 30
@@ -22,17 +62,22 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: independent-image-bundle
+          path: ${{ runner.temp }}/fenix-image-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Verify and start the published independent stack
         shell: powershell
         env:
           FENIX_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
           FENIX_INPUT_BIND: ${{ vars.INGESTA_INPUT_BIND }}
           FENIX_DOCKER_CONTEXT: ${{ vars.INGESTA_DOCKER_CONTEXT }}
-          INGESTA_GITHUB_TOKEN: ${{ github.token }}
-          INGESTA_REGISTRY_USER: ${{ github.actor }}
           GOLD_CATALOGS_GZIP_B64: ${{ secrets.GOLD_CATALOGS_GZIP_B64 }}
         run: |
-          ./scripts/start_independent.ps1 -Site $env:FENIX_SITE `
-            -Image 'ghcr.io/ikervillen/test-runner-deploy@sha256:ccc4b48f0f11da0596a8030ccc081702bb5d06eea24a8afcc2cdf2932b5ee77e' `
-            -Revision '87ede4b001b6cdd6dc47488e427fc7ee88c3e035' `
-            -GoldRevision 'ad88dc3d0bdedfbc4da3de06da74e3801b9b64f7'
+          $bundle = Join-Path $env:RUNNER_TEMP "fenix-image-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          try {
+            ./scripts/start_independent.ps1 -Site $env:FENIX_SITE -Bundle $bundle `
+              -Image $env:IMAGE -Revision $env:REVISION -GoldRevision $env:GOLD_REVISION
+          } finally {
+            Remove-Item -LiteralPath (Join-Path $bundle 'image.tar.gz'), (Join-Path $bundle 'image.json') -ErrorAction SilentlyContinue
+          }

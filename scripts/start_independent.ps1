@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Site,
     [Parameter(Mandatory = $true)][string]$Image,
+    [Parameter(Mandatory = $true)][string]$Bundle,
     [Parameter(Mandatory = $true)][string]$Revision,
     [Parameter(Mandatory = $true)][string]$GoldRevision
 )
@@ -10,9 +11,6 @@ $encoding = [Text.UTF8Encoding]::new($false)
 if ($Revision -notmatch '^[0-9a-f]{40}$' -or $GoldRevision -notmatch '^[0-9a-f]{40}$' -or
     $Image -cnotmatch '^ghcr\.io/ikervillen/test-runner-deploy@sha256:[0-9a-f]{64}$') {
     throw 'La imagen y ambas revisiones deben estar fijadas.'
-}
-if (-not $env:INGESTA_GITHUB_TOKEN -or $env:INGESTA_REGISTRY_USER -notmatch '^[A-Za-z0-9_-]+(?:\[bot\])?$') {
-    throw 'Faltan las credenciales efímeras de GHCR.'
 }
 $existingSite = Test-Path -LiteralPath $Site -PathType Leaf
 $siteFile = if ($existingSite) { $Site } else { Join-Path $root 'deployment/site.example.json' }
@@ -39,27 +37,6 @@ function Write-Config([string]$name, [string]$value) {
     Move-Item -LiteralPath $tmp -Destination $path -Force
 }
 
-function Login-Registry {
-    $process = [Diagnostics.ProcessStartInfo]::new()
-    $process.FileName = (Get-Command docker -ErrorAction Stop).Source
-    $process.Arguments = "login ghcr.io --username $env:INGESTA_REGISTRY_USER --password-stdin"
-    $process.UseShellExecute = $false
-    $process.RedirectStandardInput = $true
-    $process.CreateNoWindow = $true
-    $login = [Diagnostics.Process]::Start($process)
-    try {
-        # Write the token as bytes to avoid Windows PowerShell's pipeline BOM.
-        $token = $encoding.GetBytes($env:INGESTA_GITHUB_TOKEN + "`n")
-        $login.StandardInput.BaseStream.Write($token, 0, $token.Length)
-        $login.StandardInput.BaseStream.Flush()
-        $login.StandardInput.BaseStream.Close()
-        $login.WaitForExit()
-        if ($login.ExitCode -ne 0) { throw 'No se pudo autenticar GHCR.' }
-    } finally {
-        $login.Dispose()
-    }
-}
-
 $infoJson = (Invoke-Docker info --format '{{json .}}') -join "`n"
 $info = $infoJson | ConvertFrom-Json
 Write-Output "Docker: $($info.NCPU) CPU y $([Math]::Round($info.MemTotal / 1GB, 2)) GiB"
@@ -81,6 +58,15 @@ $profile.input_bind = $oldSite.input_bind
 $profile.forbidden_volumes = @($profile.forbidden_volumes) + @(
     $oldSite.environments.main.volume, $oldSite.environments.develop.volume
 )
+$liveCpus = [int]$profile.resources.'ingesta-live'.cpus
+$sharedCpus = [int]$info.NCPU - $liveCpus
+if ($sharedCpus -lt 1) { throw 'Docker no dispone de CPU aparte de las reservadas para live.' }
+$index = 0
+foreach ($service in $profile.resources.PSObject.Properties) {
+    if ($service.Name -eq 'ingesta-live') { continue }
+    $service.Value.cpuset = [string]($liveCpus + ($index % $sharedCpus))
+    $index += 1
+}
 $present = @(Invoke-Docker volume ls --format '{{.Name}}')
 foreach ($lane in $profile.volumes.PSObject.Properties) {
     foreach ($store in $lane.Value.PSObject.Properties) {
@@ -135,46 +121,46 @@ Write-Config $profile.catalogs_file $catalogText
 # The backend is bound to loopback, as in the independent site template.
 Write-Config $profile.api_env_file "APP_AUTH_MODE=disabled`n"
 
-$originalConfig = $env:DOCKER_CONFIG
-$dockerConfig = if ($originalConfig) { $originalConfig } else { Join-Path $env:USERPROFILE '.docker' }
-$tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
-$tempConfig = Join-Path $tempRoot ('fenix-independent-registry-' + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $tempConfig | Out-Null
-try {
-    $contexts = Join-Path $dockerConfig 'contexts'
-    if (Test-Path -LiteralPath $contexts) {
-        Copy-Item -LiteralPath $contexts -Destination $tempConfig -Recurse
-    }
-    $env:DOCKER_CONFIG = $tempConfig
-    Login-Registry
-    Invoke-Docker pull $Image
-    $labels = ((Invoke-Docker image inspect $Image --format '{{json .Config.Labels}}') -join '') | ConvertFrom-Json
-    if ($labels.'org.opencontainers.image.revision' -cne $Revision -or
-        $labels.'es.fenix.ingesta.gold.revision' -cne $GoldRevision) {
-        throw 'La imagen no corresponde a los commits aprobados.'
-    }
-    $temporary = @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
-        '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m')
-    $scoreText = (Invoke-Docker @temporary --entrypoint cat $Image '/opt/quality/config/customer_score.json') -join "`n"
-    Write-Config $profile.score_file $scoreText
-    $configMount = "type=bind,src=$configBind,dst=/staging"
-    Invoke-Docker @temporary --mount $configMount --entrypoint python $Image `
-        -m deployment.independent --site /staging/site.json --pipelines "/staging/$($profile.pipelines_file)" `
-        --host-info /staging/host.json --output /staging/compose.json
-    $inputMount = "type=bind,src=$($profile.input_bind),dst=$($profile.input_target),readonly"
-    $probe = "import sys; from pathlib import Path; from ingesta_delta_lake.config import load_config; load_config(Path(sys.argv[1]))"
-    Invoke-Docker @temporary --mount "$configMount,readonly" --mount $inputMount `
-        --entrypoint python $Image -c $probe "/staging/$($profile.source_file)"
-    $composeFile = Join-Path $configDirectory 'compose.json'
-    Invoke-Docker compose -f $composeFile config --quiet
-    Invoke-Docker compose -f $composeFile up -d --pull never --no-build
-    Invoke-Docker compose -f $composeFile ps --all
-    Write-Output "Compose: $composeFile"
-} finally {
-    $env:DOCKER_CONFIG = $originalConfig
-    $resolved = [IO.Path]::GetFullPath($tempConfig)
-    if ([IO.Path]::GetDirectoryName($resolved).TrimEnd('\') -eq $tempRoot.TrimEnd('\') -and
-        [IO.Path]::GetFileName($resolved) -match '^fenix-independent-registry-[0-9a-f]{32}$') {
-        Remove-Item -LiteralPath $resolved -Recurse -Force
-    }
+$bundleRoot = (Resolve-Path -LiteralPath $Bundle).Path
+$archive = Join-Path $bundleRoot 'image.tar.gz'
+$manifest = Get-Content -LiteralPath (Join-Path $bundleRoot 'image.json') -Raw | ConvertFrom-Json
+$localImage = 'fenix-independent:sha-' + $Revision
+if ($manifest.registry_ref -cne $Image -or $manifest.local_tag -cne $localImage -or
+    $manifest.image_id -cnotmatch '^sha256:[a-f0-9]{64}$' -or
+    $manifest.archive_sha256 -cnotmatch '^[a-f0-9]{64}$') {
+    throw 'El manifiesto del artefacto no corresponde a la imagen aprobada.'
 }
+if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $manifest.archive_sha256) {
+    throw 'El archivo de imagen no coincide con la huella verificada.'
+}
+Invoke-Docker image load --input $archive
+$loadedId = (Invoke-Docker image inspect $localImage --format '{{.Id}}') -join ''
+if ($loadedId -cne $manifest.image_id) { throw 'Docker cargó una imagen distinta de la esperada.' }
+$labels = ((Invoke-Docker image inspect $localImage --format '{{json .Config.Labels}}') -join '') | ConvertFrom-Json
+if ($labels.'org.opencontainers.image.revision' -cne $Revision -or
+    $labels.'es.fenix.ingesta.gold.revision' -cne $GoldRevision) {
+    throw 'La imagen no corresponde a los commits aprobados.'
+}
+$temporary = @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
+    '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m')
+$scoreText = (Invoke-Docker @temporary --entrypoint cat $localImage '/opt/quality/config/customer_score.json') -join "`n"
+Write-Config $profile.score_file $scoreText
+$configMount = "type=bind,src=$configBind,dst=/staging"
+Invoke-Docker @temporary --mount $configMount --entrypoint python $localImage `
+    -m deployment.independent --site /staging/site.json --pipelines "/staging/$($profile.pipelines_file)" `
+    --host-info /staging/host.json --output /staging/compose.json
+$inputMount = "type=bind,src=$($profile.input_bind),dst=$($profile.input_target),readonly"
+$probe = "import sys; from pathlib import Path; from ingesta_delta_lake.config import load_config; load_config(Path(sys.argv[1]))"
+Invoke-Docker @temporary --mount "$configMount,readonly" --mount $inputMount `
+    --entrypoint python $localImage -c $probe "/staging/$($profile.source_file)"
+$composeFile = Join-Path $configDirectory 'compose.json'
+$compose = Get-Content -LiteralPath $composeFile -Raw | ConvertFrom-Json
+foreach ($service in $compose.services.PSObject.Properties) {
+    if ($service.Value.image -cne $Image) { throw 'El Compose refiere otra imagen.' }
+    $service.Value.image = $localImage
+}
+Write-Config 'compose.json' ($compose | ConvertTo-Json -Depth 30)
+Invoke-Docker compose -f $composeFile config --quiet
+Invoke-Docker compose -f $composeFile up -d --pull never --no-build
+Invoke-Docker compose -f $composeFile ps --all
+Write-Output "Compose: $composeFile"
