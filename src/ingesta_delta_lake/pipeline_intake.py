@@ -229,7 +229,7 @@ class Intake:
                 (identity, str(path), reason, stamp, stamp),
             )
 
-    def pending(self, family, limit, *, window=None):
+    def pending(self, family, limit, *, window=None, include_untimed=True):
         query = "SELECT input_id FROM inputs AS selected WHERE state='CAPTURED' AND family=?"
         params = [family]
         if self.lane == "live":
@@ -249,10 +249,10 @@ class Intake:
                 "WHERE imported.input_id=selected.input_id AND imported.eligible=0)"
             )
         if window is not None:
-            query += (
-                " AND (producer_time IS NULL OR length(producer_time)=10 OR "
-                "(producer_time>=? AND producer_time<?))"
-            )
+            timed = "(producer_time>=? AND producer_time<?)"
+            if include_untimed:
+                timed = f"(producer_time IS NULL OR length(producer_time)=10 OR {timed})"
+            query += f" AND {timed}"
             params.extend((window.start.isoformat(), window.end.isoformat()))
         if self.lane == "history":
             query += (

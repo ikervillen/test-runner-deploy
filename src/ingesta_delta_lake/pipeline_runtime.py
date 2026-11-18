@@ -202,7 +202,12 @@ class PipelineWorker:
             intake.lots.pending_window(ids, self.policy) if self.lane == "live" else None
         )
         if selected_window:
-            ids = intake.pending(family, self.policy.live_batch_files, window=selected_window)
+            ids = intake.pending(
+                family,
+                self.policy.live_batch_files,
+                window=selected_window,
+                include_untimed=family not in {"LISTA_DEFECTOS", "LISTA_RECH"},
+            )
         bounds = (
             (selected_window.start.isoformat(), selected_window.end.isoformat())
             if selected_window

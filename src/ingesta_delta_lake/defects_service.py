@@ -107,12 +107,18 @@ def process(
                     control.receipts(attempt, [snapshot])
                     captured[(snapshot.origin, snapshot.sha256)] = snapshot
     consumed = control.consumed_inputs()
+    scoped_live = lane == "live" and bool(config.intake_ids)
+    # The independent live scheduler already chose the Bronze captures for this turn.
+    # In particular, captures with no filename hour still need a turn of their own.
+    queue = captured
+    if scoped_live:
+        queue = {(s.origin, s.sha256): s for s in snapshots if (s.origin, s.sha256) not in consumed}
     parents = set()
     if control.compact:
         from .input_fragments import expand
 
-        parents = expand(control, captured, max_file_bytes=MAX_FILE_BYTES)
-    pending = [s for key, s in captured.items() if key not in consumed and key not in parents]
+        parents = expand(control, queue, max_file_bytes=MAX_FILE_BYTES)
+    pending = [s for key, s in queue.items() if key not in consumed and key not in parents]
     if any(s.size > MAX_FILE_BYTES for s in pending):
         raise IntegrityError("Captured MIA file exceeds 8 MiB; split-file support is required")
     # Export timestamps order versions, never determine production or sample time.
@@ -138,7 +144,10 @@ def process(
     window, origins = shared_bronze_window(
         config.control_root, selected_window=config.processing_window
     )
-    if window is None:
+    if scoped_live:
+        live, backlog = pending, []
+        bronze_now = {origin: window[0] for origin in origins} if window else {}
+    elif window is None:
         live, backlog, bronze_now = [], list(pending), {}
     else:
         live, backlog, bronze_now = split_live_backlog(
@@ -224,7 +233,6 @@ def process(
     acknowledged = control.consumed_inputs()
     # The independent scheduler publishes only the selected captures. Other
     # windows in this family's control queue cannot delay that confirmation.
-    scoped_live = lane == "live" and bool(config.intake_ids)
     counted = snapshots if scoped_live else pending
     remaining = [s for s in counted if (s.origin, s.sha256) not in acknowledged]
     return {

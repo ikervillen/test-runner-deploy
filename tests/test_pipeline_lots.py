@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from deltalake import DeltaTable
 from test_lista_defectos import line
+from test_mia_batches import csv_row
 from test_pipeline_runtime import pipeline_config as pipeline_config
 
 from ingesta_delta_lake.defects_control import DefectsControl
@@ -199,6 +200,44 @@ def test_live_defects_confirms_selected_capture_despite_control_backlog(
         assert current_lot["inputs"][0]["state"] == "HANDLED"
         assert json.loads(current_lot["inputs"][0]["confirmation"])["version"] == 0
         assert DeltaTable(str(current.table_path)).version() == 0
+
+
+@pytest.mark.parametrize("family", ["LISTA_DEFECTOS", "LISTA_RECH"])
+def test_live_confirms_timed_capture_before_processing_untimed_exports(
+    config, pipeline_config, clock, family
+):
+    config = replace(config, timestamp_policy="local_naive_test_v1")
+    root = config.sources[0][1]
+    (root / f"18112026_092000_{family}.csv").write_text(csv_row(family, 0))
+    live, _ = worker_pair(config, pipeline_config)
+    with open_intake(live) as intake:
+        window, _ = live.capture(intake)
+        timed = live.selected_config(intake, family, window)
+        intake.lots.claim(timed.intake_ids, live.policy, clock.value)
+        first, _ = live.transform(timed, run_phase)
+        assert first["status"] == "APPLIED"
+
+        # The timed CSV was committed but its intake receipt has not been written.
+        (root / f"{family}.csv").write_text(csv_row(family, 1))
+        (root / f"20261118_{family}.csv").write_text(csv_row(family, 2))
+        window, _ = live.capture(intake)
+        replay = live.selected_config(intake, family, window)
+        result, seconds = live.transform(replay, run_phase)
+        assert result["status"] == "NO_CHANGE"
+        assert result["processed_versions"] == result["remaining_versions"] == 0
+        assert replay.intake_ids == timed.intake_ids
+        live.record(intake, replay, result, seconds)
+        lot = read_manifest(live.storage, "lots")["lots"][0]
+        assert lot["state"] == "PUBLISHED"
+
+        untimed = live.selected_config(intake, family, window)
+        assert len(untimed.intake_ids) == 2
+        result, seconds = live.transform(untimed, run_phase)
+        assert result["status"] == "APPLIED"
+        assert result["processed_versions"] == 2 and result["remaining_versions"] == 0
+        live.record(intake, untimed, result, seconds)
+        assert not intake.pending(family, 10)
+        assert DeltaTable(str(timed.table_path)).count() == 3
 
 
 def test_successful_live_lot_is_not_transformed_again_when_frontier_advances(
