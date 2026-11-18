@@ -40,7 +40,7 @@ def synthetic_stack(root, image, gold_context):
         f'environment = "test"\nplant = "AIALA"\ninput_root = "{site["input_target"]}"\n'
         'bronze_root = "/unused/bronze"\nsilver_root = "/unused/silver"\n'
         'control_root = "/unused/control"\ntimestamp_policy = "local_naive_test_v1"\n'
-        '[sources]\nAV21 = "AV21"\n',
+        '[sources]\nAV21 = "AV21"\n[line_by_origin]\nAV21 = "AV21"\n',
         encoding="utf-8",
     )
     (config / site["catalogs_file"]).write_text(
@@ -78,11 +78,34 @@ def smoke(image, gold_context):
         compose = ["docker", "compose", "-f", str(path)]
         services = stack["services"]
 
-        def run(*args, check=True):
-            subprocess.run([*compose, *args], check=check, timeout=120)
+        def run(*args, capture_output=False):
+            return subprocess.run(
+                [*compose, *args],
+                check=True,
+                timeout=120,
+                capture_output=capture_output,
+                text=True,
+            )
 
         def once(service):
-            run("run", "--rm", "--no-deps", "-T", service, *services[service]["command"], "--once")
+            completed = run(
+                "run",
+                "--rm",
+                "--no-deps",
+                "-T",
+                service,
+                *services[service]["command"],
+                "--once",
+                capture_output=True,
+            )
+            print(completed.stdout, end="", flush=True)
+            if completed.stderr:
+                print(completed.stderr, end="", flush=True)
+            events = [
+                json.loads(line) for line in completed.stdout.splitlines() if line.startswith("{")
+            ]
+            if any(event.get("result", event).get("status") == "FAILED" for event in events):
+                raise RuntimeError(f"{service} reported a failed family or publication")
 
         try:
             run("config", "--quiet")
@@ -99,9 +122,15 @@ def smoke(image, gold_context):
                     "python",
                     service,
                     "-c",
-                    "from deltalake import DeltaTable; "
-                    f"table = DeltaTable('/pipelines/{lane}/silver/AIALA/sip_modelo'); "
-                    f"assert table.to_pyarrow_table()['id_modelo_fenix'].to_pylist() == [{model}]",
+                    "from deltalake import DeltaTable; import pyarrow as pa; "
+                    "pa.set_cpu_count(1); pa.set_io_thread_count(1); "
+                    f"root = '/pipelines/{lane}/silver/AIALA'; "
+                    "models = DeltaTable(root + '/sip_modelo').to_pyarrow_dataset(); "
+                    "ids = models.scanner(use_threads=False).to_table()['id_modelo_fenix']; "
+                    f"assert ids.to_pylist() == [{model}]; "
+                    "defects = DeltaTable(root + '/lista_defectos').to_pyarrow_dataset(); "
+                    "dates = defects.scanner(use_threads=False).to_table()['FECHA']; "
+                    f"assert [d.as_py().day for d in dates] == [{13 + model}]",
                 )
                 once(f"gold-{lane}")
             run(
