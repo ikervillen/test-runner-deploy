@@ -17,7 +17,7 @@ AUXILIARY = frozenset(
 OPERATIONS = frozenset({"LISTA_DEFECTOS", "LISTA_RECH", "LISTA_AR", "CONT_ZC"})
 
 
-def auxiliary_turn(pipelines, lane):
+def auxiliary_turn(pipelines, lane, *, encoding):
     from ingesta_delta_lake.pipeline_bronze import BronzeFeed
 
     from .evidence import Evidence
@@ -37,7 +37,7 @@ def auxiliary_turn(pipelines, lane):
     try:
         feed = BronzeFeed(storage)
     except FileNotFoundError:
-        return auxiliary(root, (), captures=(), initial=initial), cursor
+        return auxiliary(root, (), captures=(), initial=initial, encoding=encoding), cursor
     if previous and previous.document["feed_identity"] != feed.identity:
         raise IntegrityError("Gold auxiliary checkpoint belongs to another Bronze owner")
     captures = []
@@ -52,7 +52,7 @@ def auxiliary_turn(pipelines, lane):
                 )
             )
         cursor = capture.sequence
-    tables = auxiliary(root, (), captures=captures, initial=initial)
+    tables = auxiliary(root, (), captures=captures, initial=initial, encoding=encoding)
     if sum(t.num_rows for t in tables.values()) > policy.read_max_rows:
         raise IntegrityError("Gold auxiliary state exceeds its explicit row budget")
     save(root, {"cursor": cursor, "feed_identity": feed.identity}, tables)
@@ -69,15 +69,40 @@ def export(pipelines, lane, config):
 
     storage, policy = getattr(pipelines, lane), pipelines.policy
     own = SilverSnapshot.open(storage)
+    from ingesta_delta_lake.common import IntegrityError as NativeIntegrityError
+
+    from .common import atomic_json, read_json
+    from .evidence import Evidence
+
     archive = None
-    archive_path = pipelines.history.exchange / "archive" / "current.json"
-    if archive_path.exists():
+    cached_archive = storage.gold / "checkpoint" / "archive-reference.json"
+    try:
         archive = ArchiveSnapshot(pipelines.history)
+        atomic_json(cached_archive, archive.manifest)
+    except (OSError, NativeIntegrityError, ValueError):
+        if cached_archive.exists():
+            archive = ArchiveSnapshot(pipelines.history, manifest_path=cached_archive)
     # Live has no dependency on the history backfill's current Silver publication.
     reference = None
     if lane == "history" and (pipelines.live.exchange / "silver" / "current.json").exists():
         reference = SilverSnapshot.open(pipelines.live)
     snapshots = [own, *([reference] if reference else [])]
+    auxiliary_tables, cursor = auxiliary_turn(pipelines, lane, encoding=config.encoding)
+    historical_gold = None
+    try:
+        historical_gold = read_json(pipelines.history.gold / "published" / "current.json")[
+            "publication_id"
+        ]
+    except (OSError, ValueError, KeyError):
+        historical_gold = None
+    vector = [s.manifest["publication_id"] for s in snapshots]
+    vector.extend(
+        [archive.manifest["publication_id"] if archive else None, cursor, historical_gold]
+    )
+    if (storage.gold / "inputs" / "current.json").exists():
+        previous = Evidence.open(storage.gold / "inputs")
+        if previous.document.get("source_vector") == vector:
+            return previous
     projections = {family: own.control(family) for family in own.manifest.get("controls", {})}
     tables, lineages, coverage, rejections = {}, {}, [], {}
     views = {
@@ -195,9 +220,9 @@ def export(pipelines, lane, config):
     if lane == "live":
         retain_live(pipelines, tables, doc)
     tables.update(attribution(doc, tables))
-    auxiliary_tables, cursor = auxiliary_turn(pipelines, lane)
     tables.update(auxiliary_tables)
     doc["bronze_cursor"] = cursor
+    doc["source_vector"] = vector
     return save(storage.gold / "inputs", doc, tables)
 
 

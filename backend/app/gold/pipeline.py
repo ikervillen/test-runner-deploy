@@ -116,7 +116,7 @@ REUSED_TABLES = (
 )
 REFERENCE_TABLES = ("mia_reference_sets", "mia_reference_members", "mia_reference_values")
 DIMENSION_TABLES = ("dim_machine", "dim_model", "dim_defect", "dim_date")
-LIVE_FAMILIES = {"LISTA_RECH", "LISTA_DEFECTOS", "LISTA_AR", "CONT_ZC"}
+LIVE_FAMILIES = frozenset({"LISTA_RECH", "LISTA_DEFECTOS", "LISTA_AR", "CONT_ZC"})
 # Scoring runs outside this wait. The pointer swap is the only shared step.
 COMMIT_WAIT_SECONDS = 30
 ZC_LINK_STATUSES = {
@@ -685,6 +685,10 @@ class SpilledTables(dict):
         self.spilled: set[str] = set()
         self._directory = directory
         self._closed = False
+        self.replace_ids: set[str] | None = None
+        self.hours: tuple[tuple[str, datetime], ...] | None = None
+        self.fact_bounds: tuple[tuple[str, datetime, datetime], ...] | None = None
+        self.result_ids: tuple[str, ...] | None = None
 
     def mark(self, name: str) -> None:
         self.spilled.add(name)
@@ -1021,7 +1025,8 @@ def build(
     lane: str = "all",
     since: datetime | None = None,
     copied_until: dict[str, datetime] | None = None,
-) -> tuple[dict[str, list[dict]] | None, list[dict]]:
+    reference_snapshot=None,
+) -> tuple[SpilledTables | None, list[dict]]:
     """Score one lane. `all` is the manual full build; live and history score a chunk."""
     validate_config(config)
     recalculate_closed_ids = recalculate_closed_ids or set()
@@ -1037,7 +1042,7 @@ def build(
         )
         prods, capacities = tables["productions"], tables["production_capacity"]
         decisions = reader.rows("observation_assignments")
-    score_stats = {
+    score_stats: dict[str, Any] = {
         "mia_windows_reused": 0,
         "mia_windows_recalculated": 0,
         "unchanged_productions": 0,
@@ -1069,7 +1074,7 @@ def build(
     )
     recorded = list(checked)
     if hour_plan:
-        recorded.extend(_hour_key(chunk.production_id, chunk.start) for chunk in hour_plan)
+        recorded.extend(_hour_key(chunk.production_id, chunk.start) for chunk in hour_plan or [])
     score_stats["ar_version"] = ar_version
     score_stats["ar_recorded"] = recorded
     chosen = None if hour_plan is None else {chunk.production_id for chunk in hour_plan}
@@ -1115,7 +1120,7 @@ def build(
         with clock.stage("previous"):
             _carry_references(previous, store, max_total_rows)
         scoring = {p["id_produccion"] for p in selected}
-        facts_only = bool(hour_plan) and all(chunk.facts_only for chunk in hour_plan)
+        facts_only = bool(hour_plan) and all(chunk.facts_only for chunk in hour_plan or [])
         if facts_only:
             selected = []
         else:
@@ -1161,6 +1166,13 @@ def build(
                 ):
                     rates[production["id_produccion"]] = base["rates"]
                 del prepared, _rows, old_tables
+        if reference_snapshot is not None:
+            for production in prods:
+                identity = production["id_produccion"]
+                if identity not in rates and production["estado_produccion"] == "CLOSED":
+                    stored = _reference_rates(reference_snapshot, production, max_total_rows)
+                    if stored:
+                        rates[identity] = stored
         segments = {r["codigo_modelo_botella"]: r for r in tables["model_segment_catalog"]}
         config_id = digest([config, bundle])
         catalog_version = digest(catalog_bundle)
@@ -1428,6 +1440,8 @@ def _run(
     recalculate_closed_ids=None,
     recalculation_reason=None,
     lane: str = "all",
+    confirmed_input=None,
+    reference_snapshot=None,
 ) -> dict:
     input_root, output_root = input_root.resolve(strict=True), output_root.resolve()
     if (
@@ -1458,12 +1472,10 @@ def _run(
         else:
             held.release()
     priority = (
-        portalocker.Lock(output_root / "live.priority.lock", timeout=2)
-        if lane == "live"
-        else nullcontext()
+        portalocker.Lock(output_root / "live.priority.lock", timeout=2) if lane == "live" else None
     )
     try:
-        if lane == "live":
+        if priority is not None:
             priority.acquire()
     except portalocker.exceptions.LockException:
         return {"status": "UNCHANGED", "lane": "live", "reason": "LIVE_BUSY"}
@@ -1475,8 +1487,14 @@ def _run(
             else nullcontext()
         )
         with hold:
-            snap = Snapshot.open(input_root)
-            code_id = digest([source_fingerprint(__name__), ("python", platform.python_version())])
+            snap = confirmed_input or Snapshot.open(input_root)
+            code_id = digest(
+                [
+                    source_fingerprint(__name__),
+                    ("python", platform.python_version()),
+                    reference_snapshot.publication_id if reference_snapshot else None,
+                ]
+            )
             immutable_json(
                 output_root / "configs" / f"{digest([config, bundle])}.json",
                 {"schema_id": "quality-effective-config-v1", "score": config, "catalogs": bundle},
@@ -1552,6 +1570,7 @@ def _run(
                 lane=lane,
                 since=since,
                 copied_until=copied_until,
+                reference_snapshot=reference_snapshot,
             )
             if tables is None:
                 state.update(status="IDLE", lane=lane)
@@ -1569,11 +1588,7 @@ def _run(
                     "incremental": statistics,
                     "chunk_productions": [],
                 }
-            commit = (
-                portalocker.Lock(output_root / "pipeline.lock", timeout=0)
-                if lane == "all"
-                else nullcontext()
-            )
+            commit = nullcontext()  # The full-build owner already holds pipeline.lock.
             try:
                 with commit:
                     # Bounded first snapshot; the writer also supports explicit
@@ -1656,7 +1671,7 @@ def _run(
             finally:
                 tables.close()
     finally:
-        if lane == "live":
+        if priority is not None:
             priority.release()
 
 

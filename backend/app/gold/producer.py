@@ -69,7 +69,12 @@ def auxiliary_captures(root, sources):
 
 
 def auxiliary(
-    root: Path, sources: tuple[tuple[str, Path], ...], *, captures=None, initial=None
+    root: Path,
+    sources: tuple[tuple[str, Path], ...],
+    *,
+    captures=None,
+    initial=None,
+    encoding="cp1252",
 ) -> dict[str, pa.Table]:
     """Minimal approved extra fields, captured once, with contradictions rejected.
 
@@ -94,7 +99,7 @@ def auxiliary(
         captures if captures is not None else auxiliary_captures(root, sources)
     ):
         accepted = maps[family]
-        for raw in csv.reader(io.StringIO(before.decode("cp1252")), delimiter=";"):
+        for raw in csv.reader(io.StringIO(before.decode(encoding)), delimiter=";"):
             if not raw or not any(raw):
                 continue
             if raw[-1] == "":
