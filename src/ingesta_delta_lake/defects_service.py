@@ -222,7 +222,11 @@ def process(
     if stopped:
         status = "STOPPED_AFTER_BATCH"
     acknowledged = control.consumed_inputs()
-    remaining = [s for s in pending if (s.origin, s.sha256) not in acknowledged]
+    # The independent scheduler publishes only the selected captures. Other
+    # windows in this family's control queue cannot delay that confirmation.
+    scoped_live = lane == "live" and bool(config.intake_ids)
+    counted = snapshots if scoped_live else pending
+    remaining = [s for s in counted if (s.origin, s.sha256) not in acknowledged]
     return {
         **result,
         **totals,
@@ -231,7 +235,7 @@ def process(
         "quality_complete": result["complete"],
         "source_files": len(snapshots),
         "processed_versions": completed,
-        "remaining_versions": len(pending) - completed,
+        "remaining_versions": len(remaining) if scoped_live else len(pending) - completed,
         "pending_by_origin": dict(Counter(s.origin for s in remaining)),
         "pending_bytes": sum(s.size for s in remaining),
         "oldest_pending_received_at": min((s.received_at for s in remaining), default=None),

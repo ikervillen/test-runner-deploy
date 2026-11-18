@@ -308,7 +308,7 @@ class LotJournal:
             "SELECT * FROM lots WHERE state!='ARCHIVED_CONFIRMED'"
         ).fetchall():
             units = self.members(row["lot_id"])
-            if not units or any(u["input_id"] in active for u in units):
+            if not units:
                 continue
             if row["state"] == "ARCHIVED_CONFIRMED":
                 continue
@@ -319,6 +319,9 @@ class LotJournal:
             expired = (
                 stamp - datetime.fromisoformat(origin)
             ).total_seconds() >= policy.retention_seconds
+            busy = any(u["input_id"] in active for u in units)
+            if busy and expired:
+                continue
             failed = bool(states - {"HANDLED"})
             confirmed = [json.loads(u["confirmation"]) for u in units if u["confirmation"]]
             copied = all(completed.get(c["table"], -1) >= c["version"] for c in confirmed)
@@ -334,10 +337,8 @@ class LotJournal:
                         "WHERE input_id=? AND state!='HANDLED'",
                         [(u["input_id"],) for u in units],
                     )
-                elif "CAPTURED" in states:
-                    state = "RETRYING" if row["retry_used"] else "PROCESSING"
                 elif (
-                    failed
+                    "LOT_WAIT" in states
                     and not row["retry_used"]
                     and stamp >= datetime.fromisoformat(row["retry_at"])
                 ):
@@ -347,6 +348,10 @@ class LotJournal:
                         "UPDATE inputs SET state='CAPTURED' WHERE input_id=? AND state='LOT_WAIT'",
                         [(u["input_id"],) for u in units],
                     )
+                elif busy:
+                    continue
+                elif "CAPTURED" in states:
+                    state = "RETRYING" if row["retry_used"] else "PROCESSING"
                 elif failed:
                     state = "WAITING_HISTORY_REVIEW" if row["retry_used"] else "WAITING_HOUR_RETRY"
                 else:

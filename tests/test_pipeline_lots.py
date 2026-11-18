@@ -7,9 +7,11 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from deltalake import DeltaTable
+from test_lista_defectos import line
 from test_pipeline_runtime import pipeline_config as pipeline_config
 
-from ingesta_delta_lake.pipeline_intake import Intake
+from ingesta_delta_lake.defects_control import DefectsControl
+from ingesta_delta_lake.pipeline_intake import Intake, selected_snapshots
 from ingesta_delta_lake.pipeline_lots import read_manifest
 from ingesta_delta_lake.pipeline_runtime import PipelineWorker
 from ingesta_delta_lake.workers import run_phase
@@ -131,6 +133,72 @@ def test_hour_retry_recaptures_corrected_bytes_and_publishes_real_silver(
         lot = read_manifest(live.storage, "lots")["lots"][0]
         assert lot["state"] == "PUBLISHED"
         assert lot["first_publication"] == clock.value.isoformat()
+
+
+def test_retry_is_released_while_another_family_in_the_lot_is_active(
+    config, pipeline_config, clock
+):
+    root = config.sources[0][1]
+    (root / "18112026_092000_SIP_MODELO.csv").write_text("2;MODEL;1;\n")
+    (root / "18112026_092000_LISTA_DEFECTOS.csv").write_text(line())
+    live, _ = worker_pair(config, pipeline_config)
+    with open_intake(live) as intake:
+        window, _ = live.capture(intake)
+        failed = live.selected_config(intake, "SIP_MODELO", window)
+        active = intake.pending("LISTA_DEFECTOS", 10)
+        intake.lots.claim(failed.intake_ids, live.policy, clock.value)
+        live.record(intake, failed, {"status": "FAILED"}, 0, active_ids=active)
+
+        clock.value = datetime(2026, 11, 18, 8, 59, 59, tzinfo=UTC)
+        live.capture(intake, active_ids=active)
+        assert not intake.pending("SIP_MODELO", 10)
+
+        clock.value += timedelta(seconds=1)
+        live.capture(intake, active_ids=active)
+        assert intake.pending("SIP_MODELO", 10) == failed.intake_ids
+        assert intake.pending("LISTA_DEFECTOS", 10) == active
+        assert read_manifest(live.storage, "lots")["lots"][0]["retry_used"] == 1
+
+        live.record(intake, failed, {"status": "FAILED"}, 0, active_ids=active)
+        live.capture(intake, active_ids=active)
+        assert not intake.pending("SIP_MODELO", 10)
+
+
+def test_live_defects_confirms_selected_capture_despite_control_backlog(
+    config, pipeline_config, clock
+):
+    config = replace(config, timestamp_policy="local_naive_test_v1")
+    root = config.sources[0][1]
+    (root / "18112026_092000_LISTA_DEFECTOS.csv").write_text(line(defect=15))
+    live, _ = worker_pair(config, pipeline_config)
+    with open_intake(live) as intake:
+        window, _ = live.capture(intake)
+        older = live.selected_config(intake, "LISTA_DEFECTOS", window)
+        with closing(DefectsControl(older)) as control:
+            control.receipts(control.start_attempt(), list(selected_snapshots(older)))
+
+        clock.value += timedelta(minutes=10)
+        (root / "18112026_093000_LISTA_DEFECTOS.csv").write_text(line(defect=16))
+        window, _ = live.capture(intake)
+        current = live.selected_config(intake, "LISTA_DEFECTOS", window)
+        assert len(current.intake_ids) == 1 and current.intake_ids != older.intake_ids
+        intake.lots.claim(current.intake_ids, live.policy, clock.value)
+
+        # The first child commits, then its result is replayed before intake confirms it.
+        first, _ = live.transform(current, run_phase)
+        assert first["status"] == "APPLIED"
+        replay, seconds = live.transform(current, run_phase)
+        assert replay["status"] == "NO_CHANGE" and replay["processed_versions"] == 0
+        assert replay["remaining_versions"] == 0
+        live.record(intake, current, replay, seconds)
+        assert "publication_error" not in replay
+        assert intake.pending("LISTA_DEFECTOS", 10) == older.intake_ids
+        batches = read_manifest(live.storage, "lots")["lots"]
+        current_lot = next(lot for lot in batches if lot["start"] == "2026-11-18T09:30:00")
+        assert current_lot["state"] == "PUBLISHED"
+        assert current_lot["inputs"][0]["state"] == "HANDLED"
+        assert json.loads(current_lot["inputs"][0]["confirmation"])["version"] == 0
+        assert DeltaTable(str(current.table_path)).version() == 0
 
 
 def test_successful_live_lot_is_not_transformed_again_when_frontier_advances(
