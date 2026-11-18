@@ -11,17 +11,27 @@ permissions:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: "3.12"
     steps:
       - uses: actions/checkout@v4
+      # Independent Gold must exercise the real, compatible ingestion contracts.
+      # An optional import skipped these tests when Gold ran in isolation.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ikervillen/test-runner-deploy
+          ref: 992fed5a4fe506fbf029dbf47e934381c3d2bf83
+          path: .ingesta-context
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v5
         with:
           version: "0.11.6"
-      - run: uv sync --locked --dev --extra gold --python 3.11
-      - run: uv run ruff check backend orchestration
-      - run: uv run ruff format --check backend orchestration
+      - run: uv sync --locked --dev --extra gold --python 3.12
+      - run: uv run --locked --extra gold ruff check backend orchestration
+      - run: uv run --locked --extra gold ruff format --check backend orchestration
       # Scope and strictness live in [tool.mypy] (pyproject.toml); no path overrides here.
-      - run: uv run mypy
-      - run: uv run --extra gold pytest backend/tests -q --junitxml=test-results.xml --cov-report=xml
+      - run: uv run --locked --extra gold mypy
+      - run: uv run --locked --extra gold --with-editable .ingesta-context pytest backend/tests -q --junitxml=test-results.xml --cov-report=xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:
