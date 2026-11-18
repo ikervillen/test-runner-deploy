@@ -89,8 +89,10 @@ jobs:
         run: |
           set -euo pipefail
           image=fenix-independent:validation
-          docker run --rm --network none --read-only --cap-drop ALL "$image" --help
-          docker run --rm --network none --read-only --cap-drop ALL --entrypoint python "$image" -m app.gold.independent_runtime --help
-          docker run --rm --network none --read-only --cap-drop ALL --entrypoint python "$image" -m deployment.independent --help
-          docker run --rm --network none --read-only --cap-drop ALL --entrypoint python "$image" -c 'import importlib.metadata as m; from app.factory import create_app; from ingesta_delta_lake.pipeline_runtime import PipelineWorker; assert m.version("deltalake") == "1.6.6"'
+          # Match the deployed read-only root plus writable, ephemeral scratch mount.
+          candidate=(docker run --rm --network none --read-only --cap-drop ALL --tmpfs /tmp:rw,noexec,nosuid,size=64m)
+          "${candidate[@]}" "$image" --help
+          "${candidate[@]}" --entrypoint python "$image" -m app.gold.independent_runtime --help
+          "${candidate[@]}" --entrypoint python "$image" -m deployment.independent --help
+          "${candidate[@]}" --entrypoint python "$image" -c 'import importlib.metadata as m; from app.factory import create_app; from ingesta_delta_lake.pipeline_runtime import PipelineWorker; assert m.version("deltalake") == "1.6.6"'
       # There is deliberately no push, self-hosted runner, deployment or activation job.
