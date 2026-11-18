@@ -79,7 +79,7 @@ class Config:
         )
         return self.control_root / filename
 
-    def validate(self) -> None:
+    def validate(self, *, require_inputs=True) -> None:
         if self.publication_root is not None and (
             not self.publication_root.is_absolute()
             or self.publication_root != self.publication_root.resolve()
@@ -222,14 +222,16 @@ class Config:
                 raise ConfigurationError("Los datos operativos no pueden estar dentro del código")
             if p.exists() and not p.is_dir():
                 raise ConfigurationError(f"No es un directorio: {p}")
-        if (self.intake_path is None and not self.input_root.is_dir()) or not self.sources:
+        if (
+            require_inputs and self.intake_path is None and not self.input_root.is_dir()
+        ) or not self.sources:
             raise ConfigurationError("Se necesita una entrada existente y al menos un origen")
         seen = set()
         for origin, path in self.sources:
             if not re.fullmatch(r"[A-Z0-9][A-Z0-9_-]*", origin):
                 raise ConfigurationError(f"Origen inválido: {origin}")
             if not path.is_relative_to(self.input_root) or (
-                self.intake_path is None and not path.is_dir()
+                require_inputs and self.intake_path is None and not path.is_dir()
             ):
                 raise ConfigurationError(f"Origen fuera de la entrada o inexistente: {origin}")
             if path in seen:
@@ -245,7 +247,7 @@ class Config:
             raise ConfigurationError("Codificación desconocida") from exc
 
 
-def load_config(path: Path) -> Config:
+def load_config(path: Path, *, require_inputs=True) -> Config:
     try:
         with path.open("rb") as file:
             data = tomllib.load(file)
@@ -286,7 +288,7 @@ def load_config(path: Path) -> Config:
         if "intake_ids" in data:
             data["intake_ids"] = tuple(data["intake_ids"])
         config = Config(**{**data, **roots, "sources": sources})
-        config.validate()
+        config.validate(require_inputs=require_inputs)
         return config
     except (KeyError, TypeError, ValueError, OSError) as exc:
         raise ConfigurationError(f"Configuración inválida: {exc}") from exc
