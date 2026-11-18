@@ -201,3 +201,38 @@ def test_old_copy_proof_cannot_retire_a_newly_republished_equal_value(config, pi
     assert result["status"] == "RETIREMENT_UNCHANGED"
     with closing(ZcControl(selected)) as control:
         assert ZcStore(selected, control.control_id).table().count() == 1
+
+
+def test_retired_reconciliation_preserves_the_callers_transaction():
+    import sqlite3
+    from types import SimpleNamespace
+
+    import pyarrow as pa
+
+    from ingesta_delta_lake.pipeline_retired import initialize, synchronize
+    from ingesta_delta_lake.pipeline_rows import business_key
+
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT)")
+    control = SimpleNamespace(
+        db=db,
+        config=SimpleNamespace(family="SIP_MODELO", read_max_rows=10),
+        setting=lambda key: db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()[
+            0
+        ],
+    )
+    initialize(control)
+    row = {"id_modelo_fenix": 2, "codigo_modelo_botella": "MODEL"}
+    db.execute("INSERT INTO settings VALUES('retirement_index_version','0')")
+    db.execute("INSERT INTO retired_current VALUES(?,?)", (business_key("SIP_MODELO", row), "hash"))
+    db.commit()
+    events = pa.Table.from_pylist([{**row, "_commit_version": 1, "_change_type": "insert"}])
+    table = SimpleNamespace(version=lambda: 1, history=lambda: [], load_cdf=lambda *_: events)
+    with pytest.raises(RuntimeError, match="outer failure"), db:
+        db.execute("INSERT INTO settings VALUES('outer','pending')")
+        synchronize(control, table)
+        assert db.in_transaction
+        raise RuntimeError("outer failure")
+    assert db.execute("SELECT value FROM settings WHERE key='outer'").fetchone() is None
+    assert db.execute("SELECT count(*) FROM retired_current").fetchone()[0] == 1
+    db.close()

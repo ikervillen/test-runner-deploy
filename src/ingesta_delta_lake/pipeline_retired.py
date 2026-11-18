@@ -30,7 +30,8 @@ def synchronize(control, table):
         for commit in table.history()
         if commit.get("ingesta_maintenance") == "archive-retirement"
     }
-    with control.db:
+    control.db.execute("SAVEPOINT reconcile_retired")
+    try:
         for batch in pa.RecordBatchReader.from_stream(table.load_cdf(start, table.version())):
             scanned += batch.num_rows
             if scanned > control.config.read_max_rows:
@@ -62,6 +63,13 @@ def synchronize(control, table):
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(table.version()),),
         )
+
+    except BaseException:
+        control.db.execute("ROLLBACK TO reconcile_retired")
+        control.db.execute("RELEASE reconcile_retired")
+        raise
+    else:
+        control.db.execute("RELEASE reconcile_retired")
 
 
 def logical_rows(control, table):
