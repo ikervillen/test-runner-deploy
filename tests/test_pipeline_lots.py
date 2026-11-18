@@ -26,6 +26,9 @@ def clock(monkeypatch):
             return cls.value.astimezone(tz) if tz else cls.value.replace(tzinfo=None)
 
     monkeypatch.setattr("ingesta_delta_lake.pipeline_runtime.datetime", Clock)
+    monkeypatch.setattr(
+        "ingesta_delta_lake.pipeline_publications.now", lambda: Clock.value.isoformat()
+    )
     return Clock
 
 
