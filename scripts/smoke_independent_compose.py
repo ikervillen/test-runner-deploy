@@ -7,6 +7,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from textwrap import dedent
 from uuid import uuid4
 
 from deployment.independent import ContainerPipelines, read, render
@@ -122,15 +123,28 @@ def smoke(image, gold_context):
                     "python",
                     service,
                     "-c",
-                    "from deltalake import DeltaTable; import pyarrow as pa; "
-                    "pa.set_cpu_count(1); pa.set_io_thread_count(1); "
-                    f"root = '/pipelines/{lane}/silver/AIALA'; "
-                    "models = DeltaTable(root + '/sip_modelo').to_pyarrow_dataset(); "
-                    "ids = models.scanner(use_threads=False).to_table()['id_modelo_fenix']; "
-                    f"assert ids.to_pylist() == [{model}]; "
-                    "defects = DeltaTable(root + '/lista_defectos').to_pyarrow_dataset(); "
-                    "dates = defects.scanner(use_threads=False).to_table()['FECHA']; "
-                    f"assert [d.as_py().day for d in dates] == [{13 + model}]",
+                    dedent(f"""
+                        from deltalake import DeltaTable
+                        from pyarrow.parquet import ParquetFile
+
+                        root = '/pipelines/{lane}/silver/AIALA'
+
+                        def values(table, column):
+                            files = DeltaTable(root + '/' + table).file_uris()
+                            result = []
+                            for path in files:
+                                with ParquetFile(path) as parquet:
+                                    result.extend(
+                                        parquet.read(columns=[column], use_threads=False)
+                                        [column].to_pylist()
+                                    )
+                            return result
+
+                        assert values('sip_modelo', 'id_modelo_fenix') == [{model}]
+                        assert [date.day for date in values('lista_defectos', 'FECHA')] == [
+                            {13 + model}
+                        ]
+                    """),
                 )
                 once(f"gold-{lane}")
             run(

@@ -136,7 +136,7 @@ jobs:
       - name: Prepare the approved live update
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == 'a7e81b178d3d4908a89bbbd05d4e430bd48bfb3d'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '8b3cb0197d8d34eebe430014e8a5ee1507663030'
         run: |
           set -euo pipefail
           mkdir -p bundle
