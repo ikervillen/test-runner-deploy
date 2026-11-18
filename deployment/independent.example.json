@@ -42,7 +42,7 @@
       "cpus": "2",
       "cpuset": "0-1",
       "memory": "2g",
-      "pids": 128,
+      "pids": 512,
       "tmpfs": "256m",
       "score_workers": 1
     },

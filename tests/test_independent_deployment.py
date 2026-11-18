@@ -112,6 +112,11 @@ def test_cli_writes_compose_only_after_read_only_host_preflight(stack, tmp_path)
     ]
     main(args)
     services = json.loads(output.read_text())["services"]
+    live = services["ingesta-live"]
+    assert live["pids_limit"] == 512
+    assert live["cpus"] == "2"
+    assert live["mem_limit"] == "2g"
+    assert services["ingesta-history"]["pids_limit"] == 128
     for lane in ("live", "history"):
         assert "--health" in services[f"gold-{lane}"]["healthcheck"]["test"]
         assert services[f"ingesta-{lane}"]["healthcheck"]["test"][4] == "health"
