@@ -7,8 +7,25 @@ from test_pipeline_runtime import pipeline_config as pipeline_config
 
 from ingesta_delta_lake.common import IntegrityError
 from ingesta_delta_lake.pipeline_intake import Intake
-from ingesta_delta_lake.pipeline_publications import SilverSnapshot, confirmation_age
+from ingesta_delta_lake.pipeline_publications import (
+    SilverSnapshot,
+    confirmation_age,
+    immutable_json,
+)
 from ingesta_delta_lake.pipeline_runtime import PipelineWorker
+
+
+def test_immutable_publication_can_replay_a_processing_window(tmp_path):
+    path = tmp_path / "control.json"
+    window = ("2026-11-18T13:40:00", "2026-11-18T13:50:00")
+    publication = {"family": "LISTA_AR", "processing_window": window, "version": 7}
+
+    immutable_json(path, publication)
+    original = path.read_bytes()
+    immutable_json(path, publication)
+    with pytest.raises(IntegrityError, match="identity was reused"):
+        immutable_json(path, {**publication, "version": 8})
+    assert path.read_bytes() == original
 
 
 def test_reader_uses_confirmed_delta_without_opening_active_sqlite(

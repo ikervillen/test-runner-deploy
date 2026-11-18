@@ -10,7 +10,7 @@ import portalocker
 import pyarrow as pa
 from deltalake import DeltaTable
 
-from .common import IntegrityError, digest, now
+from .common import IntegrityError, canonical, digest, now
 from .runtime import atomic_json
 
 
@@ -35,7 +35,7 @@ def _inside(root, relative):
 
 def immutable_json(path, value):
     if path.exists():
-        if _read(path) != value:
+        if canonical(_read(path)) != canonical(value):
             raise IntegrityError("Immutable publication identity was reused")
         return
     atomic_json(path, value)
