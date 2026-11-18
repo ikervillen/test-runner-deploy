@@ -48,6 +48,7 @@ class Config:
     reviews_only: bool = False
     publication_root: Path | None = None
     retirement_job: dict | None = None
+    scheduled_lot_attempt: bool = False
 
     @property
     def archive_context(self):
@@ -80,6 +81,10 @@ class Config:
         return self.control_root / filename
 
     def validate(self, *, require_inputs=True) -> None:
+        if type(self.scheduled_lot_attempt) is not bool or (
+            self.scheduled_lot_attempt and (self.intake_path is None or not self.intake_ids)
+        ):
+            raise ConfigurationError("Scheduled lot attempts require explicit captured inputs")
         if self.publication_root is not None and (
             not self.publication_root.is_absolute()
             or self.publication_root != self.publication_root.resolve()

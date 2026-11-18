@@ -8,6 +8,7 @@ from . import topology
 from .common import IntegrityError
 from .contracts import CONTRACTS, DictionaryContract
 from .pipeline_bronze import BronzeFeed
+from .pipeline_lots import read_manifest
 from .sources import publish_capture
 
 
@@ -30,6 +31,19 @@ class BronzeHandoff:
         if not pointer.exists():
             return {"imported": 0, "deferred": 0}
         feed = BronzeFeed(self.live_storage)
+        ownership = read_manifest(self.live_storage, "lots")
+        strict = ownership is not None and ownership["frontier"] is not None
+        transferred = (
+            {
+                unit["input_id"]
+                for lot in ownership["lots"]
+                if lot["state"] == "TRANSFERRED_FOR_REVIEW"
+                for unit in lot["inputs"]
+                if unit["state"] != "HANDLED"
+            }
+            if strict
+            else set()
+        )
         if feed.lane != "live":
             raise IntegrityError("Bronze handoff requires the live producer")
         previous = self.intake.setting("live_import_identity")
@@ -85,7 +99,11 @@ class BronzeHandoff:
                     isinstance(contract, DictionaryContract) or row["family"] in topology.FAMILIES
                 )
                 eligible = reference
-                if stamp is None:
+                if strict:
+                    eligible = row["input_id"] in transferred or (
+                        reference and (stamp is None or "T" not in stamp)
+                    )
+                elif stamp is None:
                     eligible |= (
                         self.db.execute(
                             "SELECT 1 FROM live_imports WHERE source_path=? AND sequence>? LIMIT 1",

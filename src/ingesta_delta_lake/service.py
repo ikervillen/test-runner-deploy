@@ -365,7 +365,7 @@ def run(
                         result = {"status": "REVIEWS_CHECKED", "attempted": False}
                     export(control, config, result, force=True)
                     return result
-                if control.compact and runtime_owner:
+                if control.compact and runtime_owner and not config.scheduled_lot_attempt:
                     waiting = retry_control.ready(control)
                     if waiting:
                         from .supervision_export import export

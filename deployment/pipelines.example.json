@@ -4,6 +4,8 @@
     "timezone": "Europe/Madrid",
     "window_seconds": 600,
     "retention_seconds": 28800,
+    "live_retry_period_seconds": 3600,
+    "history_review_retry_seconds": 3600,
     "latency_seconds": 300,
     "poll_seconds": 5,
     "live_batch_files": 32,

@@ -25,9 +25,10 @@ montan SQLite privados ni Fenix. La API solo monta los dos almacenes Gold.
 
 `PipelineWorker` aplica la misma implementación de contratos, transformación,
 asociaciones y revisiones a ambos caminos. `pipeline_intake` descubre antes de leer:
-live selecciona el último bloque de Fenix de diez minutos disponible, aunque sea
-antiguo. Histórico recupera bloques anteriores con su propio progreso y también
-copia las capturas live confirmadas desde el feed Bronze. Un bloqueo en una tabla
+live fija una frontera global en el comienzo del último bloque de diez minutos,
+aunque sea antiguo. Histórico recupera los bloques anteriores a esa frontera fija;
+los posteriores pertenecen a live. Puede conservar capturas del feed Bronze sin
+transformar de nuevo los lotes correctos. Un bloqueo en una tabla
 histórica no requiere liberar ninguna tabla live para confirmar datos recientes.
 
 El planificador live reserva capacidad para entrada y transformación de fuentes;
@@ -37,8 +38,13 @@ la separación no permite inventar catálogos, aprobaciones ni cobertura.
 
 ## Envejecimiento, correcciones y recuperación
 
-Las ocho horas empiezan en la primera publicación confirmada en Silver live, no
-en la fecha del dato ni en el instante de copiar el CSV. Recuperación de Fenix y
+Las ocho horas empiezan en la primera publicación confirmada en Silver live; para
+lotes completamente fallidos, en su primer intento de procesamiento. Live concede
+un único reintento al cierre de la hora del lote (09:20–09:30 → 10:00), recapturando
+archivos corregidos. Si sigue fallando, espera su transferencia al histórico para
+revisión prioritaria. El plazo no se reinicia al reintentar ni al reiniciar servicios.
+Los estados «transferido para revisión» y «archivado y confirmado» son distintos.
+Recuperación de Fenix y
 envejecimiento son colas diferentes. Histórico copia cambios confirmados con su
 identidad, revisión, versión Delta y hashes, verifica el resultado y publica un
 recibo recuperable. Solo el propietario live puede retirar su copia después del
@@ -77,6 +83,7 @@ produce un error explícito y requiere ajustar capacidad/selección, no truncar 
 | --- | --- |
 | `pipeline_policy.py`, `deployment/pipelines.example.json` | Rutas y política explícita: ventana, retención, latencia, turnos y presupuestos |
 | `pipeline_intake.py`, `pipeline_bronze.py` | Descubrimiento, captura estable y feed Bronze verificable |
+| `pipeline_lots.py` | Frontera global fija, propiedad, reintento horario y revisiones transferidas |
 | `pipeline_runtime.py`, `workers.py` | Propietarios y programación por camino |
 | `pipeline_publications.py`, `pipeline_view.py` | Silver confirmado y reconciliación sin leer controles ajenos |
 | `pipeline_archive.py`, `pipeline_retirement.py` | Copia, recibos y retirada por el propietario live |

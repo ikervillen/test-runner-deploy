@@ -8,7 +8,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -108,7 +108,7 @@ class PipelineWorker:
             stream.flush()
         print(canonical(value), flush=True)
 
-    def capture(self, intake):
+    def capture(self, intake, *, active_ids=()):
         recovered = intake.recover_captures(
             self.source, limit=getattr(self.policy, f"{self.lane}_batch_files")
         )
@@ -116,13 +116,21 @@ class PipelineWorker:
             self.event({"event": "BRONZE_CAPTURE_RECOVERED", "captures": recovered})
         self.update(phase="DISCOVERING")
         lanes, window, failures = discover_lanes(self.source.sources, self.policy)
+        stamp = datetime.now(UTC)
+        intake.set("lot_policy", canonical(asdict(self.policy)))
+        frontier = intake.lots.frontier(self.pipelines, window)
+        intake.lots.advance(self.pipelines, stamp, active_ids=active_ids)
+        candidates = intake.lots.owned_candidates(
+            [*lanes["live"], *lanes["history"]], self.policy, window, frontier
+        )
+        if self.lane == "live":
+            intake.lots.publish(self.storage)
         for failure in failures:
             intake.failure(failure["path"], failure["error"])
             self.event({"event": "DISCOVERY_FAILED", **failure})
         bounds = (window.start.isoformat(), window.end.isoformat()) if window else None
         self.update(phase="CAPTURING", source_window=bounds)
-        self.event({"event": "BRONZE_CAPTURE_STARTED", "candidates": len(lanes[self.lane])})
-        captured = intake.capture_turn(self.source, self.policy, lanes[self.lane])
+        self.event({"event": "BRONZE_CAPTURE_STARTED", "candidates": len(candidates)})
         if self.lane == "history":
             try:
                 handoff = BronzeHandoff(intake, self.pipelines.live).turn(
@@ -131,25 +139,66 @@ class PipelineWorker:
                 self.event({"event": "BRONZE_HANDOFF", **handoff})
             except Exception as exc:
                 self.event({"event": "BRONZE_HANDOFF_FAILED", "error": str(exc)})
+            requests = intake.lots.refresh_reviews(self.pipelines, stamp)
+            review_candidates = [
+                item
+                for item in [*lanes["live"], *lanes["history"]]
+                if item.producer_time
+                and "T" in item.producer_time
+                and any(
+                    item.origin == r["origin"]
+                    and r["start"] <= item.producer_time < r["end"]
+                    and not any(
+                        u["source_path"] == str(item.path) and u["state"] == "HANDLED"
+                        for u in r["inputs"]
+                    )
+                    for r in requests
+                )
+            ]
+            review_capture = intake.capture_turn(self.source, self.policy, review_candidates)
+            budget = max(0, self.policy.history_batch_files - review_capture["captured"])
+            captured = (
+                intake.capture_turn(
+                    self.source, replace(self.policy, history_batch_files=budget), candidates
+                )
+                if budget
+                else {"captured": 0, "failed": 0, "unchanged": 0, "lane": self.lane}
+            )
+            for key in ("captured", "failed", "unchanged"):
+                captured[key] += review_capture[key]
+        else:
+            captured = intake.capture_turn(self.source, self.policy, candidates)
         try:
             intake.publish_captures(
                 self.storage.exchange, limit=getattr(self.policy, f"{self.lane}_batch_files")
             )
         except Exception as exc:
             self.event({"event": "BRONZE_PUBLICATION_FAILED", "error": str(exc)})
+        intake.lots.publish(self.storage)
         self.event({"event": "BRONZE_CAPTURE", **captured})
         return window, captured
 
     def selected_config(self, intake, family, window, *, reviews_only=False):
-        bounds = (window.start.isoformat(), window.end.isoformat()) if window else None
+        ids = intake.pending(family, getattr(self.policy, f"{self.lane}_batch_files"))
+        if self.lane == "history":
+            ids = intake.lots.review_ids(ids)
+        selected_window = (
+            intake.lots.pending_window(ids, self.policy) if self.lane == "live" else None
+        )
+        if selected_window:
+            ids = intake.pending(family, self.policy.live_batch_files, window=selected_window)
+        bounds = (
+            (selected_window.start.isoformat(), selected_window.end.isoformat())
+            if selected_window
+            else (window.start.isoformat(), window.end.isoformat())
+            if window
+            else None
+        )
         return replace(
             self.source,
             family=family,
-            intake_ids=intake.pending(
-                family,
-                getattr(self.policy, f"{self.lane}_batch_files"),
-                window=window if self.lane == "live" else None,
-            ),
+            intake_ids=ids,
+            scheduled_lot_attempt=intake.lots.managed(ids),
             processing_window=bounds if self.lane == "live" else None,
             reviews_only=reviews_only,
             **self.archive_context,
@@ -208,9 +257,14 @@ class PipelineWorker:
         except Exception as exc:
             self.event({"event": "ARCHIVE_FAILED", "error": str(exc)})
 
-    def record(self, intake, cfg, result, seconds):
+    def record(self, intake, cfg, result, seconds, *, active_ids=()):
         ids, family = cfg.intake_ids, cfg.family
-        if result.get("status") in {"RETRY_WAIT", "PAUSED_RETRY_EXHAUSTED"}:
+        manifest = None
+        lot_recorded = False
+        if (
+            result.get("status") in {"RETRY_WAIT", "PAUSED_RETRY_EXHAUSTED"}
+            and not cfg.scheduled_lot_attempt
+        ):
             intake.defer(ids, result)
             self.event({"family": family, "result": result, "seconds": seconds})
             return
@@ -229,6 +283,10 @@ class PipelineWorker:
                 ):
                     raise IntegrityError("Applied transformation has no confirmed Silver table")
                 if ids:
+                    # Persist the confirmed publication clock before acknowledging input
+                    # progress. A restart must not replace it with a later retry timestamp.
+                    intake.lots.record(ids, result, manifest, datetime.now(UTC), self.policy)
+                    lot_recorded = True
                     intake.acknowledge(ids, result, published_at=now())
                     intake.defer(ids, result)
             except Exception as exc:
@@ -238,6 +296,13 @@ class PipelineWorker:
                 )
         if cfg.retirement_job:
             RetirementQueue(intake, self.pipelines.history).acknowledge(result)
+        if not lot_recorded or result.get("publication_error"):
+            intake.lots.record(ids, result, manifest, datetime.now(UTC), self.policy)
+        intake.lots.advance(self.pipelines, datetime.now(UTC), active_ids=active_ids)
+        if self.lane == "history":
+            intake.lots.finish_reviews(self.storage)
+        else:
+            intake.lots.publish(self.storage)
         self.event({"family": family, "result": result, "seconds": seconds})
 
     def maintenance_config(self, intake, active, dirty, reviews):
@@ -320,6 +385,7 @@ class PipelineWorker:
                 break
             for family in phase:
                 cfg = self.selected_config(intake, family, window)
+                intake.lots.claim(cfg.intake_ids, self.policy, datetime.now(UTC))
                 result, seconds = self.transform(cfg, executor)
                 self.record(intake, cfg, result, seconds)
                 results[family] = result
@@ -344,7 +410,10 @@ class PipelineWorker:
                 began = time.monotonic()
                 self.archive_turn()
                 self.refresh_archive()
-                window, captured = self.capture(intake)
+                window, captured = self.capture(
+                    intake,
+                    active_ids=tuple(i for _, cfg in active.values() for i in cfg.intake_ids),
+                )
                 self.release_retries(intake, active)
                 reviews = pending_families(families)
                 for family in reviews - active.keys():
@@ -358,9 +427,22 @@ class PipelineWorker:
                         result, seconds = future.result()
                     except Exception as exc:
                         result, seconds = {"status": "FAILED", "error": str(exc)}, 0
-                    self.record(intake, cfg, result, seconds)
+                    self.record(
+                        intake,
+                        cfg,
+                        result,
+                        seconds,
+                        active_ids=tuple(
+                            i
+                            for f, (_, other) in active.items()
+                            if f != family
+                            for i in other.intake_ids
+                        ),
+                    )
                     del active[family]
-                    if result.get("status") == "FAILED" or result.get("remaining_versions", 0):
+                    if result.get("remaining_versions", 0) or (
+                        result.get("status") == "FAILED" and not cfg.scheduled_lot_attempt
+                    ):
                         dirty.add(family)
                         dirty_since.setdefault(family, time.monotonic())
                         retry_at[family] = time.monotonic() + self.policy.poll_seconds
@@ -392,6 +474,7 @@ class PipelineWorker:
                         overdue = time.monotonic() - first_seen
                         ready.append(
                             (
+                                not (self.lane == "history" and cfg.scheduled_lot_attempt),
                                 not (overdue >= self.policy.latency_seconds),
                                 not bool(cfg.intake_ids),
                                 first_seen,
@@ -399,7 +482,7 @@ class PipelineWorker:
                                 cfg,
                             )
                         )
-                for _, _, _, _, cfg in sorted(ready):
+                for _, _, _, _, _, cfg in sorted(ready):
                     if len(active) >= self.parallel:
                         break
                     if (
@@ -410,6 +493,7 @@ class PipelineWorker:
                         continue
                     dirty.discard(cfg.family)
                     dirty_since.pop(cfg.family, None)
+                    intake.lots.claim(cfg.intake_ids, self.policy, datetime.now(UTC))
                     active[cfg.family] = pool.submit(self.transform, cfg, executor), cfg
                 if len(active) < self.parallel:
                     cfg = self.maintenance_config(intake, active, dirty, reviews)
