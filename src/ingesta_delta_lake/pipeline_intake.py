@@ -108,6 +108,9 @@ class Intake:
             self.db.close()
             raise IntegrityError("Intake belongs to a different lane or storage identity")
         self.set("identity", expected)
+        from .pipeline_lots import LotJournal
+
+        self.lots = LotJournal(self)
 
     def close(self):
         self.db.close()
@@ -143,6 +146,7 @@ class Intake:
                     None,
                 ),
             )
+            self.lots.attach(identity, snapshot)
         (self.path.parent / "capture-intents" / (identity + ".json")).unlink(missing_ok=True)
         return identity
 
@@ -232,6 +236,18 @@ class Intake:
                 "(producer_time>=? AND producer_time<?))"
             )
             params.extend((window.start.isoformat(), window.end.isoformat()))
+        if self.lane == "history":
+            query += (
+                " AND NOT EXISTS (SELECT 1 FROM review_inputs ri JOIN historical_reviews hr "
+                "USING(lot_id) WHERE ri.input_id=selected.input_id AND "
+                "(hr.state='ARCHIVED_CONFIRMED' OR julianday(hr.next_at)>julianday(?)))"
+            )
+            params.append(self.lots.technical_now.isoformat())
+            query += (
+                " ORDER BY CASE WHEN EXISTS(SELECT 1 FROM review_inputs ri "
+                "WHERE ri.input_id=selected.input_id) THEN 0 ELSE 1 END,producer_time ASC"
+            )
+            return tuple(r[0] for r in self.db.execute(query + " LIMIT ?", [*params, limit]))
         query += " ORDER BY producer_time " + ("DESC" if self.lane == "live" else "ASC")
         return tuple(r[0] for r in self.db.execute(query + " LIMIT ?", [*params, limit]))
 

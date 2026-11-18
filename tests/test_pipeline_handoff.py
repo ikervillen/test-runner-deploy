@@ -48,7 +48,7 @@ def test_history_processes_superseded_alias_from_bronze_after_fenix_overwrites_i
     assert not live.source.table_path.exists()
 
 
-def test_current_timed_capture_is_deferred_until_producer_window_advances(config, pipeline_config):
+def test_live_owned_capture_stays_deferred_when_producer_window_advances(config, pipeline_config):
     config = replace(config, family="LISTA_DEFECTOS", timestamp_policy="local_naive_test_v1")
     live, history = (PipelineWorker(pipeline_config, lane, config) for lane in ("live", "history"))
     live.prepare()
@@ -65,17 +65,13 @@ def test_current_timed_capture_is_deferred_until_producer_window_advances(config
         assert handoff.turn(history.source, policy, window=current)["deferred"] == 1
         assert not intake.pending(config.family, 10)
         next_window = policy.source_window(datetime(2026, 11, 17, 12, 10))
-        assert handoff.turn(history.source, policy, window=next_window)["deferred"] == 0
+        assert handoff.turn(history.source, policy, window=next_window)["deferred"] == 1
         selected = intake.pending(config.family, 10)
-        assert len(selected) == 1
+        assert not selected
         import json
 
         snapshot = Snapshot(
-            **json.loads(
-                intake.db.execute(
-                    "SELECT descriptor FROM inputs WHERE input_id=?", selected
-                ).fetchone()[0]
-            )
+            **json.loads(intake.db.execute("SELECT descriptor FROM inputs LIMIT 1").fetchone()[0])
         )
         assert Path(snapshot.bronze_path).is_relative_to(history.storage.bronze)
         assert Path(snapshot.bronze_path).read_bytes() == source.read_bytes()

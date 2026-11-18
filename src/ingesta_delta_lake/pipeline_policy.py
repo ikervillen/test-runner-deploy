@@ -53,6 +53,8 @@ class PipelinePolicy:
     archive_publications_per_turn: int
     read_batch_rows: int
     read_max_rows: int
+    live_retry_period_seconds: int
+    history_review_retry_seconds: int
 
     def __post_init__(self):
         try:
@@ -77,10 +79,14 @@ class PipelinePolicy:
             "archive_publications_per_turn",
             "read_batch_rows",
             "read_max_rows",
+            "live_retry_period_seconds",
+            "history_review_retry_seconds",
         ):
             _positive(getattr(self, name), name)
         if self.retention_seconds < self.window_seconds:
             raise ConfigurationError("Live retention must cover at least one source window")
+        if self.live_retry_period_seconds % self.window_seconds:
+            raise ConfigurationError("Retry periods must contain complete producer windows")
         if self.poll_seconds >= self.latency_seconds:
             raise ConfigurationError("Polling must leave time for capture and publication")
         if self.live_workers < 2:

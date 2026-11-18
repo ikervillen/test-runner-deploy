@@ -29,13 +29,35 @@ Este documento complementa los contratos industriales existentes; no los sustitu
 
 ## Archivado y consulta
 
-Bronze publica las capturas estables como un feed inmutable. El histórico copia
-esos bytes a su propio Bronze sin consultar el checkpoint live ni volver a Fenix.
-El bloque operativo actual y la última versión de un alias sin reloj permanecen
-aplazados; al avanzar el bloque o aparecer otra versión del alias, las anteriores
-quedan disponibles para la recuperación histórica. Los contratos de diccionarios
-y topología pueden inicializar referencias en histórico de forma independiente.
-Esta recuperación de fuentes es distinta del archivado de Silver tras ocho horas.
+Live fija una única frontera inicial común: el comienzo del último bloque disponible
+en Fenix. La frontera no se mueve al reiniciar ni al avanzar Fenix. Histórico recupera
+los bloques anteriores; los siguientes pertenecen a live. El manifiesto de propiedad
+es inmutable y publicado por live; histórico no abre sus controles SQLite.
+
+Bronze publica capturas estables que histórico puede conservar sin transformarlas
+de nuevo. Un lote correcto de live se incorpora como resultados Silver confirmados
+tras su retención, con copia/verificación/recibo. Avanzar al siguiente bloque no da
+permiso a histórico para transformar el anterior. Los diccionarios y referencias
+sin reloj de lote mantienen su inicialización independiente; no son lotes operativos.
+
+Un lote fallido espera un único reintento al cierre de su hora industrial, según la
+zona horaria configurada. El lote 09:20–09:30 se reintenta a las 10:00. Se recapturan
+los archivos para incorporar correcciones. Si ese cierre ya pasó al arrancar, el
+reintento vencido se atiende una sola vez. Reinicios y reintentos no reinician plazos.
+Si vuelve a fallar, espera a histórico. Los lotes completamente fallidos se transfieren
+ocho horas después de su primer intento; los publicados usan su primera confirmación
+Silver. Los parciales conservan sus partes aceptadas y el diagnóstico de pendientes.
+
+`TRANSFERRED_FOR_REVIEW` significa «transferido al histórico para revisión»;
+`ARCHIVED_CONFIRMED` significa «archivado y confirmado». Histórico atiende las revisiones
+transferidas antes que la recuperación ordinaria, comprueba nuevos bytes en Fenix y
+reintenta con su propio control. Solo confirma el lote cuando las entradas pendientes
+están publicadas y las partes aceptadas están copiadas y verificadas. Las revisiones
+que siguen fallando conservan su diagnóstico y una próxima fecha explícita.
+
+La cadencia live (`live_retry_period_seconds`) y la de revisión histórica
+(`history_review_retry_seconds`) son obligatorias en la política. El ejemplo usa
+3600 s en ambas; la retención sigue siendo `retention_seconds=28800`.
 
 Recuperar archivos antiguos de Fenix y archivar resultados que envejecen en live
 son trabajos diferentes, con progreso independiente. El histórico es el único
