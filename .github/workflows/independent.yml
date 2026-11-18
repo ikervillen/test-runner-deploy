@@ -87,6 +87,8 @@ jobs:
   independent-image:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      rollout: ${{ steps.bundle.outputs.rollout }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -131,4 +133,99 @@ jobs:
         run: |
           python -m pip install uv==0.11.6
           uv run --locked --no-dev python -m scripts.smoke_independent_compose fenix-independent:validation .quality-context
-      # Hosted validation only. No image publication or server deployment.
+      - name: Prepare the approved live update
+        id: bundle
+        # One-shot authorization for this integration, not a standing deploy trigger.
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == 'a7e81b178d3d4908a89bbbd05d4e430bd48bfb3d'
+        run: |
+          set -euo pipefail
+          mkdir -p bundle
+          docker tag fenix-independent:validation "fenix-independent:sha-$GITHUB_SHA"
+          docker image save "fenix-independent:sha-$GITHUB_SHA" | gzip -1 > bundle/image.tar.gz
+          echo 'rollout=true' >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: steps.bundle.outputs.rollout == 'true'
+        with:
+          name: live-image-tar
+          path: bundle/image.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+          overwrite: true
+
+  publish-live:
+    needs: [contracts-and-delta, gold-native-contracts, independent-image]
+    if: needs.independent-image.outputs.rollout == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: live-image-tar
+          path: bundle
+      - name: Publish the tested image and write its proof
+        id: proof
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="fenix-independent:sha-$GITHUB_SHA"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:independent-sha-$GITHUB_SHA"
+          docker image load --input bundle/image.tar.gz
+          docker tag "$tag" "$image"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null' EXIT
+          docker push "$image"
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$image")
+          [[ "$digest" =~ @sha256:[0-9a-f]{64}$ ]]
+          jq -n --arg registry_ref "$digest" --arg local_tag "$tag" \
+            --arg image_id "$(docker image inspect "$tag" --format '{{.Id}}')" \
+            --arg archive_sha256 "$(sha256sum bundle/image.tar.gz | cut -d' ' -f1)" \
+            '{$registry_ref,$local_tag,$image_id,$archive_sha256}' > bundle/image.json
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Image: $digest" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: live-image-proof
+          path: bundle/image.json
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+    outputs:
+      digest: ${{ steps.proof.outputs.digest }}
+
+  rollout-live:
+    needs: publish-live
+    runs-on: [self-hosted, Windows, X64, fenix-ingesta]
+    environment: develop
+    timeout-minutes: 45
+    concurrency:
+      group: ingesta-deploy-${{ github.repository }}-develop
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          pattern: live-image-*
+          path: ${{ runner.temp }}/fenix-image-${{ github.run_id }}-${{ github.run_attempt }}
+          merge-multiple: true
+      - name: Update only the existing live worker
+        shell: powershell
+        env:
+          FENIX_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
+          FENIX_INPUT_BIND: ${{ vars.INGESTA_INPUT_BIND }}
+          FENIX_DOCKER_CONTEXT: ${{ vars.INGESTA_DOCKER_CONTEXT }}
+          GOLD_CATALOGS_GZIP_B64: ${{ secrets.GOLD_CATALOGS_GZIP_B64 }}
+          IMAGE: ${{ needs.publish-live.outputs.digest }}
+        run: |
+          $bundle = Join-Path $env:RUNNER_TEMP "fenix-image-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          try {
+            ./scripts/start_independent.ps1 -LiveOnly -Site $env:FENIX_SITE -Bundle $bundle `
+              -Image $env:IMAGE -Revision $env:GITHUB_SHA -GoldRevision $env:GOLD_SOURCE_COMMIT
+          } finally {
+            Remove-Item -LiteralPath (Join-Path $bundle 'image.tar.gz'), (Join-Path $bundle 'image.json') -ErrorAction SilentlyContinue
+          }

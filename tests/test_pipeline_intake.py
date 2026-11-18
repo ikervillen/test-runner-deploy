@@ -144,3 +144,59 @@ def test_selected_evidence_must_match_hash(config, policy, tmp_path):
         next(config.bronze_root.rglob("*.csv")).write_text("tampered")
         with pytest.raises(IntegrityError, match="hash differs"):
             run(replace(config, intake_path=intake.path, intake_ids=ids))
+
+
+def test_fresh_block_rotates_across_five_origins_before_known_payloads(
+    config, policy, tmp_path, monkeypatch
+):
+    origins = ("AV21", "AV22", "AV23", "AV31", "AV32")
+    sources = tuple((origin, config.input_root / origin) for origin in origins)
+    cfg = replace(config, sources=sources)
+    for _, folder in sources:
+        folder.mkdir(exist_ok=True)
+        for minute in range(5):
+            (folder / f"18112026_110{minute}00_SIP_MODELO.csv").write_text("1;OLD;1;\n")
+    checkpoint = tmp_path / "live-intake.sqlite"
+    lanes, window, _ = discover_lanes(cfg.sources, policy)
+    with closing(Intake(checkpoint, lane="live", identity="live")) as intake:
+        assert intake.capture_live(cfg, policy, lanes["live"], window=window)["captured"] == 25
+
+    for _, folder in sources:
+        for second in ("00", "01"):
+            (folder / f"18112026_1110{second}_SIP_MODELO.csv").write_text("2;NEW;1;\n")
+    lanes, window, _ = discover_lanes(cfg.sources, policy)
+    opened = []
+    capture = pipeline_intake.capture
+
+    def observe(*args, **kwargs):
+        opened.append((args[1], args[2].name))
+        return capture(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_intake, "capture", observe)
+    for _ in origins:
+        with closing(Intake(checkpoint, lane="live", identity="live")) as intake:
+            result = intake.capture_live(
+                cfg,
+                replace(policy, live_batch_files=1),
+                lanes["live"] + lanes["history"],
+                window=window,
+            )
+            assert result["captured"] == 1 and result["audited"] == 0
+    assert [origin for origin, _ in opened] == list(origins)
+    assert all("_1110" in name for _, name in opened)
+
+
+def test_idle_audit_detects_content_change_with_unchanged_size_and_mtime(config, policy, tmp_path):
+    import os
+
+    path = config.sources[0][1] / "18112026_111000_SIP_MODELO.csv"
+    path.write_text("1;OLD;1;\n")
+    lanes, window, _ = discover_lanes(config.sources, policy)
+    with closing(Intake(tmp_path / "audit.sqlite", lane="live", identity="live")) as intake:
+        intake.capture_live(config, policy, lanes["live"], window=window)
+        stamps = path.stat()
+        path.write_text("1;NEW;1;\n")
+        os.utime(path, ns=(stamps.st_atime_ns, stamps.st_mtime_ns))
+        result = intake.capture_live(config, policy, lanes["live"], window=window)
+        assert result["captured"] == 1 and result["audited"] == 1
+        assert len(list(config.bronze_root.rglob("*.csv"))) == 2

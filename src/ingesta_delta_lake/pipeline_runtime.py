@@ -78,6 +78,7 @@ class PipelineWorker:
         self.status = {"lane": lane, "identity": self.identity, "phase": "STARTING"}
         self.guard = threading.Lock()
         self.archive_context = {}
+        self.discovery_cache = {}
 
     def prepare(self):
         marker = self.storage.checkpoint / "identity.json"
@@ -115,13 +116,22 @@ class PipelineWorker:
         if recovered:
             self.event({"event": "BRONZE_CAPTURE_RECOVERED", "captures": recovered})
         self.update(phase="DISCOVERING")
-        lanes, window, failures = discover_lanes(self.source.sources, self.policy)
+        began_discovery = time.monotonic()
+        lanes, window, failures = discover_lanes(
+            self.source.sources, self.policy, cache=self.discovery_cache
+        )
+        discovery_seconds = round(time.monotonic() - began_discovery, 3)
         stamp = datetime.now(UTC)
         intake.set("lot_policy", canonical(asdict(self.policy)))
         frontier = intake.lots.frontier(self.pipelines, window)
         intake.lots.advance(self.pipelines, stamp, active_ids=active_ids)
+        earlier = lanes["history"]
+        if self.lane == "live":
+            # Older daily snapshots are backfill. Preserve live ownership of timed
+            # lots that were still pending when a newer Fenix block arrived.
+            earlier = [c for c in earlier if c.producer_time and "T" in c.producer_time]
         candidates = intake.lots.owned_candidates(
-            [*lanes["live"], *lanes["history"]], self.policy, window, frontier
+            [*lanes["live"], *earlier], self.policy, window, frontier
         )
         if self.lane == "live":
             intake.lots.publish(self.storage)
@@ -130,7 +140,13 @@ class PipelineWorker:
             self.event({"event": "DISCOVERY_FAILED", **failure})
         bounds = (window.start.isoformat(), window.end.isoformat()) if window else None
         self.update(phase="CAPTURING", source_window=bounds)
-        self.event({"event": "BRONZE_CAPTURE_STARTED", "candidates": len(candidates)})
+        self.event(
+            {
+                "event": "BRONZE_CAPTURE_STARTED",
+                "candidates": len(candidates),
+                "discovery_seconds": discovery_seconds,
+            }
+        )
         if self.lane == "history":
             try:
                 handoff = BronzeHandoff(intake, self.pipelines.live).turn(
@@ -167,7 +183,7 @@ class PipelineWorker:
             for key in ("captured", "failed", "unchanged"):
                 captured[key] += review_capture[key]
         else:
-            captured = intake.capture_turn(self.source, self.policy, candidates)
+            captured = intake.capture_live(self.source, self.policy, candidates, window=window)
         try:
             intake.publish_captures(
                 self.storage.exchange, limit=getattr(self.policy, f"{self.lane}_batch_files")

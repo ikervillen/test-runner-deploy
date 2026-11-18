@@ -1,6 +1,7 @@
 """Lane-owned lot journal and immutable handoff; no shared mutable control database."""
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -152,6 +153,16 @@ class LotJournal:
 
     def owned_candidates(self, candidates, policy, window, frontier):
         selected = []
+        states = (
+            {
+                (origin, start): state
+                for origin, start, state in self.db.execute(
+                    "SELECT origin,start,state FROM lots WHERE start>=?", (frontier.isoformat(),)
+                )
+            }
+            if frontier is not None and self.intake.lane == "live"
+            else {}
+        )
         for item in candidates:
             if not item.producer_time or "T" not in item.producer_time:
                 selected.append(item)
@@ -165,13 +176,16 @@ class LotJournal:
             if item.clock < frontier:
                 continue
             start = policy.source_window(item.clock).start.isoformat()
-            row = self.db.execute(
-                "SELECT state FROM lots WHERE origin=? AND start=?", (item.origin, start)
-            ).fetchone()
-            if row is None or row[0] in {"NEW", "PROCESSING", "RETRYING"}:
+            state = states.get((item.origin, start))
+            if state in {None, "NEW", "PROCESSING", "RETRYING"}:
                 selected.append(item)
-            elif row[0] == "PUBLISHED" and window and window.contains(item.clock):
-                selected.append(item)
+            elif window and window.contains(item.clock):
+                if state == "PUBLISHED":
+                    selected.append(item)
+                elif state in {"WAITING_HOUR_RETRY", "WAITING_HISTORY_REVIEW"}:
+                    # A failed family must not hide newly arrived files of the same block.
+                    # Existing captures stay deferred until their scheduled retry.
+                    selected.append(replace(item, audit=False))
         return selected
 
     def members(self, lot_id):

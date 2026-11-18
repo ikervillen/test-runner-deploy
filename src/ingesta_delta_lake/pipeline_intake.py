@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import time
+from collections import defaultdict, deque
 from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -21,6 +22,7 @@ class Candidate:
     path: Path
     family: str
     producer_time: str | None
+    audit: bool = True
 
     @property
     def clock(self):
@@ -31,7 +33,18 @@ class Candidate:
         return self.origin, self.path.name
 
 
-def discover_lanes(sources, policy):
+def classify_name(origin, folder, name):
+    family = export_kind(name)
+    if not family:
+        return None, None
+    path = folder / name
+    try:
+        return Candidate(origin, path, family, parse_name(name, family)), None
+    except CaptureError as exc:
+        return None, {"origin": origin, "path": str(path), "error": str(exc)}
+
+
+def discover_lanes(sources, policy, *, cache=None):
     """Only directory names are read here; historical files are not statted/opened."""
     candidates, errors = [], []
     for origin, folder in sources:
@@ -41,16 +54,20 @@ def discover_lanes(sources, policy):
         except OSError as exc:
             errors.append({"origin": origin, "path": str(folder), "error": str(exc)})
             continue
+        previous = {} if cache is None else cache.get((origin, folder), {})
+        current = {}
         for name in names:
-            family = export_kind(name)
-            if not family:
-                continue
-            try:
-                stamp = parse_name(name, family)
-            except CaptureError as exc:
-                errors.append({"origin": origin, "path": str(folder / name), "error": str(exc)})
-                continue
-            candidates.append(Candidate(origin, folder / name, family, stamp))
+            candidate, error = (
+                previous[name] if name in previous else classify_name(origin, folder, name)
+            )
+            if candidate:
+                candidates.append(candidate)
+            if error:
+                errors.append(error)
+            if cache is not None:
+                current[name] = candidate, error
+        if cache is not None:
+            cache[origin, folder] = current
     timed = [c.clock for c in candidates if c.producer_time and "T" in c.producer_time]
     window = policy.source_window(max(timed)) if timed else None
     daily = {}
@@ -92,6 +109,7 @@ class Intake:
                 descriptor TEXT NOT NULL, captured_at TEXT NOT NULL,
                 state TEXT NOT NULL, published_at TEXT, result TEXT);
             CREATE INDEX IF NOT EXISTS pending_inputs ON inputs(state, family, producer_time);
+            CREATE INDEX IF NOT EXISTS intake_source_paths ON inputs(source_path);
             CREATE TABLE IF NOT EXISTS receipts(
                 receipt_id TEXT PRIMARY KEY, published_at TEXT NOT NULL, result TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS failures(
@@ -307,27 +325,117 @@ class Intake:
         for item in selected:
             if clock() - started >= getattr(policy, f"{self.lane}_turn_seconds"):
                 break
-            try:
-                snapshot = capture(
-                    replace(
-                        config,
-                        family=item.family,
-                        stable_wait_seconds=policy.stable_wait_seconds,
-                        capture_attempts=policy.capture_attempts,
-                        max_file_bytes=policy.max_file_bytes,
-                    ),
-                    item.origin,
-                    item.path,
-                    item.producer_time,
-                )
-                before = self.db.total_changes
-                self.remember(item.family, snapshot)
-                counts["captured" if self.db.total_changes > before else "unchanged"] += 1
-            except (OSError, CaptureError, IntegrityError) as exc:
-                self.failure(item.path, str(exc))
-                counts["failed"] += 1
+            self._capture_item(config, policy, item, counts)
             self.set("cursor", canonical(item.order))
         return counts
+
+    def _capture_item(self, config, policy, item, counts, *, previous=None):
+        try:
+            options = {"known": {(item.origin, previous.sha256): previous}} if previous else {}
+            snapshot = capture(
+                replace(
+                    config,
+                    family=item.family,
+                    stable_wait_seconds=policy.stable_wait_seconds,
+                    capture_attempts=policy.capture_attempts,
+                    max_file_bytes=policy.max_file_bytes,
+                ),
+                item.origin,
+                item.path,
+                item.producer_time,
+                **options,
+            )
+            before = self.db.total_changes
+            if previous is None or snapshot.sha256 != previous.sha256:
+                self.remember(item.family, snapshot)
+            counts["captured" if self.db.total_changes > before else "unchanged"] += 1
+        except (OSError, CaptureError, IntegrityError) as exc:
+            self.failure(item.path, str(exc))
+            counts["failed"] += 1
+
+    def capture_live(self, config, policy, candidates, *, window, clock=time.monotonic):
+        if self.lane != "live":
+            raise IntegrityError("Only live can prioritize new Fenix blocks")
+        started = clock()
+        paths = canonical([str(c.path) for c in candidates])
+        known = dict(
+            self.db.execute(
+                """
+            SELECT candidate.value, (
+                SELECT descriptor FROM inputs WHERE source_path=candidate.value
+                ORDER BY rowid DESC LIMIT 1
+            ) FROM json_each(?) AS candidate
+        """,
+                (paths,),
+            )
+        )
+        tiers = {"current": [], "unseen": [], "audit": []}
+        for item in candidates:
+            if known[str(item.path)] is not None:
+                if not item.audit:
+                    continue
+                tier = "audit"
+            elif not item.producer_time or "T" not in item.producer_time:
+                tier = "unseen"
+            else:
+                tier = "current" if window and window.contains(item.clock) else "unseen"
+            tiers[tier].append(item)
+        counts = {
+            "captured": 0,
+            "failed": 0,
+            "unchanged": 0,
+            "lane": "live",
+            "current_unseen": len(tiers["current"]),
+            "audited": 0,
+        }
+        cursors = json.loads(self.setting("live_capture_cursors") or "{}")
+        last, attempts = None, 0
+        for tier, items in tiers.items():
+            cursor = cursors.setdefault(tier, {})
+            audit = tier == "audit"
+            for item in balanced_candidates(items, cursor, one_per_origin=audit):
+                if (
+                    attempts >= policy.live_batch_files
+                    or clock() - started >= policy.live_turn_seconds
+                ):
+                    break
+                prior = known[str(item.path)]
+                self._capture_item(
+                    config,
+                    policy,
+                    item,
+                    counts,
+                    previous=Snapshot(**json.loads(prior)) if prior else None,
+                )
+                if audit:
+                    counts["audited"] += 1
+                attempts += 1
+                last = item.order
+                cursor.setdefault("after", {})[item.origin] = item.path.name
+                cursor["origin"] = item.origin
+        if last is not None:
+            self.set("live_capture_cursors", canonical(cursors))
+            self.set("cursor", canonical(last))
+        return counts
+
+
+def balanced_candidates(items, cursor, *, one_per_origin=False):
+    """Rotate origins and their own filename cursors independently."""
+    grouped = defaultdict(list)
+    for item in sorted(items, key=lambda c: c.order):
+        grouped[item.origin].append(item)
+    last = cursor.get("origin", "")
+    lanes = deque(sorted(grouped, key=lambda origin: (origin <= last, origin)))
+    queues = {}
+    for origin, candidates in grouped.items():
+        after = cursor.get("after", {}).get(origin, "")
+        queues[origin] = deque(sorted(candidates, key=lambda c: c.path.name <= after))
+    while lanes:
+        origin = lanes.popleft()
+        queue = queues[origin]
+        yield queue.popleft()
+        if queue and not one_per_origin:
+            lanes.append(origin)
 
 
 def selected_snapshots(config):

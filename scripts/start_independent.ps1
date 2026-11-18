@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Image,
     [Parameter(Mandatory = $true)][string]$Bundle,
     [Parameter(Mandatory = $true)][string]$Revision,
-    [Parameter(Mandatory = $true)][string]$GoldRevision
+    [Parameter(Mandatory = $true)][string]$GoldRevision,
+    [switch]$LiveOnly
 )
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
@@ -55,6 +56,16 @@ if ($configBind.Contains(',') -or $oldSite.input_bind.Contains(',')) { throw 'Ru
 $profile.image = $Image
 $profile.configuration_bind = $configBind
 $profile.input_bind = $oldSite.input_bind
+$previousCompose = $null
+if ($LiveOnly) {
+    $running = @(Invoke-Docker ps --filter "label=com.docker.compose.project=$($profile.project)" `
+        --filter 'label=com.docker.compose.service=ingesta-live' --format '{{.ID}}')
+    if ($running.Count -ne 1) { throw 'Se esperaba un único contenedor live en ejecución.' }
+    $location = (Invoke-Docker inspect $running[0] --format '{{json .Config.Labels}}') | ConvertFrom-Json
+    $previousFile = $location.'com.docker.compose.project.config_files'
+    if (-not (Test-Path -LiteralPath $previousFile -PathType Leaf)) { throw 'No se encuentra el Compose activo.' }
+    $previousCompose = [IO.File]::ReadAllText($previousFile)
+}
 $profile.forbidden_volumes = @($profile.forbidden_volumes) + @(
     $oldSite.environments.main.volume, $oldSite.environments.develop.volume
 )
@@ -161,6 +172,32 @@ foreach ($service in $compose.services.PSObject.Properties) {
 }
 Write-Config 'compose.json' ($compose | ConvertTo-Json -Depth 30)
 Invoke-Docker compose -f $composeFile config --quiet
-Invoke-Docker compose -f $composeFile up -d --pull never --no-build
+if ($LiveOnly) {
+    $activeStack = $previousCompose | ConvertFrom-Json
+    $liveVolumes = @($compose.services.'ingesta-live'.volumes | Where-Object { $_.type -eq 'volume' })
+    foreach ($mount in $liveVolumes) {
+        $currentVolume = $activeStack.volumes.($mount.source)
+        if (-not $currentVolume -or $currentVolume.name -cne $compose.volumes.($mount.source).name -or
+            $currentVolume.name -notin $present) {
+            throw "El volumen activo de live ha cambiado o falta: $($mount.source)."
+        }
+    }
+    $activeStack.services.'ingesta-live' = $compose.services.'ingesta-live'
+    Write-Config 'compose.json' ($activeStack | ConvertTo-Json -Depth 30)
+    Write-Config 'compose.rollback.json' $previousCompose
+    Invoke-Docker compose -f $composeFile config --quiet
+    $timeout = [int]$oldSite.drain_seconds
+    try {
+        Invoke-Docker compose -f $composeFile up -d --no-deps --no-build --pull never `
+            --timeout $timeout --wait --wait-timeout 325 ingesta-live
+    } catch {
+        $rollback = Join-Path $configDirectory 'compose.rollback.json'
+        Invoke-Docker compose -f $rollback up -d --no-deps --no-build --pull never `
+            --timeout $timeout ingesta-live
+        throw
+    }
+} else {
+    Invoke-Docker compose -f $composeFile up -d --pull never --no-build
+}
 Invoke-Docker compose -f $composeFile ps --all
 Write-Output "Compose: $composeFile"
