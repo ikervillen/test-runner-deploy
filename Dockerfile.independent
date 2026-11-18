@@ -1,0 +1,29 @@
+FROM python:3.12.14-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e AS build
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
+RUN python -m pip install --no-cache-dir uv==0.11.6
+WORKDIR /opt/quality
+COPY --from=quality pyproject.toml uv.lock ./
+RUN uv sync --locked --no-dev --extra gold --python /usr/local/bin/python
+WORKDIR /opt/ingesta
+COPY pyproject.toml uv.lock ./
+COPY src ./src
+# Gold and ingestion share pinned Delta/Arrow contracts; Gold's lock includes tzdata.
+RUN uv pip install --python /opt/venv/bin/python --no-deps .
+
+FROM python:3.12.14-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
+ARG REVISION
+ARG GOLD_REVISION
+LABEL org.opencontainers.image.revision=$REVISION es.fenix.ingesta.gold.revision=$GOLD_REVISION
+ENV PATH=/opt/venv/bin:$PATH PYTHONPATH=/opt/quality/backend:/opt/app PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+WORKDIR /opt/app
+COPY --from=build /opt/venv /opt/venv
+COPY --from=quality backend /opt/quality/backend
+COPY --from=quality config /opt/quality/config
+COPY deployment ./deployment
+RUN groupadd --gid 10001 ingesta && useradd --uid 10001 --gid 10001 --no-create-home ingesta \
+    && test -n "$GOLD_REVISION" \
+    && python -c "from app.gold.independent_runtime import Worker; from ingesta_delta_lake.pipeline_runtime import PipelineWorker"
+USER 10001:10001
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["python", "-m", "ingesta_delta_lake.pipeline_runtime"]
+CMD ["--help"]

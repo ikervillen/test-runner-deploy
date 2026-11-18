@@ -1,0 +1,10 @@
+**
+!Dockerfile.independent
+!pyproject.toml
+!uv.lock
+!src/
+!src/**
+!deployment/
+!deployment/**
+**/__pycache__/
+**/*.pyc
