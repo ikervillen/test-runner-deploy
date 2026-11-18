@@ -24,7 +24,7 @@ from .common import (
 from .defects_storage import DefectsStore
 from .mia_scope import files, group_holds, scope_for
 from .service import _apply
-from .sources import discover, input_scan, orphan_captures, stable_capture
+from .sources import available_captures, discover, input_scan, orphan_captures, stable_capture
 
 MAX_FILE_BYTES = 8 * 1024 * 1024
 POLICY = "bounded-context-v2"
@@ -86,29 +86,26 @@ def process(
     snapshots, verified = [], set()
     with input_scan(config, control) as due:
         if due:
-            for origin, path, stamp in discover(config):
-                snapshot = stable_capture(
-                    replace(
-                        config,
-                        max_file_bytes=config.max_file_bytes
-                        if control.compact
-                        else min(config.max_file_bytes, MAX_FILE_BYTES),
-                    ),
-                    origin,
-                    path,
-                    stamp,
-                    known=captured,
-                    verified=verified,
-                )
-                if snapshot is None:
-                    continue
+            for snapshot in available_captures(
+                replace(
+                    config,
+                    max_file_bytes=config.max_file_bytes
+                    if control.compact
+                    else min(config.max_file_bytes, MAX_FILE_BYTES),
+                ),
+                known=captured,
+                verified=verified,
+                discoverer=discover,
+                capturer=stable_capture,
+            ):
                 # Durable as soon as captured: a later capture error cannot lose this input.
                 control.receipts(attempt, [snapshot])
                 snapshots.append(snapshot)
                 captured.setdefault((snapshot.origin, snapshot.sha256), snapshot)
-            for snapshot in orphan_captures(config, captured):
-                control.receipts(attempt, [snapshot])
-                captured[(snapshot.origin, snapshot.sha256)] = snapshot
+            if config.intake_path is None:
+                for snapshot in orphan_captures(config, captured):
+                    control.receipts(attempt, [snapshot])
+                    captured[(snapshot.origin, snapshot.sha256)] = snapshot
     consumed = control.consumed_inputs()
     parents = set()
     if control.compact:
@@ -138,7 +135,9 @@ def process(
     wrote = recovery_count > 0
     stopped = False
     # One clock window for every line. An older file on one line is backlog.
-    window, origins = shared_bronze_window(config.control_root)
+    window, origins = shared_bronze_window(
+        config.control_root, selected_window=config.processing_window
+    )
     if window is None:
         live, backlog, bronze_now = [], list(pending), {}
     else:
@@ -147,7 +146,7 @@ def process(
         )
     if lane != "history" and not live:
         control.set_live_slot(bronze_now)
-    if lane == "history" and history_yields():
+    if lane == "history" and config.intake_path is None and history_yields():
         remaining = list(backlog)
         return {
             "status": "BACKLOG_PENDING" if remaining else "NO_INPUTS",
@@ -176,7 +175,7 @@ def process(
         for batch in selected:
             if result is not None and (
                 (stop_requested is not None and stop_requested())
-                or (lane == "history" and history_yields())
+                or (lane == "history" and config.intake_path is None and history_yields())
             ):
                 stopped = True
                 break
@@ -267,9 +266,11 @@ def process_batch(
     scope = scope_for(parsed, model)
     store.set_scope(scope)
     before_files = files(store.table())
-    published_rows = sum(row[2] for row in before_files)
+    from .pipeline_retired import logical_rows
+
+    published_rows = logical_rows(control, store.table())
     control.ensure_inspection_index(
-        store.table().version() if before_files else None, published_rows
+        store.table().version() if store.table() is not None else None, published_rows
     )
     version, existing = store.read()
     if control.setting("last_version") not in (None, str(version)):

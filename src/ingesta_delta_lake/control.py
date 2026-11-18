@@ -356,6 +356,8 @@ class Control:
 
     def prepare_compact(self, batch_id, operation_id, prepared):
         """Shared pending protocol; subclasses retain their confirmation semantics."""
+        if self.config.archive_context is not None:
+            prepared["archive_context"] = self.config.archive_context
         if not self.compact:
             return False
         from .compact_control import publish

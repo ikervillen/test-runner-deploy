@@ -12,7 +12,7 @@ from deltalake.transaction import CommitProperties
 
 from . import __version__
 from . import lista_ar as ar
-from .commit_protocol import application_transaction
+from .commit_protocol import application_transaction, delta_configuration, merge_counts_match
 from .common import IntegrityError, canonical, digest
 from .delta import DeltaStore
 
@@ -79,7 +79,7 @@ def load_references(config):
 
 class ArStore(DeltaStore):
     def read(self, table=None):
-        table = table if table is not None else self.table()
+        table = self.read_view(table if table is not None else self.table())
         if table is None:
             return None, {}
         arrow = table.to_pyarrow_table()
@@ -151,7 +151,13 @@ class ArStore(DeltaStore):
             max_commit_retries=0,
         )
         if table is None:
-            write_deltalake(str(self.path), arrow, mode="error", commit_properties=props)
+            write_deltalake(
+                str(self.path),
+                arrow,
+                mode="error",
+                configuration=delta_configuration(self.config),
+                commit_properties=props,
+            )
         else:
             parts = []
             for f in ("origen_fenix", *ar.KEY_FIELDS):
@@ -176,9 +182,5 @@ class ArStore(DeltaStore):
                 .when_not_matched_insert_all()
                 .execute()
             )
-            if (
-                metrics["num_target_rows_inserted"] != len(inserts)
-                or metrics["num_target_rows_updated"] != len(updates)
-                or metrics["num_target_rows_deleted"] != 0
-            ):
+            if not merge_counts_match(metrics, inserts, updates, self.config):
                 raise IntegrityError("MERGE AR distinto de las intenciones")

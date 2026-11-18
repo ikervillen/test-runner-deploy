@@ -5,7 +5,7 @@ from deltalake import DeltaTable, write_deltalake
 from deltalake.transaction import CommitProperties
 
 from . import __version__
-from .commit_protocol import application_transaction
+from .commit_protocol import application_transaction, delta_configuration
 from .common import IntegrityError
 from .config import Config
 from .contracts import MODEL_SCHEMA
@@ -15,10 +15,19 @@ SCHEMA = MODEL_SCHEMA  # Compatibilidad pública de la primera entrega.
 
 class DeltaStore:
     def __init__(self, config: Config, control_id: str):
+        self.config = config
+        self.read_context = config.archive_context
         self.path = config.table_path
         self.plant = config.plant
         self.control_id = control_id
         self.contract = config.contract
+
+    def read_view(self, table):
+        if self.read_context is None:
+            return table
+        from .pipeline_read import AcceptedRead
+
+        return table if isinstance(table, AcceptedRead) else AcceptedRead(self, table)
 
     def table(self) -> DeltaTable | None:
         if not DeltaTable.is_deltatable(str(self.path)):
@@ -28,6 +37,11 @@ class DeltaStore:
                 raise IntegrityError("El destino contiene archivos sin una tabla Delta reconocible")
             return None
         table = DeltaTable(str(self.path))
+        if self.config.change_data_feed and (
+            table.metadata().configuration.get("delta.enableChangeDataFeed") != "true"
+            or table.metadata().configuration.get("delta.enableExpiredLogCleanup") != "false"
+        ):
+            raise IntegrityError("Independent storage requires retained CDF; migrate explicitly")
         history = table.history()
         if not history or any(
             h.get("ingesta_control_id") != self.control_id
@@ -41,7 +55,7 @@ class DeltaStore:
         return table
 
     def read(self, table: DeltaTable | None = None) -> tuple[int | None, dict]:
-        table = table if table is not None else self.table()
+        table = self.read_view(table if table is not None else self.table())
         if table is None:
             return None, {}
         arrow = table.to_pyarrow_table()
@@ -73,6 +87,7 @@ class DeltaStore:
             table if table else str(self.path),
             arrow,
             mode="append" if table else "error",
+            configuration=delta_configuration(self.config),
             commit_properties=CommitProperties(
                 custom_metadata={
                     "ingesta_operation_id": operation_id,

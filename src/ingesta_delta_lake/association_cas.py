@@ -20,6 +20,15 @@ MIN_BLOCK = 32 * 1024
 MAX_BLOCK = 256 * 1024
 
 
+def root_for(config):
+    publication = getattr(config, "publication_root", None)
+    return (
+        publication / "artifacts" / "association-artifacts"
+        if publication
+        else config.control_root / "association-artifacts"
+    )
+
+
 def sync(path):
     if os.name != "nt":
         fd = os.open(path, os.O_RDONLY)
@@ -140,7 +149,7 @@ def write(root, parts, *, verified=None):
 
 def resolve(config, descriptor):
     """Legacy descriptors survive conversion, including archived batch receipts."""
-    root = config.control_root / "association-artifacts"
+    root = root_for(config)
     if descriptor.get("format") == FORMAT:
         return descriptor
     sha = descriptor["sha256"]
@@ -161,7 +170,7 @@ def resolve(config, descriptor):
 
 
 def manifest(config, descriptor):
-    root = config.control_root / "association-artifacts"
+    root = root_for(config)
     path = Path(descriptor["path"])
     if path.is_symlink() or not path.resolve().is_relative_to(root.resolve()):
         raise IntegrityError("Association manifest escapes its root")
@@ -193,7 +202,7 @@ def verify_shared(config, descriptor, verified):
     The conversion separately checks the complete source payload hash while it
     builds this immutable manifest. No historical data is deserialized here.
     """
-    root = config.control_root / "association-artifacts"
+    root = root_for(config)
     document = manifest(config, descriptor)
     size = 0
     for sha in document["chunks"]:
@@ -205,7 +214,7 @@ def verify_shared(config, descriptor, verified):
 
 
 def read_blocks(config, descriptor):
-    root = config.control_root / "association-artifacts"
+    root = root_for(config)
     document = manifest(config, descriptor)
     payload, size = hashlib.sha256(), 0
     for sha in document["chunks"]:

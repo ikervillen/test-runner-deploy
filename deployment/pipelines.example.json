@@ -1,0 +1,42 @@
+{
+  "schema_id": "fenix-independent-pipelines-v1",
+  "policy": {
+    "timezone": "Europe/Madrid",
+    "window_seconds": 600,
+    "retention_seconds": 28800,
+    "live_retry_period_seconds": 3600,
+    "history_review_retry_seconds": 3600,
+    "latency_seconds": 300,
+    "poll_seconds": 5,
+    "live_batch_files": 32,
+    "live_turn_seconds": 5,
+    "history_batch_files": 32,
+    "history_turn_seconds": 5,
+    "live_workers": 2,
+    "history_workers": 1,
+    "arrow_threads": 1,
+    "stable_wait_seconds": 0.2,
+    "capture_attempts": 3,
+    "max_file_bytes": 67108864,
+    "archive_batch_rows": 1000,
+    "archive_publications_per_turn": 256,
+    "read_batch_rows": 8192,
+    "read_max_rows": 1000000
+  },
+  "live": {
+    "bronze": "/pipelines/live/bronze",
+    "silver": "/pipelines/live/silver",
+    "gold": "/pipelines/live/gold",
+    "control": "/pipelines/live/control",
+    "checkpoint": "/pipelines/live/checkpoint",
+    "exchange": "/pipelines/live/exchange"
+  },
+  "history": {
+    "bronze": "/pipelines/history/bronze",
+    "silver": "/pipelines/history/silver",
+    "gold": "/pipelines/history/gold",
+    "control": "/pipelines/history/control",
+    "checkpoint": "/pipelines/history/checkpoint",
+    "exchange": "/pipelines/history/exchange"
+  }
+}

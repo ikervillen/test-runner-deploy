@@ -15,7 +15,7 @@ from deltalake import write_deltalake
 from deltalake.transaction import CommitProperties
 
 from . import __version__
-from .commit_protocol import application_transaction
+from .commit_protocol import application_transaction, delta_configuration
 from .common import IntegrityError, canonical, digest, now
 from .review_adapters import ADMISSION_VERSION, ADMIT, KEEP, REPLACE, adapter, contextual_offers
 
@@ -130,9 +130,9 @@ def _plan(config, control, command):
     if (control.setting("last_version") or "None") != str(version):
         raise IntegrityError("Review destination is not confirmed")
     if scope and version is not None:
-        from .mia_scope import files
+        from .pipeline_retired import logical_rows
 
-        control.ensure_inspection_index(version, sum(row[2] for row in files(a.store.table())))
+        control.ensure_inspection_index(version, logical_rows(control, a.store.table()))
     rows = a.rows(existing)
     if rows.get(a.key(target)) != old:
         raise IntegrityError("Accepted value changed since the evidence was captured")
@@ -177,6 +177,7 @@ def _plan(config, control, command):
             close.append(row[0])
     return {
         "before_version": version,
+        "archive_context": config.archive_context,
         "scope": scope,
         "old": old,
         "candidate": candidate,
@@ -189,6 +190,7 @@ def _plan(config, control, command):
 
 def _execute(config, control, command, plan):
     a = adapter(config, control.control_id)
+    a.store.read_context = plan.get("archive_context")
     if plan["scope"]:
         a.store.set_scope(plan["scope"])
     operation = digest(["review-v1", control.control_id, command["decision_id"]])
@@ -242,6 +244,7 @@ def _execute(config, control, command, plan):
                     "ingesta_release": __version__,
                     "ingesta_timestamp_policy": config.timestamp_policy,
                     "ingesta_review_decision": command["decision_id"],
+                    "ingesta_review_rejected_hashes": canonical(plan["reject"]),
                 },
                 app_transactions=application_transaction(
                     control.control_id, plan["before_version"]
@@ -257,20 +260,18 @@ def _execute(config, control, command, plan):
                     commit_properties=props,
                 )
             elif replacing:
-                metrics = (
-                    table.merge(
-                        arrow,
-                        predicate,
-                        source_alias="s",
-                        target_alias="t",
-                        commit_properties=props,
-                    )
-                    .when_matched_update({f: f"s.`{f}`" for f in fields})
-                    .execute()
-                )
+                merger = table.merge(
+                    arrow,
+                    predicate,
+                    source_alias="s",
+                    target_alias="t",
+                    commit_properties=props,
+                ).when_matched_update({f: f"s.`{f}`" for f in fields})
+                if plan.get("archive_context"):
+                    merger = merger.when_not_matched_insert({f: f"s.`{f}`" for f in fields})
+                metrics = merger.execute()
                 if (
-                    metrics["num_target_rows_updated"] != 1
-                    or metrics["num_target_rows_inserted"]
+                    metrics["num_target_rows_updated"] + metrics["num_target_rows_inserted"] != 1
                     or metrics["num_target_rows_deleted"]
                 ):
                     raise IntegrityError("Review did not update exactly one homologous row")
@@ -279,6 +280,7 @@ def _execute(config, control, command, plan):
                     table if table else str(a.store.path),
                     arrow,
                     mode="append" if table else "error",
+                    configuration=delta_configuration(config),
                     commit_properties=props,
                 )
             table = a.store.table()
@@ -350,6 +352,9 @@ def _execute(config, control, command, plan):
             "UPDATE issues SET status='RESOLVED' WHERE issue_id=?", [(i,) for i in plan["close"]]
         )
         if plan["scope"]:
+            from .pipeline_retired import synchronize
+
+            synchronize(control, a.store.table())
             control.db.executemany(
                 "DELETE FROM inspection_current WHERE group_id=?",
                 [(g,) for g in plan.get("removed_group_ids", [])],
@@ -505,3 +510,21 @@ def process(config, control):
             atomic(result_path, result)
             result_path.with_suffix(".progress.json").unlink(missing_ok=True)
         processed += 1
+
+
+def pending_families(families):
+    """Discover command names only; the owner validates commands under its writer lock."""
+    configured = os.environ.get("INGESTA_REVIEW_ROOT")
+    if not configured:
+        return set()
+    root, pending = Path(configured), set()
+    for family in families:
+        for path in (root / "commands" / family).glob("*.json"):
+            try:
+                identifier = str(uuid.UUID(path.stem))
+            except ValueError:
+                continue
+            if not (root / "results" / family / (identifier + ".json")).exists():
+                pending.add(family)
+                break
+    return pending

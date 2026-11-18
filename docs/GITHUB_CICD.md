@@ -1,5 +1,10 @@
 # GitHub Actions y Docker en Windows/WSL2
 
+**Documento histórico del despliegue anterior.** Para la candidata de `develop`,
+consulta la [guía de los procesos independientes](OPERACION_PIPELINES_INDEPENDIENTES.md).
+Los pasos de activación y mantenimiento descritos aquí ya no se ofrecen desde
+los workflows de la candidata.
+
 Repositorio: `ikervillen/test-runner-deploy`. Runner comprobado: `servidor-prueba`,
 etiquetas `self-hosted`, `Windows`, `X64`. La antigua prueba de Nginx se sustituye por
 `.github/workflows/deploy.yml`; se elimina su `docker-compose.yml`. Eliminar esos archivos

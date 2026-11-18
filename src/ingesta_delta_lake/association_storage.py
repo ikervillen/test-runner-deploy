@@ -17,7 +17,7 @@ from . import __version__, topology
 from . import associations as a
 from .ar_storage import ArStore
 from .catalog_storage import CatalogStore
-from .commit_protocol import application_transaction
+from .commit_protocol import application_transaction, delta_configuration, merge_counts_match
 from .common import IntegrityError, canonical, digest, now
 from .control import Control
 from .defects_storage import DefectsStore
@@ -75,13 +75,9 @@ def source_snapshot(config, family, read=True, *, expected=None):
         version = table.version() if table is not None else None
         if settings.get("last_version", "None") != str(version):
             raise IntegrityError("Fuente sin confirmación")
-        cases = [
-            {"issue_id": r[0], "reason": r[1], "status": r[2], "payload": json.loads(r[3])}
-            for r in db.execute(
-                "SELECT issue_id,reason,status,payload_json FROM issues "
-                "WHERE status!='RESOLVED' ORDER BY issue_id"
-            )
-        ]
+        from .pipeline_control import confirmed_control
+
+        cases, meta, extra = confirmed_control(cfg, db, settings, version, expected=expected)
         if expected is not None:
             if expected["control_id"] != settings["control_id"] or expected[
                 "quality_hash"
@@ -116,44 +112,7 @@ def source_snapshot(config, family, read=True, *, expected=None):
             else:
                 rows = list(data.values())
 
-        def _mark(name):
-            try:
-                value = json.loads(settings[name]) if settings.get(name) else {}
-            except json.JSONDecodeError:
-                return {}
-            return value if isinstance(value, dict) else {}
-
-        meta = {
-            "family": family,
-            "contract": cfg.contract.name,
-            "version": version,
-            "control_id": settings["control_id"],
-            "quality_hash": digest(cases),
-            "observed_until": _mark("observed_until"),
-            "live_until": _mark("live_until"),
-        }
-        extra = {}
-        if family == "CATALOGO_PRODUCCIONES":
-            query = "SELECT batch_id,source_manifest_json,diagnostics_json FROM publications "
-            pinned = expected.get("publication_id") if expected else None
-            publication = db.execute(
-                query + ("WHERE batch_id=?" if pinned else "ORDER BY publication_no DESC LIMIT 1"),
-                (pinned,) if pinned else (),
-            ).fetchone()
-            if publication is None:
-                raise IntegrityError("Construir el catálogo antes de asociar")
-            meta["publication_id"] = publication[0]
-            extra = {
-                "manifest": json.loads(publication[1]),
-                "diagnostics": json.loads(publication[2]),
-                "composition": {
-                    r[0]: json.loads(r[1])
-                    for r in db.execute(
-                        "SELECT production_id,observation_json FROM composition WHERE batch_id=?",
-                        (publication[0],),
-                    )
-                },
-            }
+        meta["version"] = version
     return rows, cases, meta, extra
 
 
@@ -210,9 +169,9 @@ def load_bundle(config, *, physical=False, manifest=None):
 
 
 def artifact(config, payload):
-    from .association_cas import encoded, write
+    from .association_cas import encoded, root_for, write
 
-    return write(config.control_root / "association-artifacts", encoded(payload))
+    return write(root_for(config), encoded(payload))
 
 
 def verify_artifact(config, descriptor):
@@ -351,7 +310,7 @@ class AssociationControl(Control):
 
 class AssociationStore(DeltaStore):
     def read(self, table=None):
-        table = table if table is not None else self.table()
+        table = self.read_view(table if table is not None else self.table())
         if table is None:
             return None, {}
         arrow = table.to_pyarrow_table()
@@ -435,7 +394,13 @@ class AssociationStore(DeltaStore):
             max_commit_retries=0,
         )
         if table is None:
-            write_deltalake(str(self.path), arrow, mode="error", commit_properties=props)
+            write_deltalake(
+                str(self.path),
+                arrow,
+                mode="error",
+                configuration=delta_configuration(self.config),
+                commit_properties=props,
+            )
         else:
             m = (
                 table.merge(
@@ -449,9 +414,5 @@ class AssociationStore(DeltaStore):
                 .when_not_matched_insert_all()
                 .execute()
             )
-            if (
-                m["num_target_rows_inserted"] != len(inserts)
-                or m["num_target_rows_updated"] != len(updates)
-                or m["num_target_rows_deleted"]
-            ):
+            if not merge_counts_match(m, inserts, updates, self.config):
                 raise IntegrityError("MERGE distinto de las decisiones")

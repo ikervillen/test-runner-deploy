@@ -12,7 +12,7 @@ from deltalake.transaction import CommitProperties
 
 from . import __version__
 from . import topology as t
-from .commit_protocol import application_transaction
+from .commit_protocol import application_transaction, delta_configuration, merge_counts_match
 from .common import IntegrityError, canonical, digest, now
 from .control import Control
 from .delta import DeltaStore
@@ -113,7 +113,7 @@ class TopologyStore(DeltaStore):
         self.family = config.family
 
     def read(self, table=None):
-        table = table if table is not None else self.table()
+        table = self.read_view(table if table is not None else self.table())
         if table is None:
             return None, {}
         arrow = table.to_pyarrow_table()
@@ -188,7 +188,13 @@ class TopologyStore(DeltaStore):
             max_commit_retries=0,
         )
         if table is None:
-            write_deltalake(str(self.path), arrow, mode="error", commit_properties=props)
+            write_deltalake(
+                str(self.path),
+                arrow,
+                mode="error",
+                configuration=delta_configuration(self.config),
+                commit_properties=props,
+            )
         else:
             keys = (
                 ["id_maquina_fenix", "vigente_desde"]
@@ -210,11 +216,7 @@ class TopologyStore(DeltaStore):
                 .when_not_matched_insert_all()
                 .execute()
             )
-            if (
-                metrics["num_target_rows_inserted"] != len(inserts)
-                or metrics["num_target_rows_updated"] != len(updates)
-                or metrics["num_target_rows_deleted"]
-            ):
+            if not merge_counts_match(metrics, inserts, updates, self.config):
                 raise IntegrityError("MERGE de topología distinto de lo preparado")
 
 

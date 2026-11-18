@@ -40,7 +40,16 @@ def _check_evidence(config: Config, prepared: dict) -> None:
 def _apply(
     config: Config, control: Control, store: DeltaStore, batch: dict
 ) -> tuple[int | None, bool]:
+    previous_context = store.read_context
+    try:
+        return _apply_pinned(config, control, store, batch)
+    finally:
+        store.read_context = previous_context
+
+
+def _apply_pinned(config, control, store, batch):
     prepared = control.prepared(batch)
+    store.read_context = prepared.get("archive_context")
     scoped = "read_scope" in prepared
     if scoped:
         if config.family not in {"LISTA_RECH", "LISTA_DEFECTOS"}:
@@ -272,17 +281,7 @@ def _process(
     }
 
 
-def run(
-    config: Config,
-    *,
-    runtime_owner: bool = False,
-    stop_requested=None,
-    reviews_only=False,
-    lane="all",
-) -> dict:
-    config.validate()
-    for path in (config.bronze_root, config.silver_root, config.control_root):
-        path.mkdir(parents=True, exist_ok=True)
+def control_type(config):
     control_class = Control
     if config.family in {"SIP_MAQUINA_MOLDEO", "SIP_LINEA_ZF"}:
         from .topology_storage import TopologyControl
@@ -316,6 +315,21 @@ def run(
         from .defects_control import DefectsControl
 
         control_class = DefectsControl
+    return control_class
+
+
+def run(
+    config: Config,
+    *,
+    runtime_owner: bool = False,
+    stop_requested=None,
+    reviews_only=False,
+    lane="all",
+) -> dict:
+    config.validate()
+    for path in (config.bronze_root, config.silver_root, config.control_root):
+        path.mkdir(parents=True, exist_ok=True)
+    control_class = control_type(config)
     # El bloqueo sigue al destino Silver, no a un nombre de fichero de entrada.
     # Dos configuraciones con controles distintos tampoco pueden escribir a la vez.
     try:
@@ -335,6 +349,9 @@ def run(
                 )
             )
             with closing(control_class(config)) as control:
+                from .pipeline_retirement import recover
+
+                recover(config, control)
                 from . import retry_control
 
                 if reviews_only:
@@ -348,7 +365,7 @@ def run(
                         result = {"status": "REVIEWS_CHECKED", "attempted": False}
                     export(control, config, result, force=True)
                     return result
-                if control.compact and runtime_owner:
+                if control.compact and runtime_owner and not config.scheduled_lot_attempt:
                     waiting = retry_control.ready(control)
                     if waiting:
                         from .supervision_export import export

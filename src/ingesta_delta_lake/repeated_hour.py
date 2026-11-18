@@ -184,6 +184,7 @@ def _replace(config, control, a, origin, winners):
     )
     plan = {
         "before_version": version,
+        "archive_context": config.archive_context,
         "scope": scope,
         "old": old,
         "candidate": candidate,
@@ -298,9 +299,9 @@ def process(config, control, result):
     complete = pending == 0 and not result.get("remaining_versions", 0)
     if config.family in {"LISTA_RECH", "LISTA_DEFECTOS"}:
         complete = complete and control.inspection_summary()["unresolved_groups"] == 0
-        from .mia_scope import files
+        from .pipeline_retired import logical_rows
 
-        result = {**result, "published_rows": sum(f[2] for f in files(a.store.table()))}
+        result = {**result, "published_rows": logical_rows(control, a.store.table())}
     return {
         **result,
         "delta_version": int(control.setting("last_version")),
