@@ -74,3 +74,17 @@ def test_auxiliary_timestamp_contract():
     assert _iso("2026-11-01T06:10:00") == datetime(2026, 11, 1, 6, 10)
     with pytest.raises(IntegrityError, match="timestamp"):
         _time("2026-11-01")
+
+
+def test_verified_bronze_bytes_reuse_auxiliary_rules_without_discovering_fenix(tmp_path):
+    first = auxiliary(
+        tmp_path, (), captures=[("AV21", "MP9_PARAM_MODELO", b"1;9;01/11/2026;NULL;8;0;0;0;0;\n")]
+    )
+    second = auxiliary(
+        tmp_path,
+        (),
+        captures=[("AV21", "MP9_PARAM_MODELO", b"1;9;01/11/2026;02/11/2026;8;0;0;0;0;\n")],
+        initial={name: table.to_pylist() for name, table in first.items()},
+    )
+    assert second["production_parameters"].to_pylist()[0]["fecha_off"] == datetime(2026, 11, 2)
+    assert not list(tmp_path.rglob("*.csv"))

@@ -13,7 +13,6 @@ from contextlib import closing
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import pyarrow as pa
 from deltalake import CommitProperties, DeltaTable, write_deltalake
@@ -48,100 +47,118 @@ def _time(value):
     raise IntegrityError("Unsupported auxiliary Fenix timestamp")
 
 
-def auxiliary(root: Path, sources: tuple[tuple[str, Path], ...]) -> dict[str, pa.Table]:
-    """Minimal approved extra fields, captured once, with contradictions rejected.
-
-    This local replay producer does not register these sources in the running
-    server worker. That integration belongs to the later server validation step.
-    """
-    # Keys differ per family (tuples or scalars) and identify one auxiliary record.
-    parameters: dict[Any, dict] = {}
-    drops: dict[Any, dict] = {}
-    machines: dict[Any, dict] = {}
-    hot: dict[Any, dict] = {}
-    maps = {
-        "MP9_PARAM_MODELO": parameters,
-        "SIP_NUMERO_GOTAS_SIMULTANEAS": drops,
-        "SIP_MAQUINA_MOLDEO": machines,
-        "MP9_LISTA_RECH_ZC": hot,
-    }
+def auxiliary_captures(root, sources):
     for origin, directory in sources:
-        for family, accepted in maps.items():
+        for family in (
+            "MP9_PARAM_MODELO",
+            "SIP_NUMERO_GOTAS_SIMULTANEAS",
+            "SIP_MAQUINA_MOLDEO",
+            "MP9_LISTA_RECH_ZC",
+        ):
             for path in sorted(directory.glob(f"*_{family}.csv")):
                 before = path.read_bytes()
                 target = (
-                    root / "bronze-extensions" / origin / family / f"{digest(before.hex())}.csv"
+                    root / "bronze-extensions" / origin / family / (digest(before.hex()) + ".csv")
                 )
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if not target.exists():
                     target.write_bytes(before)
                 if target.read_bytes() != before or path.read_bytes() != before:
                     raise IntegrityError("Auxiliary source changed during stable capture")
-                for raw in csv.reader(io.StringIO(before.decode("cp1252")), delimiter=";"):
-                    if not raw or not any(raw):
-                        continue
-                    if raw[-1] == "":
-                        raw = raw[:-1]
-                    if family == "MP9_PARAM_MODELO":
-                        if len(raw) != 9:
-                            raise IntegrityError("Unexpected production parameter schema")
-                        row = {
-                            "origen_fenix": origin,
-                            "id": int(raw[0]),
-                            "id_cambio_modelo": int(raw[1]),
-                            "fecha_on": _time(raw[2]),
-                            "fecha_off": _time(raw[3]),
-                            "num_secciones": int(raw[4]),
-                        }
-                        key = (origin, row["id"])
-                    elif family == "SIP_NUMERO_GOTAS_SIMULTANEAS":
-                        if len(raw) != 3:
-                            raise IntegrityError("Unexpected gobs dictionary schema")
-                        row = {"id_gotas": int(raw[0]), "valor": int(raw[2])}
-                        key = row["id_gotas"]
-                    elif family == "SIP_MAQUINA_MOLDEO":
-                        if len(raw) != 10:
-                            raise IntegrityError("Unexpected machine configuration schema")
-                        row = {
-                            "id_maquina_fenix": int(raw[0]),
-                            "id_gotas": int(raw[5]),
-                            "vigente_desde": _time(raw[7]),
-                            "vigente_hasta": _time(raw[8]),
-                        }
-                        key = (row["id_maquina_fenix"], row["vigente_desde"])
-                    else:
-                        if len(raw) != 11:
-                            raise IntegrityError("Unexpected hot rejection schema")
+                yield origin, family, before
 
-                        def optional_int(token):
-                            return None if token in {"NULL", ""} else int(token)
 
-                        row = {
-                            "origen_fenix": origin,
-                            "id": int(raw[0]),
-                            "fecha": _time(raw[1]),
-                            "molde": optional_int(raw[2]),
-                            "cavidad": None if raw[7] in {"NULL", ""} else raw[7],
-                            "seccion": optional_int(raw[9]),
-                            "id_maquina_fenix": int(raw[10]),
-                            "rechazos": optional_int(raw[5]),
-                        }
-                        key = (origin, row["id"])
-                    previous = accepted.get(key)
-                    if previous and previous != row:
-                        fields = {k for k in row if previous[k] != row[k]}
-                        if fields in ({"fecha_off"}, {"vigente_hasta"}) and all(
-                            previous[k] is None for k in fields
-                        ):
-                            accepted[key] = row
-                        elif fields in ({"fecha_off"}, {"vigente_hasta"}) and all(
-                            row[k] is None for k in fields
-                        ):
-                            continue  # Old re-export cannot reopen a closed episode.
-                        else:
-                            raise IntegrityError(f"Contradictory auxiliary {family} key {key}")
-                    else:
-                        accepted[key] = row
+def auxiliary(
+    root: Path, sources: tuple[tuple[str, Path], ...], *, captures=None, initial=None
+) -> dict[str, pa.Table]:
+    """Minimal approved extra fields, captured once, with contradictions rejected.
+
+    This local replay producer does not register these sources in the running
+    server worker. That integration belongs to the later server validation step.
+    """
+    # Keys differ per family (tuples or scalars) and identify one auxiliary record.
+    initial = initial or {}
+    parameters = {(r["origen_fenix"], r["id"]): r for r in initial.get("production_parameters", [])}
+    drops = {r["id_gotas"]: r for r in initial.get("gobs_dictionary", [])}
+    machines = {
+        (r["id_maquina_fenix"], r["vigente_desde"]): r for r in initial.get("machine_gobs", [])
+    }
+    hot = {(r["origen_fenix"], r["id"]): r for r in initial.get("hot_rejection_evidence", [])}
+    maps = {
+        "MP9_PARAM_MODELO": parameters,
+        "SIP_NUMERO_GOTAS_SIMULTANEAS": drops,
+        "SIP_MAQUINA_MOLDEO": machines,
+        "MP9_LISTA_RECH_ZC": hot,
+    }
+    for origin, family, before in (
+        captures if captures is not None else auxiliary_captures(root, sources)
+    ):
+        accepted = maps[family]
+        for raw in csv.reader(io.StringIO(before.decode("cp1252")), delimiter=";"):
+            if not raw or not any(raw):
+                continue
+            if raw[-1] == "":
+                raw = raw[:-1]
+            if family == "MP9_PARAM_MODELO":
+                if len(raw) != 9:
+                    raise IntegrityError("Unexpected production parameter schema")
+                row = {
+                    "origen_fenix": origin,
+                    "id": int(raw[0]),
+                    "id_cambio_modelo": int(raw[1]),
+                    "fecha_on": _time(raw[2]),
+                    "fecha_off": _time(raw[3]),
+                    "num_secciones": int(raw[4]),
+                }
+                key = (origin, row["id"])
+            elif family == "SIP_NUMERO_GOTAS_SIMULTANEAS":
+                if len(raw) != 3:
+                    raise IntegrityError("Unexpected gobs dictionary schema")
+                row = {"id_gotas": int(raw[0]), "valor": int(raw[2])}
+                key = row["id_gotas"]
+            elif family == "SIP_MAQUINA_MOLDEO":
+                if len(raw) != 10:
+                    raise IntegrityError("Unexpected machine configuration schema")
+                row = {
+                    "id_maquina_fenix": int(raw[0]),
+                    "id_gotas": int(raw[5]),
+                    "vigente_desde": _time(raw[7]),
+                    "vigente_hasta": _time(raw[8]),
+                }
+                key = (row["id_maquina_fenix"], row["vigente_desde"])
+            else:
+                if len(raw) != 11:
+                    raise IntegrityError("Unexpected hot rejection schema")
+
+                def optional_int(token):
+                    return None if token in {"NULL", ""} else int(token)
+
+                row = {
+                    "origen_fenix": origin,
+                    "id": int(raw[0]),
+                    "fecha": _time(raw[1]),
+                    "molde": optional_int(raw[2]),
+                    "cavidad": None if raw[7] in {"NULL", ""} else raw[7],
+                    "seccion": optional_int(raw[9]),
+                    "id_maquina_fenix": int(raw[10]),
+                    "rechazos": optional_int(raw[5]),
+                }
+                key = (origin, row["id"])
+            previous = accepted.get(key)
+            if previous and previous != row:
+                fields = {k for k in row if previous[k] != row[k]}
+                if fields in ({"fecha_off"}, {"vigente_hasta"}) and all(
+                    previous[k] is None for k in fields
+                ):
+                    accepted[key] = row
+                elif fields in ({"fecha_off"}, {"vigente_hasta"}) and all(
+                    row[k] is None for k in fields
+                ):
+                    continue  # Old re-export cannot reopen a closed episode.
+                else:
+                    raise IntegrityError(f"Contradictory auxiliary {family} key {key}")
+            else:
+                accepted[key] = row
 
     def table(values, fields):
         return pa.Table.from_pylist(list(values.values()), schema=pa.schema(fields))
@@ -413,95 +430,8 @@ def _export_confirmed(config, root, *, max_ledger_rows, source_mode, discoveries
                     operation_field="ingesta_operation_id",
                 )
             )
-    from ingesta_delta_lake import associations as native
-
-    ar_rows = {native.source_id("LISTA_AR", r): r for r in ar_rows}
-
-    def decisions():
-        for r in ledger:
-            episodes = [
-                registry[i]
-                for i in r["episode_ids"]
-                if i in registry and registry[i].get("production") in r["productions"]
-            ]
-            zf = [e for e in episodes if e["kind"] == "ZF_ASSOCIATION"]
-            assignment = (
-                f"fenix-association-v1:{config.plant}:{r['origin']}:{zf[0]['id']}" if zf else None
-            )
-            zone = (
-                native.zone_for_ar({"sources": {"SIP_DEFECTO_AR": types}}, ar_rows[r["source_id"]])
-                if r["family"] == "LISTA_AR"
-                else None
-            )
-            yield {
-                "source_family": r["family"],
-                "source_id": r["source_id"],
-                "origin": r["origin"],
-                "status": r["status"],
-                "productions": r["productions"],
-                "rule": r["rule"],
-                "assignment_id": assignment,
-                "zone": zone,
-            }
-
     auxiliary_tables = auxiliary(root, config.sources)
-    decision_schema = pa.schema(
-        [
-            ("source_family", pa.string()),
-            ("source_id", pa.string()),
-            ("origin", pa.string()),
-            ("status", pa.string()),
-            ("productions", pa.list_(pa.string())),
-            ("rule", pa.string()),
-            ("assignment_id", pa.string()),
-            ("zone", pa.string()),
-        ]
-    )
-
-    def batches():
-        buffer = []
-        for row in decisions():
-            buffer.append(row)
-            if len(buffer) == 8192:
-                yield pa.RecordBatch.from_pylist(buffer, schema=decision_schema)
-                buffer.clear()
-        if buffer:
-            yield pa.RecordBatch.from_pylist(buffer, schema=decision_schema)
-
-    auxiliary_tables["observation_assignments"] = pa.RecordBatchReader.from_batches(
-        decision_schema, batches()
-    )
-    presences = [
-        {
-            "id_asignacion": "fenix-zc-presence:" + r["id"],
-            "id_produccion": r["production"],
-            "zona": "ZC",
-            "ramal": None,
-            "vigente_desde": _iso(r["start"]),
-            "vigente_hasta": _iso(r["end"]),
-            "version_regla": r["actor"],
-            "revision_decision": r["revision"],
-            "evidencia_origen": "registry:" + r["id"],
-        }
-        for r in registry.values()
-        if r["kind"] == "ZC_PRESENCE"
-    ]
-    auxiliary_tables["zc_presences"] = pa.Table.from_pylist(
-        presences,
-        schema=pa.schema(
-            [
-                ("id_asignacion", pa.string()),
-                ("id_produccion", pa.string()),
-                ("zona", pa.string()),
-                ("ramal", pa.int64()),
-                ("vigente_desde", pa.timestamp("us")),
-                ("vigente_hasta", pa.timestamp("us")),
-                ("version_regla", pa.string()),
-                ("revision_decision", pa.int64()),
-                ("evidencia_origen", pa.string()),
-            ]
-        ),
-    )
+    auxiliary_tables.update(assignment_tables(config.plant, ledger, registry, ar_rows, types))
     for name, table in auxiliary_tables.items():
         relative = f"gold-input-extensions/{name}"
         operation = (
@@ -584,3 +514,94 @@ def accepted_operation(path, version):
             if "commitInfo" in value:
                 return value["commitInfo"]["ingesta_operation_id"]
     raise IntegrityError("Accepted operation metadata is unavailable")
+
+
+def assignment_tables(plant, ledger, registry, ar_rows, types):
+    from ingesta_delta_lake import associations as native
+
+    ar_rows = {native.source_id("LISTA_AR", r): r for r in ar_rows}
+
+    def decisions():
+        for r in ledger:
+            episodes = [
+                registry[i]
+                for i in r["episode_ids"]
+                if i in registry and registry[i].get("production") in r["productions"]
+            ]
+            zf = [e for e in episodes if e["kind"] == "ZF_ASSOCIATION"]
+            assignment = f"fenix-association-v1:{plant}:{r['origin']}:{zf[0]['id']}" if zf else None
+            zone = (
+                native.zone_for_ar({"sources": {"SIP_DEFECTO_AR": types}}, ar_rows[r["source_id"]])
+                if r["family"] == "LISTA_AR"
+                else None
+            )
+            yield {
+                "source_family": r["family"],
+                "source_id": r["source_id"],
+                "origin": r["origin"],
+                "status": r["status"],
+                "productions": r["productions"],
+                "rule": r["rule"],
+                "assignment_id": assignment,
+                "zone": zone,
+            }
+
+    auxiliary_tables = {}
+    decision_schema = pa.schema(
+        [
+            ("source_family", pa.string()),
+            ("source_id", pa.string()),
+            ("origin", pa.string()),
+            ("status", pa.string()),
+            ("productions", pa.list_(pa.string())),
+            ("rule", pa.string()),
+            ("assignment_id", pa.string()),
+            ("zone", pa.string()),
+        ]
+    )
+
+    def batches():
+        buffer = []
+        for row in decisions():
+            buffer.append(row)
+            if len(buffer) == 8192:
+                yield pa.RecordBatch.from_pylist(buffer, schema=decision_schema)
+                buffer.clear()
+        if buffer:
+            yield pa.RecordBatch.from_pylist(buffer, schema=decision_schema)
+
+    auxiliary_tables["observation_assignments"] = pa.RecordBatchReader.from_batches(
+        decision_schema, batches()
+    )
+    presences = [
+        {
+            "id_asignacion": "fenix-zc-presence:" + r["id"],
+            "id_produccion": r["production"],
+            "zona": "ZC",
+            "ramal": None,
+            "vigente_desde": _iso(r["start"]),
+            "vigente_hasta": _iso(r["end"]),
+            "version_regla": r["actor"],
+            "revision_decision": r["revision"],
+            "evidencia_origen": "registry:" + r["id"],
+        }
+        for r in registry.values()
+        if r["kind"] == "ZC_PRESENCE"
+    ]
+    auxiliary_tables["zc_presences"] = pa.Table.from_pylist(
+        presences,
+        schema=pa.schema(
+            [
+                ("id_asignacion", pa.string()),
+                ("id_produccion", pa.string()),
+                ("zona", pa.string()),
+                ("ramal", pa.int64()),
+                ("vigente_desde", pa.timestamp("us")),
+                ("vigente_hasta", pa.timestamp("us")),
+                ("version_regla", pa.string()),
+                ("revision_decision", pa.int64()),
+                ("evidencia_origen", pa.string()),
+            ]
+        ),
+    )
+    return auxiliary_tables
