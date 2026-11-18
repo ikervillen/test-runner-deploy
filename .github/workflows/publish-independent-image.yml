@@ -1,0 +1,90 @@
+name: Publish independent image for 87ede4b
+
+on:
+  push:
+    branches: [release/publish-independent-87ede4b]
+
+permissions:
+  actions: read
+  contents: read
+  packages: write
+
+env:
+  RELEASE_SHA: 87ede4b001b6cdd6dc47488e427fc7ee88c3e035
+  VALIDATED_SHA: d6a74bbc0b61228da8ee9c3c2560d5d8a6d6a175
+  VALIDATION_RUN: '44270726177'
+
+jobs:
+  publish-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify the integrated tree and validated Gold revisions
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$VALIDATION_RUN" |
+            jq -e --arg commit "$VALIDATED_SHA" '
+              .head_sha == $commit and .conclusion == "success"
+              and .path == ".github/workflows/independent.yml"' >/dev/null
+          git merge-base --is-ancestor "$RELEASE_SHA" origin/develop
+          git diff --exit-code "$VALIDATED_SHA" "$RELEASE_SHA"
+          config=.github/workflows/independent.yml
+          context="$(sed -nE 's/^  GOLD_CONTEXT_COMMIT: ([0-9a-f]{40})$/\1/p' "$config")"
+          source="$(sed -nE 's/^  GOLD_SOURCE_COMMIT: ([0-9a-f]{40})$/\1/p' "$config")"
+          [[ "$context" =~ ^[0-9a-f]{40}$ && "$source" =~ ^[0-9a-f]{40}$ ]]
+          {
+            echo "gold_context=$context"
+            echo "gold_source=$source"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:independent-sha-$RELEASE_SHA"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ steps.release.outputs.gold_context }}
+          path: .quality-context
+          persist-credentials: false
+      - name: Verify the Gold source marker
+        env:
+          GOLD_SOURCE: ${{ steps.release.outputs.gold_source }}
+        run: test "$(cat .quality-context/GOLD_REVISION)" = "$GOLD_SOURCE"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile.independent
+          build-contexts: quality=.quality-context
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ steps.release.outputs.image }}
+          build-args: |
+            REVISION=${{ env.RELEASE_SHA }}
+            GOLD_REVISION=${{ steps.release.outputs.gold_source }}
+          cache-from: type=gha,scope=independent
+      - name: Check the built image and publish its digest
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m "$IMAGE" --help
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null' EXIT
+          docker push "$IMAGE"
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")
+          [[ "$digest" =~ @sha256:[0-9a-f]{64}$ ]]
+          printf '%s\n' "$digest" > independent-image-reference.txt
+          printf '### Imagen independiente\n\n`%s`\n' "$digest" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: independent-image-reference
+          path: independent-image-reference.txt
+          if-no-files-found: error
