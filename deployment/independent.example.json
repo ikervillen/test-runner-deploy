@@ -1,0 +1,84 @@
+{
+  "schema_id": "fenix-independent-deployment-v1",
+  "project": "fenix-aiala-independent",
+  "image": "ghcr.io/ikervillen/test-runner-deploy@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "uid": 10001,
+  "gid": 10001,
+  "input_bind": "C:/DataSharing/Fenix",
+  "input_target": "/input",
+  "configuration_bind": "C:/ProgramData/FenixIngesta/independent-configuration",
+  "configuration_target": "/configuration",
+  "source_file": "source.toml",
+  "pipelines_file": "pipelines.json",
+  "score_file": "customer_score.json",
+  "catalogs_file": "catalogs.json",
+  "api_env_file": "api.env",
+  "api_host": "127.0.0.1",
+  "api_port": 8011,
+  "volumes": {
+    "live": {
+      "bronze": "fenix-aiala-independent-live-bronze",
+      "silver": "fenix-aiala-independent-live-silver",
+      "gold": "fenix-aiala-independent-live-gold",
+      "control": "fenix-aiala-independent-live-control",
+      "checkpoint": "fenix-aiala-independent-live-checkpoint",
+      "exchange": "fenix-aiala-independent-live-exchange"
+    },
+    "history": {
+      "bronze": "fenix-aiala-independent-history-bronze",
+      "silver": "fenix-aiala-independent-history-silver",
+      "gold": "fenix-aiala-independent-history-gold",
+      "control": "fenix-aiala-independent-history-control",
+      "checkpoint": "fenix-aiala-independent-history-checkpoint",
+      "exchange": "fenix-aiala-independent-history-exchange"
+    }
+  },
+  "forbidden_volumes": [
+    "fenix-aiala-develop",
+    "fenix-aiala-main"
+  ],
+  "resources": {
+    "ingesta-live": {
+      "cpus": "2",
+      "cpuset": "0-1",
+      "memory": "2g",
+      "pids": 128,
+      "tmpfs": "256m",
+      "score_workers": 1
+    },
+    "ingesta-history": {
+      "cpus": "1",
+      "cpuset": "2",
+      "memory": "2g",
+      "pids": 128,
+      "tmpfs": "256m",
+      "score_workers": 1
+    },
+    "gold-live": {
+      "cpus": "1",
+      "cpuset": "3",
+      "memory": "2g",
+      "pids": 128,
+      "tmpfs": "256m",
+      "score_workers": 1
+    },
+    "gold-history": {
+      "cpus": "1",
+      "cpuset": "4",
+      "memory": "3g",
+      "pids": 128,
+      "tmpfs": "256m",
+      "score_workers": 1
+    },
+    "backend": {
+      "cpus": "1",
+      "cpuset": "5",
+      "memory": "1g",
+      "pids": 128,
+      "tmpfs": "256m",
+      "score_workers": 1
+    }
+  },
+  "health_retries": 3,
+  "host_reserve_memory": "1g"
+}
