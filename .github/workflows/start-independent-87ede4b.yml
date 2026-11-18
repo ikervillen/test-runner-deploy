@@ -1,0 +1,38 @@
+name: Start independent Fenix pipelines
+
+on:
+  push:
+    branches: [develop]
+    paths: [.github/workflows/start-independent-87ede4b.yml]
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  start:
+    if: github.repository == 'ikervillen/test-runner-deploy' && github.event.before == '87ede4b001b6cdd6dc47488e427fc7ee88c3e035'
+    runs-on: [self-hosted, Windows, X64, fenix-ingesta]
+    environment: develop
+    timeout-minutes: 30
+    concurrency:
+      group: ingesta-deploy-${{ github.repository }}-develop
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Verify and start the published independent stack
+        shell: powershell
+        env:
+          FENIX_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
+          FENIX_INPUT_BIND: ${{ vars.INGESTA_INPUT_BIND }}
+          FENIX_DOCKER_CONTEXT: ${{ vars.INGESTA_DOCKER_CONTEXT }}
+          INGESTA_GITHUB_TOKEN: ${{ github.token }}
+          INGESTA_REGISTRY_USER: ${{ github.actor }}
+          GOLD_CATALOGS_GZIP_B64: ${{ secrets.GOLD_CATALOGS_GZIP_B64 }}
+        run: |
+          ./scripts/start_independent.ps1 -Site $env:FENIX_SITE `
+            -Image 'ghcr.io/ikervillen/test-runner-deploy@sha256:ccc4b48f0f11da0596a8030ccc081702bb5d06eea24a8afcc2cdf2932b5ee77e' `
+            -Revision '87ede4b001b6cdd6dc47488e427fc7ee88c3e035' `
+            -GoldRevision 'ad88dc3d0bdedfbc4da3de06da74e3801b9b64f7'
