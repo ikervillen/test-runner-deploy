@@ -222,3 +222,28 @@ def test_ingestion_does_not_claim_or_modify_the_gold_owners_store(config, pipeli
     worker.prepare()
     assert marker.read_text() == "gold owner"
     assert worker.source.runtime_root.exists()
+
+
+def test_approved_decision_paths_belong_to_their_lane(config, pipeline_config):
+    decision = config.control_root / "associations" / "decisions.json"
+    source = replace(config, association_decisions=decision)
+    live, history = (PipelineWorker(pipeline_config, lane, source) for lane in ("live", "history"))
+    assert (
+        live.source.association_decisions
+        == pipeline_config.live.control / "associations/decisions.json"
+    )
+    assert (
+        history.source.association_decisions
+        == pipeline_config.history.control / "associations/decisions.json"
+    )
+    assert not decision.exists()  # Moving the path never silently imports old decisions.
+
+
+def test_consumer_validates_source_metadata_without_mounting_fenix(config):
+    from ingesta_delta_lake.common import ConfigurationError
+
+    missing = config.input_root.parent / "not-mounted"
+    consumer = replace(config, input_root=missing, sources=(("AV21", missing / "AV21"),))
+    with pytest.raises(ConfigurationError):
+        consumer.validate()
+    consumer.validate(require_inputs=False)

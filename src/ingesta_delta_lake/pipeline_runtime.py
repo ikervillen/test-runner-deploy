@@ -41,6 +41,11 @@ class PipelineWorker:
             bronze_root=self.storage.bronze,
             silver_root=self.storage.silver,
             control_root=self.storage.control,
+            association_decisions=(
+                self.storage.control / source.association_decisions.relative_to(source.control_root)
+                if source.association_decisions
+                else None
+            ),
             runtime_root=self.storage.checkpoint / "units",
             intake_path=self.storage.checkpoint / "intake.sqlite",
             intake_ids=(),
