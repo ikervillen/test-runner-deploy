@@ -35,7 +35,13 @@ def decode_config(text):
         values["intake_ids"] = tuple(values["intake_ids"])
     if values.get("runtime_root") is not None:
         values["runtime_root"] = Path(values["runtime_root"])
-    for name in ("archive_root", "archive_manifest", "publication_root"):
+    for name in (
+        "archive_root",
+        "archive_manifest",
+        "publication_root",
+        "history_exchange",
+        "history_silver",
+    ):
         if values.get(name) is not None:
             values[name] = Path(values[name])
     if values.get("processing_window") is not None:

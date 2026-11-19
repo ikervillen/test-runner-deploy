@@ -314,11 +314,13 @@ class Intake:
                 "UPDATE inputs SET state='CAPTURED' WHERE family=? AND state=?", (family, state)
             )
 
-    def capture_turn(self, config, policy, candidates, *, clock=time.monotonic):
+    def capture_turn(
+        self, config, policy, candidates, *, clock=time.monotonic, cursor_key="cursor"
+    ):
         started = clock()
         counts = {"captured": 0, "failed": 0, "unchanged": 0, "lane": self.lane}
         selected = sorted(candidates, key=lambda c: c.order)
-        cursor = json.loads(self.setting("cursor") or "null")
+        cursor = json.loads(self.setting(cursor_key) or "null")
         if cursor:
             selected = [c for c in selected if c.order > tuple(cursor)] or selected
         selected = selected[: getattr(policy, f"{self.lane}_batch_files")]
@@ -326,7 +328,7 @@ class Intake:
             if clock() - started >= getattr(policy, f"{self.lane}_turn_seconds"):
                 break
             self._capture_item(config, policy, item, counts)
-            self.set("cursor", canonical(item.order))
+            self.set(cursor_key, canonical(item.order))
         return counts
 
     def _capture_item(self, config, policy, item, counts, *, previous=None):

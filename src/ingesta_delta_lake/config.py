@@ -49,6 +49,8 @@ class Config:
     publication_root: Path | None = None
     retirement_job: dict | None = None
     scheduled_lot_attempt: bool = False
+    history_exchange: Path | None = None
+    history_silver: Path | None = None
 
     @property
     def archive_context(self):
@@ -81,6 +83,13 @@ class Config:
         return self.control_root / filename
 
     def validate(self, *, require_inputs=True) -> None:
+        if (self.history_exchange is None) != (self.history_silver is None) or (
+            self.history_exchange is not None
+            and (self.pipeline_lane != "live" or self.history_silver == self.silver_root)
+        ):
+            raise ConfigurationError(
+                "Historical MP9 references require separate live and history roots"
+            )
         if type(self.scheduled_lot_attempt) is not bool or (
             self.scheduled_lot_attempt and (self.intake_path is None or not self.intake_ids)
         ):
@@ -284,6 +293,8 @@ def load_config(path: Path, *, require_inputs=True) -> Config:
             "archive_root",
             "archive_manifest",
             "publication_root",
+            "history_exchange",
+            "history_silver",
         ):
             if data.get(name) is not None:
                 path = Path(data[name])

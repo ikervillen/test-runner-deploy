@@ -23,6 +23,10 @@ class IntegrityError(IngestaError):
     pass
 
 
+class DependencyPending(IntegrityError):
+    """An upstream writer has yet to confirm a usable revision."""
+
+
 class CaptureError(IngestaError):
     pass
 
