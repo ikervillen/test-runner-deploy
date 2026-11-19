@@ -319,6 +319,17 @@ def _iter_table(tables, name):
     return tables[name]
 
 
+def _score_components(formula, reference):
+    from .scoring import LIVE_PARTIAL_MIA_FORMULA
+
+    components = {"MIA", "Critico", "Grave", "Mayor", "Menor", "Leve", "DAR", "ZC"}
+    if formula == LIVE_PARTIAL_MIA_FORMULA:
+        if reference is not None:
+            raise IntegrityError("A score with pending MIA cannot claim a MIA reference")
+        components.remove("MIA")
+    return components
+
+
 def _validate_spilled(tables, *, complete=False):
     """Same rules as `validate`, scanning one spilled family at a time."""
     if complete and set(tables) != set(CONTRACTS):
@@ -355,6 +366,8 @@ def _validate_spilled(tables, *, complete=False):
                     row["total_penalty"],
                     row["evaluated_weight"],
                     row["normalized_score"],
+                    row["formula_version"],
+                    row["reference_id"],
                 )
             if (
                 "id_produccion" in row
@@ -377,19 +390,10 @@ def _validate_spilled(tables, *, complete=False):
                 components[row["id_resultado"]].append(
                     (row["componente"], row["contribucion"], row["peso"])
                 )
-    for identity, (total, weight, normalized) in scores.items():
+    for identity, (total, weight, normalized, formula, reference) in scores.items():
         parts = components[identity]
-        if {item[0] for item in parts} != {
-            "MIA",
-            "Critico",
-            "Grave",
-            "Mayor",
-            "Menor",
-            "Leve",
-            "DAR",
-            "ZC",
-        }:
-            raise IntegrityError("Official score requires every component")
+        if {item[0] for item in parts} != _score_components(formula, reference):
+            raise IntegrityError("Score components do not match its published formula")
         got_total = round(sum(item[1] for item in parts), 4)
         got_weight = round(sum(item[2] for item in parts), 4)
         if got_total != total or got_weight != weight:
@@ -470,17 +474,11 @@ def validate(tables, *, complete=False):
     if "quality_score_components" in tables:
         for identity, score in scores.items():
             parts = [r for r in tables["quality_score_components"] if r["id_resultado"] == identity]
-            if {r["componente"] for r in parts} != {
-                "MIA",
-                "Critico",
-                "Grave",
-                "Mayor",
-                "Menor",
-                "Leve",
-                "DAR",
-                "ZC",
-            }:
-                raise IntegrityError("Official score requires every component")
+            if {r["componente"] for r in parts} != _score_components(
+                score["formula_version"],
+                score["reference_id"],
+            ):
+                raise IntegrityError("Score components do not match its published formula")
             total = round(sum(r["contribucion"] for r in parts), 4)
             weight = round(sum(r["peso"] for r in parts), 4)
             if total != score["total_penalty"] or weight != score["evaluated_weight"]:

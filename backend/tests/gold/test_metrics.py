@@ -246,3 +246,34 @@ def test_ar_missing_category_is_explained_and_top_code_is_preserved():
     with pytest.raises(PendingBasis) as error:
         ar_bases([row], capacity(), window())
     assert error.value.code == "AR_CATEGORY_UNRESOLVED"
+
+
+def test_live_mia_without_denominator_publishes_other_evaluated_components():
+    from app.gold.contracts import validate
+    from app.gold.scoring import LIVE_PARTIAL_MIA_FORMULA
+
+    config = json.loads(
+        (Path(__file__).resolve().parents[3] / "config/customer_score.json").read_text()
+    )
+    result = calculate(
+        window(),
+        mia=mia_bases([], [], window()),
+        ar=ar_bases([], capacity(), window()),
+        zc=[{"rueda": 90, "teoricos": 100, "muestras": 1, "id_base_zc": "wheel"}],
+        reference={"values": [], "sets": []},
+        config=config,
+        config_id="c",
+        profile_confirmed=True,
+        coverage_ready=True,
+        calculation_time=END,
+        live_mia=True,
+    )
+
+    score = result.tables["quality_scores"][0]
+    components = result.tables["quality_score_components"]
+    assert result.pending == ("LISTA_RECH_BASE_MISSING",)
+    assert score["formula_version"] == LIVE_PARTIAL_MIA_FORMULA
+    assert score["reference_id"] is None
+    assert score["evaluated_weight"] == sum(row["peso"] for row in components)
+    assert len(components) == 7 and all(row["componente"] != "MIA" for row in components)
+    validate(result.tables)

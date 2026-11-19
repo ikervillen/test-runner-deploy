@@ -46,6 +46,9 @@ def validate_config(raw: dict) -> None:
             raise IntegrityError("Official Gold publication requires every agreed score family")
 
 
+LIVE_PARTIAL_MIA_FORMULA = "live-score-mia-pending-v1"
+
+
 def calculate(
     window: Window,
     *,
@@ -61,6 +64,8 @@ def calculate(
     line: str | None = None,
     ar_pending_reason: str = "ASSIGNED_CAPACITY_PENDING",
     configuration_status: str = "CONFIRMED",
+    live_mia: bool = False,
+    mia_coverage_ready: bool = True,
 ) -> ScoreResult:
     """Pending means no new official total/components, rather than a partial score."""
     validate_config(config)
@@ -69,19 +74,23 @@ def calculate(
         pending.append("SOURCE_COVERAGE_PENDING")
     if not profile_confirmed:
         pending.append("MODEL_SEGMENT_DAR_PROFILE_PENDING")
-    if mia["exposure"]["inspeccionadas"] <= 0:
-        pending.append("LISTA_RECH_BASE_MISSING")
     if ar is None or ar["exposure"]["tiempo_disponible_us"] <= 0:
         pending.append(ar_pending_reason)
     if not zc or sum(r["teoricos"] for r in zc) <= 0:
         pending.append("ZC_THEORETICAL_BASE_MISSING")
     stats = {(r["espacio_defecto"], r["codigo_defecto"]): r for r in reference["values"]}
+    mia_pending = []
+    if mia["exposure"]["inspeccionadas"] <= 0:
+        mia_pending.append("LISTA_RECH_BASE_MISSING")
+    if not mia_coverage_ready:
+        mia_pending.append("MIA_SOURCE_COVERAGE_PENDING")
     for rate in mia["rates"]:
         stat = stats.get((rate["espacio_defecto"], rate["codigo_defecto"]))
         if stat is None or stat["estado"] != "READY":
-            pending.append(f"MIA_REFERENCE_PENDING:{rate['codigo_defecto']}")
-    if pending:
-        return ScoreResult({}, tuple(sorted(set(pending))))
+            mia_pending.append(f"MIA_REFERENCE_PENDING:{rate['codigo_defecto']}")
+    if pending or (mia_pending and not live_mia):
+        return ScoreResult({}, tuple(sorted(set(pending + mia_pending))))
+    evaluate_mia = not mia_pending
     assert ar is not None  # A missing capacity basis is reported as pending above.
     score_config = _ScoreConfig(int(config["version"]), config)
     identity = window.identity
@@ -110,7 +119,7 @@ def calculate(
         )
 
     mia_weight = float(config["weights"]["mia_defect"])
-    for rate in mia["rates"]:
+    for rate in mia["rates"] if evaluate_mia else ():
         stat = stats[(rate["espacio_defecto"], rate["codigo_defecto"])]
         mean, sigma = stat["media_percent"], stat["sigma_percent"]
         z = (rate["percent"] - mean) / sigma if sigma > 0 else None
@@ -139,11 +148,14 @@ def calculate(
                 "muestras": stat["muestras"],
             }
         )
-    mia_total = sum(r["contribucion"] for r in tables["mia_score_details"])
-    weight = mia_weight * len(tables["mia_score_details"])
-    # Empty observed defect set has no per-defect evaluated weight, as in legacy.
-    component("MIA", mia_total / max(weight, 1.0), weight, mia["exposure"]["inspected_basis_id"])
-    tables["quality_score_components"][-1]["contribucion"] = round(mia_total, 4)
+    if evaluate_mia:
+        mia_total = sum(r["contribucion"] for r in tables["mia_score_details"])
+        weight = mia_weight * len(tables["mia_score_details"])
+        # Empty observed defect set has no per-defect evaluated weight, as in legacy.
+        component(
+            "MIA", mia_total / max(weight, 1.0), weight, mia["exposure"]["inspected_basis_id"]
+        )
+        tables["quality_score_components"][-1]["contribucion"] = round(mia_total, 4)
     available = ar["exposure"]["tiempo_disponible_us"]
     by = {(r["ambito"], r["codigo_ambito"]): r for r in ar["amounts"]}
     for category in SEVERITIES:
@@ -222,8 +234,10 @@ def calculate(
             "id_resultado": identity,
             **window.key,
             "config_id": config_id,
-            "formula_version": "shared-score-math-v1",
-            "reference_id": reference["sets"][0]["reference_id"],
+            "formula_version": "shared-score-math-v1" if evaluate_mia else LIVE_PARTIAL_MIA_FORMULA,
+            "reference_id": reference["sets"][0]["reference_id"]
+            if evaluate_mia and reference["sets"]
+            else None,
             "total_penalty": total,
             "normalized_score": round(total / weight, 4) if weight else 0.0,
             "evaluated_weight": weight,
@@ -232,4 +246,4 @@ def calculate(
             "configuration_status": configuration_status,
         }
     )
-    return ScoreResult(tables, ())
+    return ScoreResult(tables, tuple(sorted(set(mia_pending))))

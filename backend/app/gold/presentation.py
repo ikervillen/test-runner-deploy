@@ -6,6 +6,8 @@ from datetime import timedelta
 from app.domain.customer_score import CustomerScoreComponent
 from app.domain.score_math import _dar_threshold_label, _ScoreConfig, main_causes
 
+from .scoring import LIVE_PARTIAL_MIA_FORMULA
+
 
 def score_payload(score, tables, config, labels, profiles):
     identity = score["id_resultado"]
@@ -22,7 +24,7 @@ def score_payload(score, tables, config, labels, profiles):
             weight=r["peso"],
             contribution=r["contribucion"],
             details={
-                "MIA": "Tasa de rechazo frente al histórico acreditado.",
+                "MIA": "Tasa de rechazo frente a la referencia MIA del corte.",
                 "DAR": "Presencia de los defectos DAR aplicables al segmento.",
                 "ZC": "Rendimiento de zona caliente frente al objetivo.",
             }.get(r["componente"], "Minutos-cavidad afectados frente a la capacidad disponible."),
@@ -56,6 +58,8 @@ def score_payload(score, tables, config, labels, profiles):
         if score.get("configuration_status") == "PROVISIONAL_DAR"
         else []
     )
+    if score.get("formula_version") == LIVE_PARTIAL_MIA_FORMULA:
+        warnings.append("MIA pendiente. La valoración incluye los componentes evaluados.")
     return dict(
         total_penalty=score["total_penalty"],
         normalized_score=score["normalized_score"],
