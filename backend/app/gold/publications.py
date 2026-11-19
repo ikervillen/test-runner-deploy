@@ -397,7 +397,7 @@ def chunk_delete_predicate(
                 f"AND t.\"{column}\" < timestamp '{closed}')"
             )
         return parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
-    if bounds and not hours:
+    if bounds is not None and not hours:
         return None
     if hours and {"id_produccion", "inicio", "tipo_ventana"} <= columns:
         grouped: dict[datetime, list[str]] = {}
@@ -586,7 +586,7 @@ class Publisher:
                 for p in (self.root / "operations").glob("*.json")
                 if read_json(p)["state"] != "ACKNOWLEDGED"
             ]
-            if pending and not (hours or fact_bounds):
+            if pending and hours is None and fact_bounds is None:
                 raise IntegrityError(
                     "Recover the pending operation before publishing another input"
                 )
@@ -615,7 +615,7 @@ class Publisher:
                             "restore its pointer before writing"
                         )
                     same_version = current.version() == accepted["delta_version"]
-                    if not same_version and not (hours or fact_bounds):
+                    if not same_version and hours is None and fact_bounds is None:
                         raise IntegrityError(
                             "Output changed outside the pending confirmed operation"
                         )
@@ -646,7 +646,7 @@ class Publisher:
                             configuration=RETENTION,
                             commit_properties=properties,
                         )
-                    elif name == "publication_scope_status" and not (scope or fact_bounds):
+                    elif name == "publication_scope_status" and not scope and fact_bounds is None:
                         # A full scope snapshot is authoritative. Stream its replacement directly.
                         write_deltalake(
                             target, data, mode="overwrite", commit_properties=properties

@@ -105,13 +105,17 @@ def test_independent_gold_publishes_self_contained_evidence(independent, tmp_pat
         bundle=bundle(),
         config=read_json(Path(__file__).parents[3] / "config/customer_score.json"),
         cutoff=datetime(2026, 11, 17, 16, 40),
+        lane="live",
+        current_slot_seconds=plan.policy.window_seconds,
         environment=cfg.environment,
         plant=cfg.plant,
     )
     result = run(evidence.root, root, **kwargs)
     assert result["status"] == "PUBLISHED"
     assert published_evidence(root).publication_id == evidence.publication_id
-    assert Snapshot.open(root, require_gold_contract=True).rows("productions") == []
+    snapshot = Snapshot.open(root, require_gold_contract=True)
+    assert snapshot.rows("productions") == []
+    assert snapshot.rows("publication_scope_status") == []
     assert run(evidence.root, root, **kwargs)["status"] == "UNCHANGED"
 
 

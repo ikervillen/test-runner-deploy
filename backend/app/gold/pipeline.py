@@ -272,7 +272,7 @@ def _spill_facts(
     link_rules,
     only_ids=None,
     spans=None,
-    include_unassigned_zc=False,
+    current_window=None,
 ):
     """Write accepted facts for this chunk. The scan keeps one Arrow batch, not the history."""
     assigned = {r["id_asignacion"]: r["id_produccion"] for r in tables["production_assignments"]}
@@ -280,7 +280,7 @@ def _spill_facts(
     def wanted(production_id: str) -> bool:
         return only_ids is None or production_id in only_ids
 
-    window = _fact_window(spans)
+    window = current_window or _fact_window(spans)
     for target, family in (("mia_rejections", "LISTA_DEFECTOS"), ("mia_inspections", "LISTA_RECH")):
         for batch in reader.batches(family, operational_expression(family, window)):
             rows, issues = facts.mia(family, batch.to_pylist(), attribution)
@@ -338,7 +338,7 @@ def _spill_facts(
             if (
                 (only_ids is not None or spans is not None)
                 and not owners
-                and not include_unassigned_zc
+                and current_window is None
             ):
                 continue
             store.add(
@@ -1105,7 +1105,7 @@ def build(
     score_stats["chunk_productions"] = sorted(p["id_produccion"] for p in selected)
     score_stats["chunk_hours"] = [] if not hour_plan else [c.start.isoformat() for c in hour_plan]
     score_stats["horizon_complete"] = lane == "live" and not hour_plan
-    if chosen is not None and not selected:
+    if chosen is not None and not selected and current_slot_seconds is None:
         if statistics is not None:
             statistics.update(score_stats)
             statistics["lane_status"] = "IDLE"
@@ -1139,7 +1139,9 @@ def build(
                 link_rules,
                 only_ids=chosen,
                 spans=spans,
-                include_unassigned_zc=current_slot_seconds is not None,
+                current_window=(lanes.hour_holding(cutoff)[0], cutoff)
+                if current_slot_seconds is not None
+                else None,
             )
             del decisions
             reader.release("observation_assignments")
