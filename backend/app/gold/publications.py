@@ -646,6 +646,11 @@ class Publisher:
                             configuration=RETENTION,
                             commit_properties=properties,
                         )
+                    elif name == "publication_scope_status" and not (scope or fact_bounds):
+                        # A full scope snapshot is authoritative. Stream its replacement directly.
+                        write_deltalake(
+                            target, data, mode="overwrite", commit_properties=properties
+                        )
                     else:
                         join = " AND ".join(f't."{k}" = s."{k}"' for k in KEYS[name])
                         changed = " OR ".join(
