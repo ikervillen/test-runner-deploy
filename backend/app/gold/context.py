@@ -33,6 +33,28 @@ def issue(source: str, reason: str, production: str | None = None, **extra) -> d
     }
 
 
+def catalog_mp9(rows, bundle):
+    """Apply closures verified by the published Silver catalogue to its source rows."""
+    if not bundle.get("historical_mp9_closures"):
+        return rows
+    from ingesta_delta_lake import mp9
+    from ingesta_delta_lake.pipeline_rows import portable
+
+    effective = {mp9.key(row): portable(row) for row in rows}
+    for composition in bundle["catalog_composition"].values():
+        if composition["coverage"] != "VALID":
+            continue
+        for accepted in (composition["root"], *composition["zf"]):
+            key = mp9.key(accepted)
+            if key not in effective or accepted["FECHA_OFF"] is None:
+                continue
+            candidate, conflicts = mp9.consolidate([effective[key], accepted])
+            if conflicts:
+                raise IntegrityError("Published catalogue contradicts its MP9 source")
+            effective[key] = candidate
+    return list(effective.values())
+
+
 def productions(
     catalog: list[dict],
     mp9: list[dict],

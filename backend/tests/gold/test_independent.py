@@ -270,6 +270,32 @@ def test_cross_boundary_facts_recalculate_the_same_as_one_complete_input(tmp_pat
         tables.close()
 
 
+def test_gold_context_uses_the_confirmed_historical_mp9_closure(tmp_path, native):
+    from ingesta_delta_lake.mp9 import key
+    from ingesta_delta_lake.pipeline_rows import portable
+
+    from app.gold.context import catalog_mp9
+
+    evidence = industrial_evidence(tmp_path, "live", recent=True, native=native)
+    rows = evidence.rows("MP9_CAMBIO_MODELO")
+    old = next(r for r in rows if r["STATUS"] == 2 and r["FECHA_OFF"] is not None)
+    opened = [{**r, "FECHA_OFF": None} if r == old else r for r in rows]
+    accepted = {key(row): portable(row) for row in rows}
+    bundle = {
+        **evidence.document["bundle"],
+        "catalog_composition": {
+            identity: {
+                **entry,
+                "root": accepted[key(entry["root"])],
+                "zf": [accepted[key(row)] for row in entry["zf"]],
+            }
+            for identity, entry in evidence.document["bundle"]["catalog_composition"].items()
+        },
+        "historical_mp9_closures": [{"publication_id": "history"}],
+    }
+    assert catalog_mp9(opened, bundle) == portable(rows)
+
+
 def test_combined_gold_never_counts_a_capture_twice(tmp_path, native):
     from app.gold.evidence import combine
 
@@ -455,3 +481,70 @@ def test_gold_health_observes_its_owner_lock_without_waiting_on_history(independ
         worker.health()
     with portalocker.Lock(worker.root / "checkpoint/worker.lock", timeout=0):
         assert worker.health() == {"status": "STARTING", "lane": "live"}
+
+
+@pytest.mark.parametrize("phase", ["commit:publication_scope_status", "promoted", "legacy"])
+def test_worker_recovers_original_input_before_exporting_new_silver(
+    tmp_path, native, monkeypatch, phase
+):
+    from types import SimpleNamespace
+
+    from app.gold import independent_runtime as runtime
+    from app.gold.common import atomic_json, read_json
+    from app.gold.independent_inputs import cutoff
+    from app.gold.pipeline import run
+    from app.gold.publications import Snapshot
+
+    from .test_pipeline import bundle
+
+    root = tmp_path / "gold"
+    output = root / "published"
+    old = industrial_evidence(root / "inputs", "live", recent=False, native=native)
+    new = industrial_evidence(root / "inputs", "live", recent=True, native=native)
+    config = read_json(Path(__file__).parents[3] / "config/customer_score.json")
+    catalogs = bundle()
+
+    def interrupt(point):
+        if point == ("commit:publication_scope_status" if phase == "legacy" else phase):
+            raise RuntimeError("interrupted")
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        run(
+            old.root,
+            output,
+            confirmed_input=old,
+            bundle=catalogs,
+            config=config,
+            cutoff=cutoff(old),
+            environment="test",
+            plant="AV",
+            failpoint=interrupt,
+        )
+    journal = next((output / "operations").glob("*.json"))
+    pending = read_json(journal)["operation_id"]
+    if phase == "legacy":
+        path = next((output / "runs").glob("*.json"))
+        state = read_json(path)
+        for key in ("operation_id", "cutoff", "base_publication_id", "reference_publication_id"):
+            del state[key]
+        atomic_json(path, state)
+
+    plan = SimpleNamespace(
+        lane=lambda _: SimpleNamespace(gold=root),
+        policy=SimpleNamespace(read_max_rows=100000),
+    )
+    source = SimpleNamespace(environment="test", plant="AV")
+    worker = runtime.Worker(plan, "live", source, score=config, catalogs=catalogs)
+    monkeypatch.setattr(worker, "historical_reference", lambda: None)
+
+    def next_input(*args):
+        assert read_json(journal)["state"] == "ACKNOWLEDGED"
+        original = Snapshot.open(output)
+        assert original.publication_id == pending
+        assert original.table("publication_scope_status").version() == 0
+        return new
+
+    monkeypatch.setattr(runtime, "export", next_input)
+    result = worker.cycle()
+    assert result["recovered_publication_id"] == pending
+    assert Snapshot.open(output).manifest["input_publication_id"] == new.publication_id

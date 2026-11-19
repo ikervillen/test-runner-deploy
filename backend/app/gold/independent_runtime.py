@@ -5,15 +5,18 @@ from __future__ import annotations
 import argparse
 import signal
 import threading
+from datetime import datetime
 from pathlib import Path
+from time import monotonic
 
 import portalocker
 import pyarrow as pa
 
 from .common import IntegrityError, atomic_json, canonical, digest, read_json
+from .evidence import Evidence
 from .independent_inputs import cutoff, export
 from .pipeline import run
-from .publications import Snapshot
+from .publications import Snapshot, commit_scope
 
 
 class Worker:
@@ -25,6 +28,7 @@ class Worker:
         self.stop = threading.Event()
         self.root = self.storage.gold
         self.reference = None
+        self.acknowledged = set()
 
     def prepare(self):
         identity = digest(
@@ -67,21 +71,130 @@ class Worker:
                 )
         return self.reference
 
-    def cycle(self):
-        evidence = export(self.pipelines, self.lane, self.source)
+    def publish(self, evidence, reference, *, score, catalogs, cutoff_at, recovery=None):
         return run(
             self.root / "inputs",
             self.root / "published",
             confirmed_input=evidence,
-            reference_snapshot=self.historical_reference(),
-            cutoff=cutoff(evidence),
-            bundle=self.catalogs,
-            config=self.score,
+            reference_snapshot=reference,
+            cutoff=cutoff_at,
+            bundle=catalogs,
+            config=score,
             environment=self.source.environment,
             plant=self.source.plant,
             max_rows_per_source=self.policy.read_max_rows,
             max_total_rows=self.policy.read_max_rows,
+            recovery=recovery,
         )
+
+    def recover_publication(self):
+        output = self.root / "published"
+        pending = []
+        for path in sorted((output / "operations").glob("*.json")):
+            if path in self.acknowledged:
+                continue
+            operation = read_json(path)
+            if operation["state"] != "ACKNOWLEDGED":
+                pending.append((path, operation))
+            else:
+                self.acknowledged.add(path)
+        if not pending:
+            return None
+        if len(pending) != 1:
+            raise IntegrityError("Gold live has multiple pending publications")
+        path, operation = pending[0]
+        identity = operation["operation_id"]
+        if (output / "current.json").exists():
+            actual = Snapshot.open(output, require_gold_contract=True)
+            if actual.publication_id == identity:
+                for ref in actual.manifest["tables"]:
+                    actual.table(ref["name"])
+                operation["state"] = "ACKNOWLEDGED"
+                atomic_json(path, operation)
+                return identity
+
+        evidence = Evidence.open(self.root / "inputs", operation["input_publication_id"])
+        cutoff_at = cutoff(evidence)
+        matches = []
+        for run_path in (output / "runs").glob("*.json"):
+            state = read_json(run_path)
+            if state.get("input_publication_id") != evidence.publication_id:
+                continue
+            config_path = output / "configs" / f"{state['config_id']}.json"
+            if not config_path.is_file():
+                continue
+            settings = read_json(config_path)
+            pinned = state.get("operation_id")
+            if pinned is None:
+                # Legacy independent runs published the complete snapshot with an empty scope.
+                publication_config = digest(
+                    [
+                        settings["catalogs"],
+                        settings["score"],
+                        state["code_id"],
+                        state["recalculation"],
+                    ]
+                )
+                pinned = digest(
+                    [
+                        "gold-v1",
+                        evidence.publication_id,
+                        publication_config,
+                        cutoff_at.isoformat(),
+                        commit_scope(None, None),
+                    ]
+                )
+            if pinned == identity:
+                matches.append((state, settings))
+        if len(matches) != 1:
+            raise IntegrityError(f"Cannot identify the original Gold run for {identity}")
+        state, settings = matches[0]
+        vector = evidence.document.get("source_vector") or [None]
+        reference_id = state.get("reference_publication_id", vector[-1])
+        reference = (
+            Snapshot.open(
+                self.pipelines.history.gold / "published",
+                publication_id=reference_id,
+                require_gold_contract=True,
+            )
+            if reference_id
+            else None
+        )
+        result = self.publish(
+            evidence,
+            reference,
+            score=settings["score"],
+            catalogs=settings["catalogs"],
+            cutoff_at=datetime.fromisoformat(state.get("cutoff", cutoff_at.isoformat())),
+            recovery=(identity, state),
+        )
+        if result.get("publication_id") != identity:
+            raise IntegrityError(f"Gold did not complete recovery of {identity}")
+        return identity
+
+    def cycle(self):
+        started = monotonic()
+        recovered = self.recover_publication() if self.lane == "live" else None
+        began_export = monotonic()
+        evidence = export(self.pipelines, self.lane, self.source)
+        began_publish = monotonic()
+        result = self.publish(
+            evidence,
+            self.historical_reference(),
+            score=self.score,
+            catalogs=self.catalogs,
+            cutoff_at=cutoff(evidence),
+        )
+        if recovered is not None:
+            result["recovered_publication_id"] = recovered
+            result["recovery_seconds"] = round(began_export - started, 3)
+        sources = evidence.document.get("sources") or []
+        result.update(
+            silver_publication_id=sources[0] if sources else None,
+            export_seconds=round(began_publish - began_export, 3),
+            calculation_and_publish_seconds=round(monotonic() - began_publish, 3),
+        )
+        return result
 
     def health(self):
         marker = read_json(self.root / "checkpoint" / "identity.json")

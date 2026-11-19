@@ -190,6 +190,11 @@ def export(pipelines, lane, config):
                 else value
             )
     diagnostics = catalogs[0].get("diagnostics", {}) if catalogs else {}
+    historical_closures = [
+        c["manifest"]["MP9_CAMBIO_MODELO"]["historical_closures"]
+        for c in catalogs
+        if c.get("manifest", {}).get("MP9_CAMBIO_MODELO", {}).get("historical_closures")
+    ]
     doc = {
         "confirmed_at": max(
             (r["confirmed_at"] for r in own.manifest["tables"].values()), default=None
@@ -214,6 +219,7 @@ def export(pipelines, lane, config):
             "cases": cases,
             "catalog_composition": composition,
             "catalog_diagnostics": diagnostics,
+            **({"historical_mp9_closures": historical_closures} if historical_closures else {}),
         },
         "coverage": coverage,
     }

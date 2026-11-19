@@ -202,7 +202,9 @@ def _context_tables(snapshot, reader, bundle, previous, recalculate_closed_ids):
     )
     prods, issues = context.productions(
         catalog_rows,
-        reader.rows("MP9_CAMBIO_MODELO"),
+        context.catalog_mp9(
+            reader.rows("MP9_CAMBIO_MODELO"), getattr(snapshot, "document", {}).get("bundle", {})
+        ),
         reader.rows("SIP_MODELO"),
         reader.rows("SIP_MAQUINA_MOLDEO"),
         boundary_rows,
@@ -1442,6 +1444,7 @@ def _run(
     lane: str = "all",
     confirmed_input=None,
     reference_snapshot=None,
+    recovery: tuple[str, dict] | None = None,
 ) -> dict:
     input_root, output_root = input_root.resolve(strict=True), output_root.resolve()
     if (
@@ -1501,7 +1504,15 @@ def _run(
             )
             # A full build is one operation. A lane is not: the next chunk must still run
             # after this one is stored, so its receipt is not a reason to skip the lane.
-            if lane == "all":
+            if recovery is not None:
+                _, state = recovery
+                if state["input_publication_id"] != snap.publication_id:
+                    raise IntegrityError("Recovery run refers to another input")
+                if state["config_id"] != digest([config, bundle]):
+                    raise IntegrityError("Recovery configuration differs from the prepared run")
+                code_id = state["code_id"]
+                state_path = output_root / "runs" / f"{state['work_id']}.json"
+            elif lane == "all":
                 work_id = digest(
                     [snap.publication_id, bundle, config, cutoff, code_id, recalculation]
                 )
@@ -1551,6 +1562,12 @@ def _run(
             previous = (
                 Snapshot.open(output_root) if (output_root / "current.json").exists() else None
             )
+            previous_id = previous.publication_id if previous else None
+            if (
+                recovery is not None
+                and state.get("base_publication_id", previous_id) != previous_id
+            ):
+                raise IntegrityError("Recovery base differs from the published Gold snapshot")
             since = copied_until = None
             if lane == "live":
                 since, _ = _mark_live_since(output_root, cutoff)
@@ -1573,6 +1590,8 @@ def _run(
                 reference_snapshot=reference_snapshot,
             )
             if tables is None:
+                if recovery is not None:
+                    raise IntegrityError("Recovery did not reproduce the prepared publication")
                 state.update(status="IDLE", lane=lane)
                 atomic_json(state_path, state)
                 _remember_ar(output_root, statistics)
@@ -1606,6 +1625,18 @@ def _run(
                             commit_scope(replace_ids, hours),
                         ]
                     )
+                    if recovery is not None and recovery[0] != publication_id:
+                        raise IntegrityError("Recovery did not reproduce the prepared operation ID")
+                    if confirmed_input is not None:
+                        state.update(
+                            operation_id=publication_id,
+                            cutoff=cutoff.isoformat(),
+                            base_publication_id=previous_id,
+                            reference_publication_id=(
+                                reference_snapshot.publication_id if reference_snapshot else None
+                            ),
+                        )
+                        atomic_json(state_path, state)
                     if "quality_scores" not in getattr(tables, "spilled", ()):
                         for row in tables["quality_scores"]:
                             if row.get("basis_publication_id") is None:
