@@ -11,6 +11,7 @@ from .common import IntegrityError, digest
 from .evidence import attribution, registry, save
 from .lanes import hour_holding
 from .producer import FAMILIES, _apply_horizon, _apply_live, auxiliary
+from .series_handover import apply_series_handover, recent_relations
 
 AUXILIARY = frozenset(
     {"MP9_PARAM_MODELO", "SIP_NUMERO_GOTAS_SIMULTANEAS", "SIP_MAQUINA_MOLDEO", "MP9_LISTA_RECH_ZC"}
@@ -103,7 +104,7 @@ def export(pipelines, lane, config):
     if (storage.gold / "inputs" / "current.json").exists():
         previous = Evidence.open(storage.gold / "inputs")
         if previous.document.get("source_vector") == vector and (
-            lane != "live" or "attribution_window" in previous.document
+            lane != "live" or "series_handover_scopes" in previous.document
         ):
             return previous
     projections = {family: own.control(family) for family in own.manifest.get("controls", {})}
@@ -232,7 +233,13 @@ def export(pipelines, lane, config):
         horizon = _source_horizon(coverage)
         if horizon:
             window = (hour_holding(horizon)[0], horizon)
+            evidence = recent_relations(
+                storage, policy, config.encoding, horizon, dict(config.sources)
+            )
+            if evidence:
+                apply_series_handover(doc, tables, evidence, window, policy.window_seconds)
         doc["attribution_window"] = portable(window)
+        doc.setdefault("series_handover_scopes", [])
     tables.update(attribution(doc, tables, window=window))
     tables.update(auxiliary_tables)
     doc["bronze_cursor"] = cursor
