@@ -14,6 +14,7 @@ from pathlib import Path
 
 import portalocker
 
+from .catalog_storage import historical_mp9
 from .common import IntegrityError, canonical, digest, now
 from .config import load_config
 from .contracts import CONTRACTS
@@ -63,6 +64,8 @@ class PipelineWorker:
             reviews_only=False,
             publication_root=self.storage.exchange,
             retirement_job=None,
+            history_exchange=pipelines.history.exchange if lane == "live" else None,
+            history_silver=pipelines.history.silver if lane == "live" else None,
         )
         self.source.validate()
         self.stop = stop if stop is not None else threading.Event()
@@ -173,15 +176,38 @@ class PipelineWorker:
             ]
             review_capture = intake.capture_turn(self.source, self.policy, review_candidates)
             budget = max(0, self.policy.history_batch_files - review_capture["captured"])
+            mp9 = [item for item in candidates if item.family == "MP9_CAMBIO_MODELO"]
+            priority = None
+            turn_seconds = self.policy.history_turn_seconds
+            if mp9 and budget > 1:
+                # Reserve a bounded turn for reference corrections, independent of backlog order.
+                quota = budget // 2
+                priority = intake.capture_turn(
+                    self.source,
+                    replace(
+                        self.policy,
+                        history_batch_files=quota,
+                        history_turn_seconds=turn_seconds / 2,
+                    ),
+                    mp9,
+                    cursor_key="mp9_history_cursor",
+                )
+                candidates = [item for item in candidates if item.family != "MP9_CAMBIO_MODELO"]
+                budget -= quota
+                turn_seconds /= 2
             captured = (
                 intake.capture_turn(
-                    self.source, replace(self.policy, history_batch_files=budget), candidates
+                    self.source,
+                    replace(
+                        self.policy, history_batch_files=budget, history_turn_seconds=turn_seconds
+                    ),
+                    candidates,
                 )
                 if budget
                 else {"captured": 0, "failed": 0, "unchanged": 0, "lane": self.lane}
             )
             for key in ("captured", "failed", "unchanged"):
-                captured[key] += review_capture[key]
+                captured[key] += review_capture[key] + (priority[key] if priority else 0)
         else:
             captured = intake.capture_live(self.source, self.policy, candidates, window=window)
         try:
@@ -426,11 +452,27 @@ class PipelineWorker:
         dirty, active, retry_at = set(families), {}, {}
         derived = set(CONTRACTS) - SILVER_EXPORTS
         dirty_since = {family: time.monotonic() for family in families}
+        history_revision = None
         with ThreadPoolExecutor(max_workers=self.parallel, thread_name_prefix=self.lane) as pool:
             while not self.stop.is_set():
                 began = time.monotonic()
                 self.archive_turn()
                 self.refresh_archive()
+                if "CATALOGO_PRODUCCIONES" in families:
+                    try:
+                        history = historical_mp9(self.source)
+                        revision = (
+                            history.manifest["controls"].get("MP9_CAMBIO_MODELO")
+                            if history
+                            else None
+                        )
+                        if revision != history_revision:
+                            family = "CATALOGO_PRODUCCIONES"
+                            dirty.add(family)
+                            dirty_since.setdefault(family, began)
+                            history_revision = revision
+                    except (OSError, ValueError, IntegrityError) as exc:
+                        self.event({"event": "HISTORICAL_MP9_REFERENCE_FAILED", "error": str(exc)})
                 window, captured = self.capture(
                     intake,
                     active_ids=tuple(i for _, cfg in active.values() for i in cfg.intake_ids),
@@ -478,6 +520,10 @@ class PipelineWorker:
                         cfg.intake_ids
                         or cfg.reviews_only
                         or result.get("status") in {"APPLIED", "RETIRED"}
+                        or (
+                            family == "CATALOGO_PRODUCCIONES"
+                            and not result.get("publication_error")
+                        )
                     ):
                         for dependent in families[families.index(family) + 1 :]:
                             intake.release(dependent, "WAITING_REVIEW")

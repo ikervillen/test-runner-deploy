@@ -1,6 +1,7 @@
 import json
 import sqlite3
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 from deltalake import DeltaTable
@@ -8,10 +9,11 @@ from deltalake import DeltaTable
 from ingesta_delta_lake import catalog
 from ingesta_delta_lake.catalog_control import CatalogControl
 from ingesta_delta_lake.catalog_service import search
-from ingesta_delta_lake.catalog_storage import CatalogStore
+from ingesta_delta_lake.catalog_storage import CatalogStore, verify_manifest
 from ingesta_delta_lake.cli import main
 from ingesta_delta_lake.common import ConfigurationError, IngestaError, IntegrityError
 from ingesta_delta_lake.mp9_storage import Mp9Store
+from ingesta_delta_lake.pipeline_publications import publish_family
 from ingesta_delta_lake.service import run
 
 
@@ -82,6 +84,37 @@ def test_schema_identity_relationship_and_no_change_replay(config, source, monke
     assert query(
         config, "SELECT kind,state,COUNT(*) FROM production_intents GROUP BY kind,state"
     ) == [("INSERT", "CONFIRMED", 1)]
+
+
+def test_confirmed_historical_closures_advance_live_catalog(config, source, tmp_path):
+    history = replace(
+        config,
+        bronze_root=tmp_path / "historical-bronze",
+        silver_root=tmp_path / "historical-silver",
+        control_root=tmp_path / "historical-control",
+        pipeline_lane="history",
+    )
+    exchange = tmp_path / "historical-exchange"
+    storage = SimpleNamespace(exchange=exchange, silver=history.silver_root)
+    live = replace(
+        config, pipeline_lane="live", history_exchange=exchange, history_silver=history.silver_root
+    )
+    identity = catalog.production_id("AIALA", "AV21", 1)
+    assert run(live)["status"] == "APPLIED"
+    assert rows(live)[identity]["fecha_fin_zf"] is None
+
+    run(replace(history, family="SIP_MODELO"))
+    close_source(history, source)
+    publish_family(history, storage, lane="history", identity="fixture", family="MP9_CAMBIO_MODELO")
+
+    result = run(live)
+    assert result["status"] == "APPLIED"
+    assert rows(live)[identity]["fecha_fin_zf"] == "2026-10-14T07:23:14"
+    manifest = result["source_manifest"]
+    assert manifest["MP9_CAMBIO_MODELO"]["historical_closures"]["publication_id"]
+    pinned = verify_manifest(live, manifest)
+    assert pinned["MP9_CAMBIO_MODELO"]["AV21", 2]["FECHA_OFF"] == "2026-10-14T07:23:14"
+    assert run(live)["status"] == "NO_CHANGE"
 
 
 def test_model_search_without_dates_is_read_only_and_keeps_model_dictionary_authoritative(

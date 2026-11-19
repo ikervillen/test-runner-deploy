@@ -1,7 +1,9 @@
 from contextlib import closing
+from dataclasses import replace
 
 from ingesta_delta_lake import retry_control
-from ingesta_delta_lake.common import IntegrityError
+from ingesta_delta_lake.catalog_control import CatalogControl
+from ingesta_delta_lake.common import DependencyPending, IntegrityError
 from ingesta_delta_lake.control import Control
 from ingesta_delta_lake.maintenance import replace_control
 from ingesta_delta_lake.service import run
@@ -27,6 +29,24 @@ def test_integrity_failure_pauses_without_automatic_retry(config, source):
     replace_control(config, apply=True, reformulate=True)
     with closing(Control(config)) as control:
         retry_control.failed(control, IntegrityError("contradiction"))
+        assert retry_control.ready(control)["status"] == "PAUSED_RETRY_EXHAUSTED"
+
+
+def test_recovers_legacy_dependency_pause_but_keeps_integrity_pause(config):
+    catalog = replace(config, family="CATALOGO_PRODUCCIONES")
+    catalog.control_root.mkdir(parents=True, exist_ok=True)
+    with closing(CatalogControl(catalog)) as control:
+        dependency = retry_control.LEGACY_DEPENDENCIES[catalog.family]
+        attempt = control.start_attempt()
+        retry_control.failed(control, IntegrityError(dependency))
+        control.finish_attempt(attempt, {"status": "FAILED", "error": dependency})
+        assert retry_control.ready(control) is None
+        retry_control.failed(control, DependencyPending(dependency))
+        assert control.setting("retry_state") is None
+
+        attempt = control.start_attempt()
+        retry_control.failed(control, IntegrityError("contradiction"))
+        control.finish_attempt(attempt, {"status": "FAILED", "error": "contradiction"})
         assert retry_control.ready(control)["status"] == "PAUSED_RETRY_EXHAUSTED"
 
 

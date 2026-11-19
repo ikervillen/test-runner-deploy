@@ -5,13 +5,30 @@ import os
 import random
 import time
 
-from .common import ConfigurationError, IntegrityError, canonical, now
+from .common import ConfigurationError, DependencyPending, IntegrityError, canonical, now
+
+LEGACY_DEPENDENCIES = {
+    "CATALOGO_PRODUCCIONES": "Recuperar MP9 antes de derivar su catálogo",
+    "ASIGNACION_PRODUCCION_RAMAL": "Actualizar el catálogo: sus fuentes han cambiado",
+}
 
 
 def ready(control):
     value = json.loads(control.setting("retry_state") or "null")
     if not value:
         return None
+    family = control.config.family
+    if (
+        value["paused"]
+        and value["error_type"] == "IntegrityError"
+        and family in LEGACY_DEPENDENCIES
+    ):
+        last = control.db.execute(
+            "SELECT result_json FROM attempts WHERE finished_at IS NOT NULL "
+            "ORDER BY finished_at DESC LIMIT 1"
+        ).fetchone()
+        if last and json.loads(last[0] or "{}").get("error") == LEGACY_DEPENDENCIES[family]:
+            return None
     if value["paused"] or value["next_at"] > time.time():
         return {
             "status": "PAUSED_RETRY_EXHAUSTED" if value["paused"] else "RETRY_WAIT",
@@ -23,6 +40,9 @@ def ready(control):
 
 
 def failed(control, error):
+    if isinstance(error, DependencyPending):
+        succeeded(control)
+        return
     previous = json.loads(control.setting("retry_state") or "null")
     number = previous["failures"] + 1 if previous else 1
     budget = int(os.environ.get("INGESTA_CONTROL_RETRIES", "5"))

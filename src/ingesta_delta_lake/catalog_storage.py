@@ -5,16 +5,20 @@ import sqlite3
 from contextlib import closing
 from dataclasses import replace
 from datetime import datetime
+from types import SimpleNamespace
 
 import pyarrow as pa
+import pyarrow.dataset as ds
 from deltalake import DeltaTable, write_deltalake
 from deltalake.transaction import CommitProperties
 
 from . import __version__, catalog, mp9
 from .commit_protocol import application_transaction, delta_configuration, merge_counts_match
-from .common import IntegrityError, canonical, digest
+from .common import DependencyPending, IntegrityError, canonical, digest
 from .delta import DeltaStore
 from .mp9_storage import Mp9Store, load_models
+from .pipeline_publications import SilverSnapshot
+from .pipeline_rows import portable
 from .topology import FAMILIES, MACHINES, machine_for_period
 from .topology_storage import TopologyStore
 from .topology_storage import snapshot as topology_snapshot
@@ -43,7 +47,7 @@ def read_source(config):
         if db.execute(
             "SELECT COUNT(*) FROM batches WHERE state IN ('PREPARED','WRITING','UNKNOWN')"
         ).fetchone()[0]:
-            raise IntegrityError("Recuperar MP9 antes de derivar su catálogo")
+            raise DependencyPending("Recuperar MP9 antes de derivar su catálogo")
         version, records = Mp9Store(source, settings["control_id"]).read()
         if settings.get("last_version", "None") != str(version):
             raise IntegrityError("El snapshot MP9 no está confirmado")
@@ -68,6 +72,67 @@ def read_source(config):
         },
         cases,
     )
+
+
+def historical_mp9(config, publication_id=None):
+    if config.history_exchange is None:
+        if publication_id is not None:
+            raise IntegrityError("Historical MP9 reference is no longer configured")
+        return None
+    storage = SimpleNamespace(exchange=config.history_exchange, silver=config.history_silver)
+    try:
+        snapshot = SilverSnapshot.open(storage, publication_id=publication_id)
+    except FileNotFoundError:
+        if publication_id is not None:
+            raise
+        return None
+    if snapshot.manifest["lane"] != "history":
+        raise IntegrityError("MP9 reference must be published by history")
+    if "MP9_CAMBIO_MODELO" in snapshot.manifest["tables"]:
+        return snapshot
+    return None
+
+
+def merge_historical_closures(records, snapshot, *, batch_size):
+    """Use confirmed closures only for identities already owned by live."""
+    merged, issues = dict(records), []
+    if snapshot is None or not records:
+        return merged, issues
+    family = "MP9_CAMBIO_MODELO"
+    blocked = set()
+    for case in snapshot.control(family)["cases"]:
+        payload = case["payload"]
+        key = payload.get("origen_fenix"), payload.get("ID")
+        if key in records:
+            blocked.add(key)
+            issues.append(case)
+    ids = sorted({key[1] for key in records})
+    selected = ds.field("ID").isin(ids) & ds.field("FECHA_OFF").is_valid()
+    for batch in snapshot.batches(family, batch_size=batch_size, expression=selected):
+        for raw in batch.to_pylist():
+            key = mp9.key(raw)
+            if key not in records or key in blocked or raw["FECHA_OFF"] is None:
+                continue
+            candidate = portable(raw)
+            row, conflicts = mp9.consolidate([records[key], candidate])
+            if conflicts:
+                payload = {
+                    "origen_fenix": key[0],
+                    "ID": key[1],
+                    "candidates": [records[key], candidate],
+                    "fields": conflicts,
+                }
+                issues.append(
+                    {
+                        "issue_id": digest(["historical_mp9_closure", payload]),
+                        "reason": "HISTORICAL_MP9_CONFLICT",
+                        "status": "PENDING",
+                        "payload": payload,
+                    }
+                )
+            else:
+                merged[key] = row
+    return merged, issues
 
 
 def verify_manifest(config, manifest):
@@ -99,13 +164,39 @@ def verify_manifest(config, manifest):
             or source.contract.content_hash(rows) != descriptor["hash"]
         ):
             raise IntegrityError("El snapshot fuente fijado no coincide con la evidencia")
+        if (reference := descriptor.get("historical_closures")) is not None:
+            snapshot = historical_mp9(config, reference["publication_id"])
+            if snapshot is None:
+                raise IntegrityError("Historical MP9 reference is missing its confirmed table")
+            rows, _ = merge_historical_closures(rows, snapshot, batch_size=config.read_batch_rows)
+            if mp9.content_hash(rows) != reference["hash"]:
+                raise IntegrityError("Historical MP9 closures differ from the pinned reference")
         result[name] = rows
     return result
 
 
-def load_sources(config):
+def load_sources(config, *, previous_history=None):
     models, model_snapshot = load_models(config)
     records, mp9_snapshot, cases = read_source(config)
+    history = historical_mp9(config)
+    if previous_history is not None and config.history_exchange is not None:
+        pinned = historical_mp9(config, previous_history["publication_id"])
+        if pinned is None:
+            raise IntegrityError("Previously confirmed historical MP9 reference is missing")
+        family = "MP9_CAMBIO_MODELO"
+        if history is None or history.manifest["controls"].get(family) == pinned.manifest[
+            "controls"
+        ].get(family):
+            history = pinned
+    if history is not None and records:
+        records, conflicts = merge_historical_closures(
+            records, history, batch_size=config.read_batch_rows
+        )
+        mp9_snapshot["historical_closures"] = {
+            "publication_id": history.manifest["publication_id"],
+            "hash": mp9.content_hash(records),
+        }
+        cases.extend(conflicts)
     manifest = {"SIP_MODELO": model_snapshot, "MP9_CAMBIO_MODELO": mp9_snapshot}
     if config.topology_enabled:
         machines, descriptor, machine_cases = topology_snapshot(config, MACHINES)

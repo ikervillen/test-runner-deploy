@@ -1,6 +1,7 @@
 import json
 import sqlite3
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +10,7 @@ from ingesta_delta_lake.association_service import inspect
 from ingesta_delta_lake.association_storage import read_artifact
 from ingesta_delta_lake.catalog_service import search
 from ingesta_delta_lake.common import IntegrityError
+from ingesta_delta_lake.pipeline_publications import publish_family
 from ingesta_delta_lake.service import run
 
 
@@ -311,7 +313,10 @@ def test_concurrent_same_model_keeps_physical_productions_separate(config, found
     assert resolved["productions"] == [pid(config, 2007)]
 
 
-def test_late_closure_versions_auto_episodes_without_changing_identity(config, foundation):
+@pytest.mark.parametrize("historical", [False, True])
+def test_late_closure_versions_auto_episodes_without_changing_identity(
+    config, foundation, tmp_path, historical
+):
     run(config)
     original = {
         r["id_asignacion"]: r
@@ -325,8 +330,29 @@ def test_late_closure_versions_auto_episodes_without_changing_identity(config, f
         .replace("2008;2;14/10/2026 7:23:14;;", "2008;2;14/10/2026 7:23:14;19/10/2026 7:00:00;"),
         encoding="utf-8",
     )
-    assert run(replace(config, family="MP9_CAMBIO_MODELO"))["updated_this_attempt"] == 2
-    assert inspect(config)["status"] == "STALE"
+    if historical:
+        history = replace(
+            config,
+            bronze_root=tmp_path / "history-bronze",
+            silver_root=tmp_path / "history-silver",
+            control_root=tmp_path / "history-control",
+        )
+        run(replace(history, family="SIP_MODELO"))
+        run(replace(history, family="MP9_CAMBIO_MODELO"))
+        exchange = tmp_path / "history-exchange"
+        storage = SimpleNamespace(exchange=exchange, silver=history.silver_root)
+        publish_family(
+            history, storage, lane="history", identity="test", family="MP9_CAMBIO_MODELO"
+        )
+        config = replace(
+            config,
+            pipeline_lane="live",
+            history_exchange=exchange,
+            history_silver=history.silver_root,
+        )
+    else:
+        assert run(replace(config, family="MP9_CAMBIO_MODELO"))["updated_this_attempt"] == 2
+        assert inspect(config)["status"] == "STALE"
     run(replace(config, family="CATALOGO_PRODUCCIONES"))
     assert run(config)["updated_this_attempt"] == 2
     current = {

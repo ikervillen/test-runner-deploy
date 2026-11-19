@@ -101,3 +101,11 @@ class CatalogControl(Control):
                 "SELECT * FROM composition WHERE batch_id=?", (row["batch_id"],)
             )
         }
+
+    def historical_mp9_reference(self):
+        row = self.db.execute(
+            "SELECT source_manifest_json FROM publications ORDER BY publication_no DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0]).get("MP9_CAMBIO_MODELO", {}).get("historical_closures")

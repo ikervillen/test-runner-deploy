@@ -32,7 +32,9 @@ def process(config, control, attempt):
     version, previous = store.read()
     if control.setting("last_version") not in (None, str(version)):
         raise IntegrityError("El catálogo y su control no coinciden")
-    models, records, manifest, cases = load_sources(config)
+    models, records, manifest, cases = load_sources(
+        config, previous_history=control.historical_mp9_reference()
+    )
     lines = dict(config.line_by_origin)
     if {r["origen_fenix"] for r in records.values()} - set(lines):
         raise ConfigurationError("Falta una correspondencia explícita de origen a línea")

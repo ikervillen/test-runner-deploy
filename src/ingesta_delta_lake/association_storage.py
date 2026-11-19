@@ -18,7 +18,7 @@ from . import associations as a
 from .ar_storage import ArStore
 from .catalog_storage import CatalogStore
 from .commit_protocol import application_transaction, delta_configuration, merge_counts_match
-from .common import IntegrityError, canonical, digest, now
+from .common import DependencyPending, IntegrityError, canonical, digest, now
 from .control import Control
 from .defects_storage import DefectsStore
 from .delta import DeltaStore
@@ -144,7 +144,7 @@ def load_bundle(config, *, physical=False, manifest=None):
                 and descriptor["quality_hash"] != current["quality_hash"]
             )
         ):
-            raise IntegrityError("Actualizar el catálogo: sus fuentes han cambiado")
+            raise DependencyPending("Actualizar el catálogo: sus fuentes han cambiado")
     if extra["diagnostics"]["mapping"] != dict(config.line_by_origin):
         raise IntegrityError("Correspondencia de líneas distinta del catálogo")
     if extra["diagnostics"].get("topology_enabled", False) != config.topology_enabled or extra[
