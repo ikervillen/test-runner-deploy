@@ -135,10 +135,10 @@ jobs:
         run: |
           python -m pip install uv==0.11.6
           uv run --locked --no-dev python -m scripts.smoke_independent_compose fenix-independent:validation .quality-context
-      - name: Prepare the approved Gold live update
+      - name: Prepare the approved Gold worker update
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '48aa015052aad9cd4ffc5e8130aa0200d7a78825' && github.event.head_commit.message == 'Roll out current Gold live with verified ZF handovers'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '28203e74176d13081a48480a04d217fb4cf3df49' && github.event.head_commit.message == 'Roll out Gold MIA references'
         run: |
           set -euo pipefail
           mkdir -p bundle
@@ -218,7 +218,7 @@ jobs:
           pattern: live-image-*
           path: ${{ runner.temp }}/fenix-image-${{ github.run_id }}-${{ github.run_attempt }}
           merge-multiple: true
-      - name: Replace only Gold live
+      - name: Replace the Gold workers
         shell: powershell
         env:
           FENIX_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
@@ -227,7 +227,7 @@ jobs:
         run: |
           $bundle = Join-Path $env:RUNNER_TEMP "fenix-image-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           try {
-            ./scripts/update_independent_workers.ps1 -GoldOnly -Immediate -Bundle $bundle `
+            ./scripts/update_independent_workers.ps1 -GoldOnly -IncludeGoldHistory -Immediate -Bundle $bundle `
               -Image $env:IMAGE -Revision $env:GITHUB_SHA -GoldRevision $env:GOLD_SOURCE_COMMIT
           } finally {
             Remove-Item -LiteralPath (Join-Path $bundle 'image.tar.gz'), (Join-Path $bundle 'image.json') -ErrorAction SilentlyContinue

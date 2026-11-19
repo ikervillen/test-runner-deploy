@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Revision,
     [Parameter(Mandatory = $true)][string]$GoldRevision,
     [switch]$GoldOnly,
+    [switch]$IncludeGoldHistory,
     [switch]$Immediate
 )
 $ErrorActionPreference = 'Stop'
@@ -16,7 +17,13 @@ $site = Get-Content -LiteralPath $sitePath -Raw | ConvertFrom-Json
 $context = if ($hasSite) { $site.docker_context } else { $env:FENIX_DOCKER_CONTEXT }
 if (-not $context) { throw 'No se ha configurado el contexto Docker.' }
 $project = $profile.project
-$services = @(if ($GoldOnly) { 'gold-live' } else { 'ingesta-live', 'ingesta-history', 'gold-live' })
+if ($GoldOnly) {
+    $services = @('gold-live')
+    if ($IncludeGoldHistory) { $services += 'gold-history' }
+} else {
+    if ($IncludeGoldHistory) { throw 'IncludeGoldHistory requiere GoldOnly.' }
+    $services = @('ingesta-live', 'ingesta-history', 'gold-live')
+}
 
 function Invoke-Docker {
     & docker --context $context @args
@@ -35,7 +42,7 @@ if ($Revision -cnotmatch '^[a-f0-9]{40}$' -or $GoldRevision -cnotmatch '^[a-f0-9
     $Image -cnotmatch '^ghcr\.io/ikervillen/test-runner-deploy@sha256:[a-f0-9]{64}$') {
     throw 'La imagen y ambas revisiones deben estar fijadas.'
 }
-if ($Immediate -and -not $GoldOnly) { throw 'El reemplazo inmediato queda limitado a Gold live.' }
+if ($Immediate -and -not $GoldOnly) { throw 'El reemplazo inmediato queda limitado a los workers Gold.' }
 $workers = @{}
 foreach ($service in $services) { $workers[$service] = Get-Worker $service }
 $anchor = $workers[$services[0]]
@@ -92,7 +99,7 @@ $candidate = Join-Path $activeDirectory "compose.$($Revision.Substring(0, 12)).j
 Invoke-Docker compose -p $project -f $candidate config --quiet
 if ($Immediate) {
     Invoke-Docker compose -p $project -f $candidate up -d --no-deps --no-build --pull never `
-        --force-recreate --timeout 0 gold-live
+        --force-recreate --timeout 0 @services
 } else {
     $originalOperations = 'import json; from pathlib import Path; print(",".join(p.stem for p in Path("/pipelines/live/gold/published/operations").glob("*.json") if json.loads(p.read_text())["state"] != "ACKNOWLEDGED"))'
     $originalPending = ($originalOperations | docker --context $context exec -i ($workers['gold-live'].Id) python -) -join ''
