@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Bundle,
     [Parameter(Mandatory = $true)][string]$Image,
     [Parameter(Mandatory = $true)][string]$Revision,
-    [Parameter(Mandatory = $true)][string]$GoldRevision
+    [Parameter(Mandatory = $true)][string]$GoldRevision,
+    [switch]$GoldOnly
 )
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
@@ -14,7 +15,7 @@ $site = Get-Content -LiteralPath $sitePath -Raw | ConvertFrom-Json
 $context = if ($hasSite) { $site.docker_context } else { $env:FENIX_DOCKER_CONTEXT }
 if (-not $context) { throw 'No se ha configurado el contexto Docker.' }
 $project = $profile.project
-$services = @('ingesta-live', 'ingesta-history', 'gold-live')
+$services = @(if ($GoldOnly) { 'gold-live' } else { 'ingesta-live', 'ingesta-history', 'gold-live' })
 
 function Invoke-Docker {
     & docker --context $context @args
@@ -35,10 +36,10 @@ if ($Revision -cnotmatch '^[a-f0-9]{40}$' -or $GoldRevision -cnotmatch '^[a-f0-9
 }
 $workers = @{}
 foreach ($service in $services) { $workers[$service] = Get-Worker $service }
-$live = $workers['ingesta-live']
-$activeFile = $live.Config.Labels.'com.docker.compose.project.config_files'
+$anchor = $workers[$services[0]]
+$activeFile = $anchor.Config.Labels.'com.docker.compose.project.config_files'
 if (-not $activeFile -or -not (Test-Path -LiteralPath $activeFile -PathType Leaf)) {
-    throw 'No se encuentra el Compose activo de ingesta-live.'
+    throw "No se encuentra el Compose activo de $($services[0])."
 }
 $compose = Get-Content -LiteralPath $activeFile -Raw | ConvertFrom-Json
 if ($compose.name -cne $project) { throw 'El Compose activo pertenece a otro proyecto.' }

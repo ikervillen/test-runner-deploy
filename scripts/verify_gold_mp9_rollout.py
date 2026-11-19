@@ -20,6 +20,7 @@ from ingesta_delta_lake.pipeline_rows import portable
 ROOT = Path("/pipelines")
 PUBLISHED = ROOT / "live/gold/published"
 HEALTH = ROOT / "live/gold/checkpoint/health.json"
+SPILL = str(HEALTH.parent / "facts-work")
 WINDOW = timedelta(minutes=10)
 ZONE = ZoneInfo("Europe/Madrid")
 MP9 = "MP9_CAMBIO_MODELO"
@@ -226,6 +227,7 @@ def main():
                 all(item["ok"] for item in mp9.values()),
                 health["status"],
                 recovered,
+                health.get("spill_directory"),
             )
             if progress != previous:
                 print(
@@ -237,6 +239,7 @@ def main():
                             "gold": health["status"],
                             "error": health.get("error"),
                             "recuperacion": recovered,
+                            "sqlite_temporal": health.get("spill_directory"),
                         }
                     )
                 )
@@ -247,6 +250,7 @@ def main():
                 and all(state == "ACKNOWLEDGED" for state in recovered.values())
                 and all(item["ok"] for item in mp9.values())
                 and health["status"] in {"PUBLISHED", "UNCHANGED"}
+                and health.get("spill_directory") == SPILL
             ):
                 break
         except FileNotFoundError as exc:
@@ -265,6 +269,7 @@ def main():
         and previous[2]
         and previous[3] in {"PUBLISHED", "UNCHANGED"}
         and all(state == "ACKNOWLEDGED" for state in previous[4].values())
+        and previous[5] == SPILL
         and all(r["late"] == 0 and r["silver"] == r["gold"] for r in rows_report)
     )
     reasons = pending_reasons(observed, found, ends)

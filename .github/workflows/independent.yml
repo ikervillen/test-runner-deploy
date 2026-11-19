@@ -15,7 +15,7 @@ env:
 
 jobs:
   contracts-and-delta:
-    if: github.event_name != 'push' || github.event.before != '7e5afbf08e91753f44d6d14917a0563eddacc0ab'
+    if: github.event_name != 'push' || github.event.before != 'd789f7c5eda5b1682a2111fce6b1e745e220c2f3'
     strategy:
       fail-fast: false
       matrix:
@@ -44,7 +44,7 @@ jobs:
         run: uv run --locked python -m pytest --cov=ingesta_delta_lake --cov=deployment --cov-report=term-missing --cov-fail-under=85
 
   gold-native-contracts:
-    if: github.event_name != 'push' || github.event.before != '7e5afbf08e91753f44d6d14917a0563eddacc0ab'
+    if: github.event_name != 'push' || github.event.before != 'd789f7c5eda5b1682a2111fce6b1e745e220c2f3'
     strategy:
       fail-fast: false
       matrix:
@@ -135,10 +135,10 @@ jobs:
         run: |
           python -m pip install uv==0.11.6
           uv run --locked --no-dev python -m scripts.smoke_independent_compose fenix-independent:validation .quality-context
-      - name: Prepare the approved update of the Gold and ingestion workers
+      - name: Prepare the approved Gold live update
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '7e5afbf08e91753f44d6d14917a0563eddacc0ab' && github.event.head_commit.message == 'Roll out Gold and MP9 workers'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == 'd789f7c5eda5b1682a2111fce6b1e745e220c2f3' && github.event.head_commit.message == 'Roll out Gold live disk spill'
         run: |
           set -euo pipefail
           mkdir -p bundle
@@ -218,7 +218,7 @@ jobs:
           pattern: live-image-*
           path: ${{ runner.temp }}/fenix-image-${{ github.run_id }}-${{ github.run_attempt }}
           merge-multiple: true
-      - name: Update the three existing workers
+      - name: Replace only Gold live
         shell: powershell
         env:
           FENIX_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
@@ -227,7 +227,7 @@ jobs:
         run: |
           $bundle = Join-Path $env:RUNNER_TEMP "fenix-image-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           try {
-            ./scripts/update_independent_workers.ps1 -Bundle $bundle `
+            ./scripts/update_independent_workers.ps1 -GoldOnly -Bundle $bundle `
               -Image $env:IMAGE -Revision $env:GITHUB_SHA -GoldRevision $env:GOLD_SOURCE_COMMIT
           } finally {
             Remove-Item -LiteralPath (Join-Path $bundle 'image.tar.gz'), (Join-Path $bundle 'image.json') -ErrorAction SilentlyContinue
