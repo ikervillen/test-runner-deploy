@@ -13,11 +13,18 @@ from .common import IntegrityError
 class FactStore:
     """One SQLite file of pickled rows. Readers see a production only after `ready`."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, max_bytes: int | None = None):
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         # The Delta writer pulls batches from another thread. Reads stay on this connection.
         self._conn = sqlite3.connect(path, check_same_thread=False)
+        if max_bytes is not None:
+            page_size = self._conn.execute("PRAGMA page_size").fetchone()[0]
+            page_limit = max_bytes // page_size
+            if page_limit < 1:
+                self._conn.close()
+                raise IntegrityError("Gold spill budget must cover at least one SQLite page")
+            self._conn.execute(f"PRAGMA max_page_count={page_limit}")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA temp_store=FILE")
@@ -173,6 +180,8 @@ class FactStore:
     def close(self) -> None:
         if getattr(self, "_closed", False):
             return
-        self.flush()
-        self._conn.close()
-        self._closed = True
+        try:
+            self.flush()
+        finally:
+            self._conn.close()
+            self._closed = True

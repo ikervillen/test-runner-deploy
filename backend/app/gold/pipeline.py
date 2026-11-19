@@ -711,16 +711,18 @@ class SpilledTables(dict):
         if self._closed:
             return
         self._closed = True
-        self.store.close()
-        for attempt in range(3):
-            try:
-                self._directory.cleanup()
-                return
-            except OSError as exc:
-                # Windows may briefly retain a deleted SQLite sidecar.
-                if exc.errno != ENOTEMPTY or attempt == 2:
-                    raise
-                sleep(0.05)
+        try:
+            self.store.close()
+        finally:
+            for attempt in range(3):
+                try:
+                    self._directory.cleanup()
+                    break
+                except OSError as exc:
+                    # Windows may briefly retain a deleted SQLite sidecar.
+                    if exc.errno != ENOTEMPTY or attempt == 2:
+                        raise
+                    sleep(0.05)
 
     def __del__(self) -> None:
         self.close()
@@ -1037,6 +1039,8 @@ def build(
     since: datetime | None = None,
     copied_until: dict[str, datetime] | None = None,
     reference_snapshot=None,
+    spill_root: Path | None = None,
+    spill_db_bytes: int | None = None,
 ) -> tuple[SpilledTables | None, list[dict]]:
     """Score one lane. `all` is the manual full build; live and history score a chunk."""
     validate_config(config)
@@ -1102,9 +1106,15 @@ def build(
             statistics.update(score_stats)
             statistics["lane_status"] = "IDLE"
         return None, []
-    spill_dir = tempfile.TemporaryDirectory(prefix="gold-facts-")
-    store = FactStore(Path(spill_dir.name) / "facts.sqlite")
-    published = None
+    if spill_root is not None:
+        spill_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    spill_dir = tempfile.TemporaryDirectory(prefix="gold-facts-", dir=spill_root)
+    try:
+        store = FactStore(Path(spill_dir.name) / "facts.sqlite", max_bytes=spill_db_bytes)
+    except BaseException:
+        spill_dir.cleanup()
+        raise
+    published = SpilledTables(store, spill_dir)
     handed = False
     try:
         with clock.stage("facts"):
@@ -1274,7 +1284,6 @@ def build(
                         absorb(result)
         store.dedupe()
         scope_rows.extend(_pending_scope_rows(pending, snapshot, last_discovery))
-        published = SpilledTables(store, spill_dir)
         score_chunks = [chunk for chunk in hour_plan or [] if not chunk.facts_only]
         published.replace_ids = None if chosen is None or facts_only else scoring
         published.hours = (
@@ -1358,11 +1367,7 @@ def build(
         return published, published["publication_scope_status"]
     finally:
         if not handed:
-            if published is not None:
-                published.close()
-            else:
-                store.close()
-                spill_dir.cleanup()
+            published.close()
 
 
 def _live_receipt(output_root: Path) -> dict | None:
@@ -1454,6 +1459,8 @@ def _run(
     confirmed_input=None,
     reference_snapshot=None,
     recovery: tuple[str, dict] | None = None,
+    spill_root: Path | None = None,
+    spill_db_bytes: int | None = None,
 ) -> dict:
     input_root, output_root = input_root.resolve(strict=True), output_root.resolve()
     if (
@@ -1597,6 +1604,8 @@ def _run(
                 since=since,
                 copied_until=copied_until,
                 reference_snapshot=reference_snapshot,
+                spill_root=spill_root,
+                spill_db_bytes=spill_db_bytes,
             )
             if tables is None:
                 if recovery is not None:

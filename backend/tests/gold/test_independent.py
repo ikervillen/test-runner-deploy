@@ -247,14 +247,18 @@ def test_cross_boundary_facts_recalculate_the_same_as_one_complete_input(tmp_pat
     source = combine(live, history, max_rows=100000)
     assert len(source.rows("LISTA_RECH")) == 8
     assert len(source.rows("SIP_MODELO")) == 1
+    scratch = tmp_path / "gold" / "checkpoint" / "facts-work"
     tables, _ = build(
         source,
         bundle=bundle(),
         config=read_json(Path(__file__).parents[3] / "config/customer_score.json"),
         cutoff=CUTOFF,
         calculation_time=CUTOFF,
+        spill_root=scratch,
+        spill_db_bytes=32 * 1024**2,
     )
     try:
+        assert tables.store.path.parent.parent == scratch
         exposures = [r for r in tables["mia_window_exposures"] if r["tipo_ventana"] == "PRODUCTION"]
         assert len(exposures) == 4
         assert {r["inspeccionadas"] for r in exposures} == {1500}
@@ -483,13 +487,42 @@ def test_gold_health_observes_its_owner_lock_without_waiting_on_history(independ
         assert worker.health() == {"status": "STARTING", "lane": "live"}
 
 
+def test_worker_spill_is_on_its_own_volume_and_recovers_only_abandoned_work(
+    independent, monkeypatch
+):
+    from app.gold.independent_runtime import Worker
+
+    plan, cfg = independent
+    worker = Worker(plan, "live", cfg, score={}, catalogs={})
+    worker.prepare()
+    abandoned = worker.spill_root / "gold-facts-abandoned"
+    abandoned.mkdir(parents=True)
+    (abandoned / "facts.sqlite").touch()
+    kept = worker.spill_root / "other"
+    kept.mkdir()
+    history = plan.history.gold / "checkpoint" / "facts-work" / "gold-facts-history"
+    history.mkdir(parents=True)
+
+    def check_paths():
+        assert not abandoned.exists()
+        assert kept.exists() and history.exists()
+        return {"status": "UNCHANGED"}
+
+    monkeypatch.setattr(worker, "cycle", check_paths)
+    worker.run(once=True)
+
+
 @pytest.mark.parametrize("phase", ["commit:publication_scope_status", "promoted", "legacy"])
 def test_worker_recovers_original_input_before_exporting_new_silver(
     tmp_path, native, monkeypatch, phase
 ):
+    from time import monotonic
     from types import SimpleNamespace
 
+    from ingesta_delta_lake.pipeline_rows import portable
+
     from app.gold import independent_runtime as runtime
+    from app.gold.attribution import source_id
     from app.gold.common import atomic_json, read_json
     from app.gold.independent_inputs import cutoff
     from app.gold.pipeline import run
@@ -545,6 +578,12 @@ def test_worker_recovers_original_input_before_exporting_new_silver(
         return new
 
     monkeypatch.setattr(runtime, "export", next_input)
+    started = monotonic()
     result = worker.cycle()
+    assert monotonic() - started < 600
     assert result["recovered_publication_id"] == pending
-    assert Snapshot.open(output).manifest["input_publication_id"] == new.publication_id
+    current = Snapshot.open(output)
+    assert current.manifest["input_publication_id"] == new.publication_id
+    for family, fact in (("LISTA_RECH", "mia_inspections"), ("LISTA_DEFECTOS", "mia_rejections")):
+        ids = {source_id(family, portable(row)) for row in new.rows(family)}
+        assert ids and ids <= {row["id_observacion"] for row in current.rows(fact)}

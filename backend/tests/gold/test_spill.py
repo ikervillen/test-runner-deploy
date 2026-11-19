@@ -1,9 +1,21 @@
 """Facts stay on disk per production."""
 
+import sqlite3
+
 import pytest
 
 from app.gold.common import IntegrityError
 from app.gold.spill import FactStore
+
+
+def test_fact_store_has_a_configured_database_limit_and_releases_failed_connections(tmp_path):
+    path = tmp_path / "facts.sqlite"
+    store = FactStore(path, max_bytes=64 * 1024)
+    store.add("mia_rejections", "p-a", "id", {"payload": b"a" * (128 * 1024)})
+    with pytest.raises(sqlite3.OperationalError) as error:
+        store.close()
+    assert error.value.sqlite_errorcode == sqlite3.SQLITE_FULL
+    path.unlink()
 
 
 def test_one_production_load_does_not_return_the_other(tmp_path):

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import signal
+import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -27,8 +30,33 @@ class Worker:
         self.score, self.catalogs = score, catalogs
         self.stop = threading.Event()
         self.root = self.storage.gold
+        self.spill_root = self.root / "checkpoint" / "facts-work"
         self.reference = None
         self.acknowledged = set()
+
+    def prepare_spill(self):
+        self.spill_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        root = self.spill_root.resolve(strict=True)
+        if root != self.spill_root.absolute() or not root.is_relative_to(self.root.resolve()):
+            raise IntegrityError("Gold scratch directory escapes its storage")
+        for path in root.iterdir():
+            if (
+                path.name.startswith("gold-facts-")
+                and path.is_dir()
+                and not path.is_symlink()
+                and path.resolve() == path
+            ):
+                shutil.rmtree(path)
+
+    @staticmethod
+    def spill_budget():
+        try:
+            limit = int(os.environ.get("GOLD_SPILL_DB_BYTES", str(2 * 1024**3)))
+        except ValueError as exc:
+            raise IntegrityError("GOLD_SPILL_DB_BYTES must be an integer") from exc
+        if limit <= 0:
+            raise IntegrityError("GOLD_SPILL_DB_BYTES must be positive")
+        return limit
 
     def prepare(self):
         identity = digest(
@@ -85,6 +113,8 @@ class Worker:
             max_rows_per_source=self.policy.read_max_rows,
             max_total_rows=self.policy.read_max_rows,
             recovery=recovery,
+            spill_root=self.spill_root,
+            spill_db_bytes=self.spill_budget(),
         )
 
     def recover_publication(self):
@@ -191,6 +221,7 @@ class Worker:
         sources = evidence.document.get("sources") or []
         result.update(
             silver_publication_id=sources[0] if sources else None,
+            spill_directory=str(self.spill_root),
             export_seconds=round(began_publish - began_export, 3),
             calculation_and_publish_seconds=round(monotonic() - began_publish, 3),
         )
@@ -215,6 +246,7 @@ class Worker:
 
         self.prepare()
         with portalocker.Lock(self.root / "checkpoint" / "worker.lock", timeout=0):
+            self.prepare_spill()
             while not self.stop.is_set():
                 try:
                     result = self.cycle()
@@ -224,6 +256,11 @@ class Worker:
                         "error_type": type(exc).__name__,
                         "error": str(exc),
                     }
+                    if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_FULL:
+                        result.update(
+                            spill_directory=str(self.spill_root),
+                            spill_disk_free_bytes=shutil.disk_usage(self.spill_root).free,
+                        )
                 result.update(lane=self.lane, time=utc_now())
                 atomic_json(self.root / "checkpoint" / "health.json", result)
                 print(canonical(result).decode("utf-8"), flush=True)
@@ -259,6 +296,8 @@ def main(argv=None):
     if args.health:
         print(canonical(worker.health()).decode("utf-8"))
     else:
+        # SQLite sorts can spill files independently of facts.sqlite and its WAL.
+        os.environ["SQLITE_TMPDIR"] = str(worker.spill_root)
         worker.run(once=args.once)
 
 
