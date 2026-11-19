@@ -10,8 +10,9 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta
+from errno import ENOTEMPTY
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any
 
 import portalocker
@@ -711,7 +712,15 @@ class SpilledTables(dict):
             return
         self._closed = True
         self.store.close()
-        self._directory.cleanup()
+        for attempt in range(3):
+            try:
+                self._directory.cleanup()
+                return
+            except OSError as exc:
+                # Windows may briefly retain a deleted SQLite sidecar.
+                if exc.errno != ENOTEMPTY or attempt == 2:
+                    raise
+                sleep(0.05)
 
     def __del__(self) -> None:
         self.close()
