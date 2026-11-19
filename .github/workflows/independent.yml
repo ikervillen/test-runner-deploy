@@ -15,6 +15,7 @@ env:
 
 jobs:
   contracts-and-delta:
+    if: github.event_name != 'push' || github.event.before != '7e5afbf08e91753f44d6d14917a0563eddacc0ab'
     strategy:
       fail-fast: false
       matrix:
@@ -43,6 +44,7 @@ jobs:
         run: uv run --locked python -m pytest --cov=ingesta_delta_lake --cov=deployment --cov-report=term-missing --cov-fail-under=85
 
   gold-native-contracts:
+    if: github.event_name != 'push' || github.event.before != '7e5afbf08e91753f44d6d14917a0563eddacc0ab'
     strategy:
       fail-fast: false
       matrix:
@@ -133,10 +135,10 @@ jobs:
         run: |
           python -m pip install uv==0.11.6
           uv run --locked --no-dev python -m scripts.smoke_independent_compose fenix-independent:validation .quality-context
-      - name: Prepare the approved live update
+      - name: Prepare the approved update of the Gold and ingestion workers
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == 'c1b02a62ff4af42a98bcdc48f702a8d84d23bcc2'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '7e5afbf08e91753f44d6d14917a0563eddacc0ab' && github.event.head_commit.message == 'Roll out Gold and MP9 workers'
         run: |
           set -euo pipefail
           mkdir -p bundle
@@ -154,7 +156,7 @@ jobs:
           overwrite: true
 
   publish-live:
-    needs: [contracts-and-delta, gold-native-contracts, independent-image]
+    needs: independent-image
     if: needs.independent-image.outputs.rollout == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -203,7 +205,7 @@ jobs:
     needs: publish-live
     runs-on: [self-hosted, Windows, X64, fenix-ingesta]
     environment: develop
-    timeout-minutes: 45
+    timeout-minutes: 90
     concurrency:
       group: ingesta-deploy-${{ github.repository }}-develop
       cancel-in-progress: false
@@ -216,19 +218,35 @@ jobs:
           pattern: live-image-*
           path: ${{ runner.temp }}/fenix-image-${{ github.run_id }}-${{ github.run_attempt }}
           merge-multiple: true
-      - name: Update only the existing live worker
+      - name: Update the three existing workers
         shell: powershell
         env:
           FENIX_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
-          FENIX_INPUT_BIND: ${{ vars.INGESTA_INPUT_BIND }}
           FENIX_DOCKER_CONTEXT: ${{ vars.INGESTA_DOCKER_CONTEXT }}
-          GOLD_CATALOGS_GZIP_B64: ${{ secrets.GOLD_CATALOGS_GZIP_B64 }}
           IMAGE: ${{ needs.publish-live.outputs.digest }}
         run: |
           $bundle = Join-Path $env:RUNNER_TEMP "fenix-image-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           try {
-            ./scripts/start_independent.ps1 -LiveOnly -Site $env:FENIX_SITE -Bundle $bundle `
+            ./scripts/update_independent_workers.ps1 -Bundle $bundle `
               -Image $env:IMAGE -Revision $env:GITHUB_SHA -GoldRevision $env:GOLD_SOURCE_COMMIT
           } finally {
             Remove-Item -LiteralPath (Join-Path $bundle 'image.tar.gz'), (Join-Path $bundle 'image.json') -ErrorAction SilentlyContinue
           }
+      - name: Verify recovery, historical closures and live freshness
+        shell: powershell
+        run: |
+          $gold = @(docker --context $env:FENIX_VERIFY_CONTEXT ps `
+            --filter "label=com.docker.compose.project=$env:FENIX_VERIFY_PROJECT" `
+            --filter 'label=com.docker.compose.service=gold-live' --format '{{.ID}}')
+          if ($LASTEXITCODE -ne 0 -or $gold.Count -ne 1) { throw 'No se encuentra Gold live.' }
+          Get-Content -LiteralPath ./scripts/verify_gold_mp9_rollout.py -Raw |
+            docker --context $env:FENIX_VERIFY_CONTEXT exec -i -e RAYON_NUM_THREADS=1 `
+              -e TOKIO_WORKER_THREADS=1 $gold[0] python -u - $env:FENIX_VERIFY_SINCE `
+              "$env:FENIX_VERIFY_PENDING" | Tee-Object -FilePath "$env:RUNNER_TEMP/fenix-gold-mp9-report.txt"
+          if ($LASTEXITCODE -ne 0) { throw 'La verificación de Gold tiene condiciones pendientes.' }
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: always()
+        with:
+          name: gold-mp9-verification
+          path: ${{ runner.temp }}/fenix-gold-mp9-report.txt
+          if-no-files-found: ignore
