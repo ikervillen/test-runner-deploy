@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Image,
     [Parameter(Mandatory = $true)][string]$Revision,
     [Parameter(Mandatory = $true)][string]$GoldRevision,
-    [switch]$GoldOnly
+    [switch]$GoldOnly,
+    [switch]$Immediate
 )
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
@@ -34,6 +35,7 @@ if ($Revision -cnotmatch '^[a-f0-9]{40}$' -or $GoldRevision -cnotmatch '^[a-f0-9
     $Image -cnotmatch '^ghcr\.io/ikervillen/test-runner-deploy@sha256:[a-f0-9]{64}$') {
     throw 'La imagen y ambas revisiones deben estar fijadas.'
 }
+if ($Immediate -and -not $GoldOnly) { throw 'El reemplazo inmediato queda limitado a Gold live.' }
 $workers = @{}
 foreach ($service in $services) { $workers[$service] = Get-Worker $service }
 $anchor = $workers[$services[0]]
@@ -88,12 +90,17 @@ $activeDirectory = Split-Path -Parent $activeFile
 $candidate = Join-Path $activeDirectory "compose.$($Revision.Substring(0, 12)).json"
 [IO.File]::WriteAllText($candidate, ($compose | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
 Invoke-Docker compose -p $project -f $candidate config --quiet
-$originalOperations = 'import json; from pathlib import Path; print(",".join(p.stem for p in Path("/pipelines/live/gold/published/operations").glob("*.json") if json.loads(p.read_text())["state"] != "ACKNOWLEDGED"))'
-$originalPending = ($originalOperations | docker --context $context exec -i ($workers['gold-live'].Id) python -) -join ''
-if ($LASTEXITCODE -ne 0) { throw 'No se pudo leer el registro actual de Gold.' }
-$started = [DateTimeOffset]::UtcNow.ToString('o')
-Invoke-Docker compose -p $project -f $candidate up -d --no-deps --no-build --pull never `
-    --timeout ([int]$site.drain_seconds) @services
+if ($Immediate) {
+    Invoke-Docker compose -p $project -f $candidate up -d --no-deps --no-build --pull never `
+        --force-recreate --timeout 0 gold-live
+} else {
+    $originalOperations = 'import json; from pathlib import Path; print(",".join(p.stem for p in Path("/pipelines/live/gold/published/operations").glob("*.json") if json.loads(p.read_text())["state"] != "ACKNOWLEDGED"))'
+    $originalPending = ($originalOperations | docker --context $context exec -i ($workers['gold-live'].Id) python -) -join ''
+    if ($LASTEXITCODE -ne 0) { throw 'No se pudo leer el registro actual de Gold.' }
+    $started = [DateTimeOffset]::UtcNow.ToString('o')
+    Invoke-Docker compose -p $project -f $candidate up -d --no-deps --no-build --pull never `
+        --timeout ([int]$site.drain_seconds) @services
+}
 foreach ($service in $services) {
     $worker = Get-Worker $service
     if ($worker.Image -cne $proof.image_id) {
@@ -102,5 +109,7 @@ foreach ($service in $services) {
     Write-Output "${service} | $($worker.Id.Substring(0, 12)) | $tag"
 }
 Invoke-Docker compose -p $project -f $candidate ps --all
-"FENIX_VERIFY_CONTEXT=$context", "FENIX_VERIFY_PROJECT=$project", "FENIX_VERIFY_SINCE=$started", `
-    "FENIX_VERIFY_PENDING=$originalPending" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+if (-not $Immediate) {
+    "FENIX_VERIFY_CONTEXT=$context", "FENIX_VERIFY_PROJECT=$project", "FENIX_VERIFY_SINCE=$started", `
+        "FENIX_VERIFY_PENDING=$originalPending" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+}

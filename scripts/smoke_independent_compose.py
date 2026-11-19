@@ -160,7 +160,8 @@ def smoke(image, gold_context):
                 "from pathlib import Path; import os; "
                 "live, history = [Snapshot.open(Path(os.environ[key]), require_gold_contract=True) "
                 "for key in ('APP_GOLD_ROOT', 'APP_GOLD_HISTORY_ROOT')]; "
-                "assert app and live.publication_id != history.publication_id",
+                "assert app and live.publication_id != history.publication_id; "
+                "assert live.rows('publication_scope_status')",
             )
         finally:
             run("down", "--volumes", "--remove-orphans")
