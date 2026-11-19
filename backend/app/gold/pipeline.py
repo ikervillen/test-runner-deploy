@@ -26,6 +26,7 @@ from . import (
     dimensional,
     facts,
     lanes,
+    mia_statistics,
     references,
 )
 from .attribution import Attribution
@@ -43,7 +44,7 @@ from .evidence import operational_expression
 from .fingerprint import source_fingerprint
 from .freshness import source_freshness
 from .incremental import Prepared
-from .metrics import Window, ar_bases, live_windows, production_windows, zc_bases
+from .metrics import Window, ar_bases, live_windows, mia_bases, production_windows, zc_bases
 from .publications import CommitConflict, Publisher, Snapshot, commit_scope
 from .schemas import KEYS, SCHEMAS, check_row, make_table
 from .scoring import ScoreResult, calculate, validate_config
@@ -118,6 +119,7 @@ REUSED_TABLES = (
 )
 REFERENCE_TABLES = ("mia_reference_sets", "mia_reference_members", "mia_reference_values")
 DIMENSION_TABLES = ("dim_machine", "dim_model", "dim_defect", "dim_date")
+MIA_FAMILIES = frozenset({"LISTA_DEFECTOS", "LISTA_RECH"})
 LIVE_FAMILIES = frozenset({"LISTA_RECH", "LISTA_DEFECTOS", "LISTA_AR", "CONT_ZC"})
 # Scoring runs outside this wait. The pointer swap is the only shared step.
 COMMIT_WAIT_SECONDS = 30
@@ -455,7 +457,7 @@ def _score_job(payload: dict) -> dict:
         and payload["previous_states"].get(identity, {}).get("raw_inputs_hash") == raw_hash
         and identity not in payload["recalculate_closed_ids"]
     )
-    ref = references.build(
+    ref = payload.get("mia_reference") or references.build(
         production,
         payload["productions"],
         payload["segments"],
@@ -500,6 +502,7 @@ def _score_job(payload: dict) -> dict:
                 old_tables=payload["old_tables"],
                 last_discovery=payload["last_discovery"],
                 windows=payload.get("windows"),
+                live_mia="mia_reference" in payload,
             )
         )
         produced = {
@@ -582,6 +585,7 @@ def _score_production(
     old_tables,
     last_discovery,
     windows=None,
+    live_mia=False,
 ):
     """Window bases and scores for one production; returns its scope status rows."""
     scope_rows = []
@@ -605,9 +609,16 @@ def _score_production(
             tables.setdefault("ar_window_bases", []).extend(a["amounts"])
         z = zc_bases(tables["zc_observations"], w, by_zc[p["id_produccion"]])
         tables.setdefault("zc_window_bases", []).extend(z)
-        ready = _coverage_ready(snapshot, p, w, pending)
+        ready = _coverage_ready(
+            snapshot,
+            p,
+            w,
+            pending,
+            LIVE_FAMILIES - MIA_FAMILIES if live_mia else None,
+        )
         if (
-            preserve_closed
+            not live_mia
+            and preserve_closed
             and w.identity in previous_scores
             and ready
             and all(previous_scores[w.identity][k] == v for k, v in w.key.items())
@@ -631,6 +642,15 @@ def _score_production(
                 calculation_time=calculation_time,
                 line=p["linea"],
                 ar_pending_reason=ar_pending_reason,
+                live_mia=live_mia,
+                mia_coverage_ready=not live_mia
+                or _coverage_ready(
+                    snapshot,
+                    p,
+                    w,
+                    pending,
+                    MIA_FAMILIES,
+                ),
             )
         for name, rows in result.tables.items():
             tables.setdefault(name, []).extend(rows)
@@ -761,7 +781,7 @@ def _history(previous, production_id: str, max_rows: int):
     return old, states, scores
 
 
-def _carry_references(previous, store: FactStore, max_rows: int) -> None:
+def _carry_references(previous, store: FactStore, max_rows: int, *, exclude=()) -> None:
     """Keep reference rows a preserved score still points at."""
     if previous is None:
         return
@@ -770,7 +790,40 @@ def _carry_references(previous, store: FactStore, max_rows: int) -> None:
         if name not in available:
             continue
         for row in previous.rows(name, max_rows=max_rows):
-            _store_row(store, name, row.get("id_produccion") or "", row)
+            if row["reference_id"] not in exclude:
+                _store_row(store, name, row.get("id_produccion") or "", row)
+
+
+def _reference_rows(snapshot, name, max_rows):
+    if snapshot is None or name not in {ref["name"] for ref in snapshot.manifest["tables"]}:
+        return []
+    return snapshot.rows(name, max_rows=max_rows)
+
+
+def _live_mia_samples(snapshot, store, selected, windows, pending):
+    denominators = defaultdict(int)
+    counts = defaultdict(lambda: defaultdict(int))
+    for p in selected:
+        model = p["codigo_modelo_botella"]
+        if not model:
+            continue
+        pid = p["id_produccion"]
+        rejections = store.load("mia_rejections", pid)
+        inspections = store.load("mia_inspections", pid)
+        for window in windows[pid]:
+            if not _coverage_ready(snapshot, p, window, pending, MIA_FAMILIES):
+                continue
+            basis = mia_bases(rejections, inspections, window)
+            inspected = basis["exposure"]["inspeccionadas"]
+            if inspected <= 0:
+                continue
+            denominators[model] += inspected
+            for row in basis["rates"]:
+                counts[model][row["espacio_defecto"], row["codigo_defecto"]] += row["rechazos"]
+    return {
+        model: {key: 100 * rejected / inspected for key, rejected in counts[model].items()}
+        for model, inspected in denominators.items()
+    }
 
 
 def _previous_coverage(previous, max_rows: int) -> dict:
@@ -1035,6 +1088,7 @@ def build(
     spill_root: Path | None = None,
     spill_db_bytes: int | None = None,
     current_slot_seconds: int | None = None,
+    mia_reference_mode: str | None = None,
 ) -> tuple[SpilledTables | None, list[dict]]:
     """Score one lane. `all` is the manual full build; live and history score a chunk."""
     validate_config(config)
@@ -1145,8 +1199,9 @@ def build(
             )
             del decisions
             reader.release("observation_assignments")
-        with clock.stage("previous"):
-            _carry_references(previous, store, max_total_rows)
+        if mia_reference_mode is None:
+            with clock.stage("previous"):
+                _carry_references(previous, store, max_total_rows)
         scoring = {p["id_produccion"] for p in selected}
         facts_only = bool(hour_plan) and all(chunk.facts_only for chunk in hour_plan or [])
         if facts_only:
@@ -1163,7 +1218,7 @@ def build(
             ]
             scoring = {production["id_produccion"] for production in selected}
         rates = {}
-        if not facts_only:
+        if not facts_only and mia_reference_mode != "live":
             for production in prods:
                 # One hour is not a production rate. Peers come from stored slices.
                 if hour_plan is not None or production["id_produccion"] not in scoring:
@@ -1173,6 +1228,11 @@ def build(
                     continue
                 windows = production_windows(production, cutoff)
                 if not (windows and production["estado_produccion"] == "CLOSED"):
+                    continue
+                if (
+                    mia_reference_mode == "history"
+                    and windows[0].cutoff != production["fecha_fin_zf"]
+                ):
                     continue
                 old_tables, previous_states, _scores = _history(
                     previous, production["id_produccion"], max_total_rows
@@ -1194,7 +1254,7 @@ def build(
                 ):
                     rates[production["id_produccion"]] = base["rates"]
                 del prepared, _rows, old_tables
-        if reference_snapshot is not None:
+        if reference_snapshot is not None and mia_reference_mode != "live":
             for production in prods:
                 identity = production["id_produccion"]
                 if identity not in rates and production["estado_produccion"] == "CLOSED":
@@ -1205,6 +1265,54 @@ def build(
         config_id = digest([config, bundle])
         catalog_version = digest(catalog_bundle)
         scope_rows: list[dict] = []
+        score_windows = defaultdict(list)
+        for chunk in hour_plan or ():
+            if not chunk.facts_only:
+                score_windows[chunk.production_id].append(
+                    Window(chunk.production_id, "HOUR", chunk.start, chunk.end, chunk.cutoff)
+                )
+        effective = {}
+        if mia_reference_mode is not None:
+            with clock.stage("previous"):
+                minimum = int(config["mia"]["historical_scope"]["min_samples"])
+                previous_sets = _reference_rows(previous, "mia_reference_sets", max_total_rows)
+                if mia_reference_mode == "live":
+                    historical = mia_statistics.historical_index(
+                        _reference_rows(reference_snapshot, "mia_reference_sets", max_total_rows),
+                        _reference_rows(reference_snapshot, "mia_reference_values", max_total_rows),
+                        minimum=minimum,
+                    )
+                    samples = _live_mia_samples(snapshot, store, selected, score_windows, pending)
+                    published_refs, effective = mia_statistics.live_statistics(
+                        samples,
+                        cutoff,
+                        previous_sets=previous_sets,
+                        previous_values=_reference_rows(
+                            previous,
+                            "mia_reference_values",
+                            max_total_rows,
+                        ),
+                        historical=historical,
+                        segments=segments,
+                        catalog=catalog_version,
+                    )
+                else:
+                    published_refs = mia_statistics.historical_statistics(
+                        prods,
+                        segments,
+                        rates,
+                        catalog=catalog_version,
+                        minimum=minimum,
+                    )
+                    replaced = {
+                        r["reference_id"]
+                        for r in previous_sets
+                        if r["reference_rule_id"] == mia_statistics.HISTORICAL
+                    }
+                    _carry_references(previous, store, max_total_rows, exclude=replaced)
+                for key, name in zip(("sets", "members", "values"), REFERENCE_TABLES, strict=True):
+                    for row in published_refs[key]:
+                        _store_row(store, name, row.get("id_produccion"), row)
 
         def payload_for(production, old_tables, previous_states, previous_scores):
             payload = {
@@ -1232,17 +1340,12 @@ def build(
                 "recalculate_closed_ids": recalculate_closed_ids,
             }
             if hour_plan is not None:
-                payload["windows"] = [
-                    Window(
-                        production["id_produccion"],
-                        "HOUR",
-                        chunk.start,
-                        chunk.end,
-                        chunk.cutoff,
-                    )
-                    for chunk in hour_plan
-                    if chunk.production_id == production["id_produccion"] and not chunk.facts_only
-                ]
+                payload["windows"] = score_windows[production["id_produccion"]]
+            if mia_reference_mode == "live":
+                payload["mia_reference"] = effective.get(
+                    production["codigo_modelo_botella"],
+                    {"sets": [], "members": [], "values": []},
+                )
             return payload
 
         def absorb(result):
@@ -1416,7 +1519,13 @@ def _remember_copied(output_root: Path, statistics: dict) -> None:
             )
 
 
-def _remember_live(output_root: Path, silver_id: str, publication_id: str | None) -> None:
+def _remember_live(
+    output_root: Path,
+    silver_id: str,
+    publication_id: str | None,
+    *,
+    mia_reference_mode=None,
+) -> None:
     """The eight-hour window is stored for this Silver publication, so the next tick can exit."""
     atomic_json(
         output_root / "lanes" / "live.json",
@@ -1424,18 +1533,26 @@ def _remember_live(output_root: Path, silver_id: str, publication_id: str | None
             "status": "ACKNOWLEDGED",
             "horizon": "COMPLETE",
             "input_publication_id": silver_id,
+            "mia_reference_mode": mia_reference_mode,
             "publication_id": publication_id,
         },
     )
 
 
-def _live_caught_up(input_root: Path, output_root: Path, confirmed_input=None) -> dict | None:
+def _live_caught_up(
+    input_root: Path,
+    output_root: Path,
+    confirmed_input=None,
+    *,
+    mia_reference_mode=None,
+) -> dict | None:
     """Same Silver publication and a complete window: do not open the fact history."""
     receipt = _live_receipt(output_root)
     if (
         receipt is None
         or receipt.get("status") != "ACKNOWLEDGED"
         or receipt.get("horizon") != "COMPLETE"
+        or receipt.get("mia_reference_mode") != mia_reference_mode
         or not (output_root / "current.json").exists()
     ):
         return None
@@ -1471,6 +1588,7 @@ def _run(
     spill_root: Path | None = None,
     spill_db_bytes: int | None = None,
     current_slot_seconds: int | None = None,
+    mia_reference_mode: str | None = None,
 ) -> dict:
     input_root, output_root = input_root.resolve(strict=True), output_root.resolve()
     if (
@@ -1489,7 +1607,12 @@ def _run(
     ):
         raise IntegrityError("Historical recalculation requires explicit productions and a reason")
     if lane == "live" and recovery is None:
-        caught_up = _live_caught_up(input_root, output_root, confirmed_input)
+        caught_up = _live_caught_up(
+            input_root,
+            output_root,
+            confirmed_input,
+            mia_reference_mode=mia_reference_mode,
+        )
         if caught_up is not None:
             return caught_up
     if lane == "history":
@@ -1556,6 +1679,7 @@ def _run(
                         "python": platform.python_version(),
                         "recalculation": recalculation,
                         "lane": lane,
+                        "mia_reference_mode": mia_reference_mode,
                     }
                     atomic_json(state_path, state)
             else:
@@ -1570,6 +1694,7 @@ def _run(
                     "recalculation": recalculation,
                     "lane": lane,
                     "current_slot_seconds": current_slot_seconds,
+                    "mia_reference_mode": mia_reference_mode,
                 }
                 state_path = output_root / "runs" / f"{state['work_id']}.json"
                 atomic_json(state_path, state)
@@ -1618,6 +1743,7 @@ def _run(
                 spill_root=spill_root,
                 spill_db_bytes=spill_db_bytes,
                 current_slot_seconds=current_slot_seconds,
+                mia_reference_mode=mia_reference_mode,
             )
             if tables is None:
                 if recovery is not None:
@@ -1628,7 +1754,12 @@ def _run(
                 _remember_copied(output_root, statistics)
                 published_id = previous.publication_id if previous is not None else None
                 if lane == "live" and statistics.get("horizon_complete"):
-                    _remember_live(output_root, snap.publication_id, published_id)
+                    _remember_live(
+                        output_root,
+                        snap.publication_id,
+                        published_id,
+                        mia_reference_mode=mia_reference_mode,
+                    )
                 return {
                     "status": "UNCHANGED",
                     "lane": lane,
@@ -1716,7 +1847,12 @@ def _run(
                     _remember_ar(output_root, statistics)
                     _remember_copied(output_root, statistics)
                     if lane == "live" and statistics.get("horizon_complete"):
-                        _remember_live(output_root, snap.publication_id, result["publication_id"])
+                        _remember_live(
+                            output_root,
+                            snap.publication_id,
+                            result["publication_id"],
+                            mia_reference_mode=mia_reference_mode,
+                        )
                     spilled = getattr(tables, "spilled", ())
                     return {
                         **result,

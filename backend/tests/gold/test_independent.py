@@ -611,3 +611,111 @@ def test_worker_recovers_original_input_before_exporting_new_silver(
     latest_counter = next(row for row in new.rows("CONT_ZC") if row["FECHA"] == latest)
     counter_id = source_id("CONT_ZC", portable(latest_counter))
     assert counter_id in {row["id_observacion"] for row in current.rows("zc_observations")}
+
+
+def test_gold_live_publishes_first_mia_reference_and_score_in_delta(tmp_path, native):
+    from datetime import timedelta
+
+    from app.gold.common import read_json
+    from app.gold.mia_statistics import LIVE_SAMPLE
+    from app.gold.pipeline import run
+    from app.gold.publications import Snapshot
+
+    from .test_pipeline import CUTOFF, bundle
+
+    target = CUTOFF - timedelta(hours=1)
+    evidence = industrial_evidence(
+        tmp_path / "inputs", "live", recent=True, native=native, horizon=target
+    )
+    output = tmp_path / "published"
+    result = run(
+        evidence.root,
+        output,
+        confirmed_input=evidence,
+        bundle=bundle(),
+        config=read_json(Path(__file__).parents[3] / "config/customer_score.json"),
+        cutoff=target,
+        environment="test",
+        plant="AV",
+        lane="live",
+        current_slot_seconds=600,
+        mia_reference_mode="live",
+    )
+    assert result["status"] == "PUBLISHED"
+    published = Snapshot.open(output, require_gold_contract=True)
+    samples = {
+        r["reference_id"]
+        for r in published.rows("mia_reference_sets")
+        if r["reference_rule_id"] == LIVE_SAMPLE
+    }
+    values = [r for r in published.rows("mia_reference_values") if r["reference_id"] in samples]
+    assert values and all(r["muestras"] == 1 and r["sigma_percent"] == 0 for r in values)
+    scores = [r for r in published.rows("quality_scores") if r["corte"] == target]
+    assert scores
+    parts = published.rows("quality_score_components")
+    assert {
+        r["score"]
+        for r in parts
+        if r["componente"] == "MIA" and r["id_resultado"] in {s["id_resultado"] for s in scores}
+    } == {0.0}
+
+
+def test_historical_gold_publishes_model_and_segment_statistics(tmp_path, native):
+    from app.gold.common import read_json
+    from app.gold.mia_statistics import HISTORICAL
+    from app.gold.pipeline import run
+    from app.gold.publications import Snapshot
+
+    from .test_pipeline import CUTOFF, bundle
+
+    evidence = industrial_evidence(tmp_path / "inputs", "history", recent=True, native=native)
+    output = tmp_path / "published"
+    result = run(
+        evidence.root,
+        output,
+        confirmed_input=evidence,
+        bundle=bundle(),
+        config=read_json(Path(__file__).parents[3] / "config/customer_score.json"),
+        cutoff=CUTOFF,
+        environment="test",
+        plant="AV",
+        mia_reference_mode="history",
+    )
+    assert result["status"] == "PUBLISHED"
+    published = Snapshot.open(output, require_gold_contract=True)
+    groups = [
+        r for r in published.rows("mia_reference_sets") if r["reference_rule_id"] == HISTORICAL
+    ]
+    assert {r["nivel"] for r in groups} == {"MODEL", "SEGMENT"}
+    refs = {r["reference_id"] for r in groups}
+    values = [r for r in published.rows("mia_reference_values") if r["reference_id"] in refs]
+    assert values and all(r["muestras"] == 4 and r["estado"] == "READY" for r in values)
+
+    from datetime import timedelta
+
+    target = CUTOFF - timedelta(hours=1)
+    live_evidence = industrial_evidence(
+        tmp_path / "live-inputs",
+        "live",
+        recent=True,
+        native=native,
+        horizon=target,
+    )
+    live_root = tmp_path / "live-gold"
+    live_result = run(
+        live_evidence.root,
+        live_root,
+        confirmed_input=live_evidence,
+        bundle=bundle(),
+        config=read_json(Path(__file__).parents[3] / "config/customer_score.json"),
+        cutoff=target,
+        environment="test",
+        plant="AV",
+        lane="live",
+        current_slot_seconds=600,
+        mia_reference_mode="live",
+        reference_snapshot=published,
+    )
+    assert live_result["status"] == "PUBLISHED"
+    details = Snapshot.open(live_root).rows("mia_score_details")
+    assert details and {r["muestras"] for r in details} == {4}

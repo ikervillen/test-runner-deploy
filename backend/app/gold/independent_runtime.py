@@ -8,6 +8,7 @@ import shutil
 import signal
 import sqlite3
 import threading
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
@@ -92,11 +93,12 @@ class Worker:
             atomic_json(cache, {"publication_id": self.reference.publication_id})
         except (OSError, ValueError):
             if self.reference is None and cache.exists():
-                self.reference = Snapshot.open(
-                    root,
-                    require_gold_contract=True,
-                    publication_id=read_json(cache)["publication_id"],
-                )
+                with suppress(OSError, ValueError):
+                    self.reference = Snapshot.open(
+                        root,
+                        require_gold_contract=True,
+                        publication_id=read_json(cache)["publication_id"],
+                    )
         return self.reference
 
     def publish(self, evidence, reference, *, score, catalogs, cutoff_at, recovery=None):
@@ -124,10 +126,15 @@ class Worker:
             return {
                 "lane": state.get("lane", "all"),
                 "current_slot_seconds": state.get("current_slot_seconds"),
+                "mia_reference_mode": state.get("mia_reference_mode"),
             }
         if self.lane == "live":
-            return {"lane": "live", "current_slot_seconds": self.policy.window_seconds}
-        return {}
+            return {
+                "lane": "live",
+                "current_slot_seconds": self.policy.window_seconds,
+                "mia_reference_mode": "live",
+            }
+        return {"mia_reference_mode": "history"}
 
     def recover_publication(self):
         output = self.root / "published"
