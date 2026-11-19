@@ -84,6 +84,7 @@ def test_latency_uses_first_visible_gold_commit_and_keeps_missing_files_in_denom
     from scripts.audit_live_fenix import assemble
 
     registered = {
+        "name": "test_CONT_ZC.csv",
         "block": START,
         "line": "AV32",
         "family": "CONT_ZC",

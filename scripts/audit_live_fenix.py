@@ -407,13 +407,13 @@ def assemble(
     groups = defaultdict(list)
     for file in data["files"]:
         groups[file["block"], file["line"]].append(file)
-    results, details, proposed = [], [], Counter()
+    results, details, files_report, proposed = [], [], [], Counter()
     start = datetime.fromisoformat(data["start"])
     for block in (start, start + STEP):
         label = f"{block:%d/%m %H:%M}-{block + STEP:%H:%M}"
         for origin in data["lines"]:
             files = groups[block.isoformat(), origin]
-            f_b, b_s, s_g = [], [], []
+            f_b, b_s, s_g, f_s, f_g = [], [], [], [], []
             preexisting = 0
             keys, exact, gold = set(), set(), set()
             pending = Counter()
@@ -424,6 +424,7 @@ def assemble(
                 else:
                     pending["SIN_BRONZE_VERSION_ACTUAL"] += 1
                 if f["silver"]:
+                    f_s.append(datetime.fromisoformat(f["silver"]).timestamp() - f["mtime"])
                     b_s.append(
                         (
                             datetime.fromisoformat(f["silver"])
@@ -434,7 +435,12 @@ def assemble(
                     pending[f"SIN_RECIBO_SILVER:{f['state']}"] += 1
                 if f["issues"] or f["error"]:
                     pending[f"INCIDENCIA_CSV:{family}"] += 1
+                exact_file, gold_file = 0, 0
                 for timestamp, key, content in f["rows"]:
+                    current_row = silver.get((family, key))
+                    if current_row is not None and current_row[0] == content:
+                        exact_file += 1
+                        gold_file += current_row[1] in published.get(family, set())
                     identity_key = family, key, content
                     if identity_key in keys:
                         continue
@@ -457,6 +463,7 @@ def assemble(
                                 preexisting += 1
                             else:
                                 s_g.append(latency)
+                                f_g.append(when.timestamp() - f["mtime"])
                     if family in ("LISTA_DEFECTOS", "LISTA_RECH"):
                         begin = (datetime.fromisoformat(timestamp) - STEP).isoformat()
                         items = registry.get((origin, row["LINEA"]), [])
@@ -484,6 +491,22 @@ def assemble(
                         proposed[
                             origin, row["LINEA"], status, machines, models, ",".join(targets)
                         ] += 1
+                files_report.append(
+                    {
+                        "Tramo": label,
+                        "Linea": origin,
+                        "Familia": family,
+                        "Archivo": f["name"],
+                        "Bronze": "SI" if f["bronze"] else "PENDIENTE",
+                        "Silver": ("CONFIRMADO" if f["silver"] else "PENDIENTE")
+                        if family in SILVER_EXPORTS
+                        else "SOLO_BRONZE",
+                        "Filas_Silver": f"{exact_file}/{len(f['rows'])}"
+                        if family in TABLES
+                        else None,
+                        "Filas_Gold": f"{gold_file}/{exact_file}" if family in TABLES else None,
+                    }
+                )
             for reason, count in sorted(pending.items()):
                 details.append(
                     {"Tramo": label, "Linea": origin, "Motivo": reason, "Cantidad": count}
@@ -500,12 +523,16 @@ def assemble(
                     "Fenix_Bronze_s": round(max(f_b), 1) if f_b else None,
                     "Bronze_Silver_s": round(max(b_s), 1) if b_s else None,
                     "Silver_Gold_s": round(max(s_g), 1) if s_g else None,
+                    "Fenix_Silver_s": round(max(f_s), 1) if f_s else None,
+                    "Fenix_Gold_s": round(max(f_g), 1) if f_g else None,
                     "YaEstabanGold": preexisting,
                 }
             )
     return {
         "resumen": results,
         "pendientes": details,
+        "archivos": files_report,
+        "relevos_aplicados": evidence.document.get("series_handover_scopes", []),
         "capturas_relacion": data["relation_checks"],
         "relacion": [
             {
