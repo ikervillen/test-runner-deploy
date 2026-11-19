@@ -115,7 +115,7 @@ def test_independent_gold_publishes_self_contained_evidence(independent, tmp_pat
     assert run(evidence.root, root, **kwargs)["status"] == "UNCHANGED"
 
 
-def industrial_evidence(root, lane, *, recent, native):
+def industrial_evidence(root, lane, *, recent, native, horizon=None):
     from copy import deepcopy
     from datetime import timedelta
     from decimal import Decimal
@@ -128,6 +128,7 @@ def industrial_evidence(root, lane, *, recent, native):
 
     from .test_pipeline import CUTOFF, START, inputs
 
+    horizon = horizon or CUTOFF
     data = deepcopy(inputs())
     for row in data["CATALOGO_PRODUCCIONES"]:
         row["id_modelo_fenix"] = 10
@@ -213,8 +214,8 @@ def industrial_evidence(root, lane, *, recent, native):
                 "origin": "AV23",
                 "estado": "READY",
                 "covered_from": START.isoformat(),
-                "covered_until": CUTOFF.isoformat(),
-                "live_until": CUTOFF.isoformat(),
+                "covered_until": horizon.isoformat(),
+                "live_until": horizon.isoformat(),
             }
             for f in FAMILIES
         ],
@@ -516,6 +517,7 @@ def test_worker_spill_is_on_its_own_volume_and_recovers_only_abandoned_work(
 def test_worker_recovers_original_input_before_exporting_new_silver(
     tmp_path, native, monkeypatch, phase
 ):
+    from datetime import timedelta
     from time import monotonic
     from types import SimpleNamespace
 
@@ -528,12 +530,13 @@ def test_worker_recovers_original_input_before_exporting_new_silver(
     from app.gold.pipeline import run
     from app.gold.publications import Snapshot
 
-    from .test_pipeline import bundle
+    from .test_pipeline import CUTOFF, bundle
 
+    latest = CUTOFF - timedelta(hours=1)
     root = tmp_path / "gold"
     output = root / "published"
     old = industrial_evidence(root / "inputs", "live", recent=False, native=native)
-    new = industrial_evidence(root / "inputs", "live", recent=True, native=native)
+    new = industrial_evidence(root / "inputs", "live", recent=True, native=native, horizon=latest)
     config = read_json(Path(__file__).parents[3] / "config/customer_score.json")
     catalogs = bundle()
 
@@ -564,7 +567,7 @@ def test_worker_recovers_original_input_before_exporting_new_silver(
 
     plan = SimpleNamespace(
         lane=lambda _: SimpleNamespace(gold=root),
-        policy=SimpleNamespace(read_max_rows=100000),
+        policy=SimpleNamespace(read_max_rows=100000, window_seconds=600),
     )
     source = SimpleNamespace(environment="test", plant="AV")
     worker = runtime.Worker(plan, "live", source, score=config, catalogs=catalogs)
@@ -584,6 +587,23 @@ def test_worker_recovers_original_input_before_exporting_new_silver(
     assert result["recovered_publication_id"] == pending
     current = Snapshot.open(output)
     assert current.manifest["input_publication_id"] == new.publication_id
+    assert result["incremental"]["chunk_productions"] == ["production-3"]
+    original = Snapshot.open(output, publication_id=pending)
     for family, fact in (("LISTA_RECH", "mia_inspections"), ("LISTA_DEFECTOS", "mia_rejections")):
-        ids = {source_id(family, portable(row)) for row in new.rows(family)}
-        assert ids and ids <= {row["id_observacion"] for row in current.rows(fact)}
+        current_ids = {row["id_observacion"] for row in current.rows(fact)}
+        expected = {
+            source_id(family, portable(row)) for row in new.rows(family) if row["FECHA"] == latest
+        }
+        older = {
+            source_id(family, portable(row)) for row in new.rows(family) if row["FECHA"] < latest
+        }
+        assert expected and expected <= current_ids
+        assert not older & current_ids
+        assert all(
+            row["id_observacion"] in current_ids
+            for row in original.rows(fact)
+            if row["id_produccion"] != "production-3"
+        )
+    latest_counter = next(row for row in new.rows("CONT_ZC") if row["FECHA"] == latest)
+    counter_id = source_id("CONT_ZC", portable(latest_counter))
+    assert counter_id in {row["id_observacion"] for row in current.rows("zc_observations")}

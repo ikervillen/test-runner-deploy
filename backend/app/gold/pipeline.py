@@ -39,6 +39,7 @@ from .common import (
     utc_now,
 )
 from .coverage import summary as coverage_summary
+from .evidence import operational_expression
 from .fingerprint import source_fingerprint
 from .freshness import source_freshness
 from .incremental import Prepared
@@ -261,19 +262,6 @@ def _fact_window(spans):
     )
 
 
-def _time_expression(family: str, window):
-    import pyarrow.dataset as ds
-
-    if window is None:
-        return None
-    left, right = window
-    if family == "LISTA_AR":
-        return (ds.field("FECHA_ON") < right) & (
-            ds.field("FECHA_OFF").is_null() | (ds.field("FECHA_OFF") > left)
-        )
-    return (ds.field("FECHA") > left) & (ds.field("FECHA") <= right)
-
-
 def _spill_facts(
     reader,
     tables,
@@ -284,6 +272,7 @@ def _spill_facts(
     link_rules,
     only_ids=None,
     spans=None,
+    include_unassigned_zc=False,
 ):
     """Write accepted facts for this chunk. The scan keeps one Arrow batch, not the history."""
     assigned = {r["id_asignacion"]: r["id_produccion"] for r in tables["production_assignments"]}
@@ -293,7 +282,7 @@ def _spill_facts(
 
     window = _fact_window(spans)
     for target, family in (("mia_rejections", "LISTA_DEFECTOS"), ("mia_inspections", "LISTA_RECH")):
-        for batch in reader.batches(family, _time_expression(family, window)):
+        for batch in reader.batches(family, operational_expression(family, window)):
             rows, issues = facts.mia(family, batch.to_pylist(), attribution)
             for row in rows:
                 if not wanted(row["id_produccion"]) or not _in_chunk(
@@ -309,7 +298,7 @@ def _spill_facts(
                     key=tuple(row[k] for k in KEYS[target]),
                 )
             pending.extend(issues)
-    for batch in reader.batches("LISTA_AR", _time_expression("LISTA_AR", window)):
+    for batch in reader.batches("LISTA_AR", operational_expression("LISTA_AR", window)):
         rows, issues = facts.ar(
             batch.to_pylist(),
             attribution,
@@ -337,7 +326,7 @@ def _spill_facts(
     for production_id, observations in by_zc.items():
         for observation_id in observations:
             linked[observation_id].append(production_id)
-    for batch in reader.batches("CONT_ZC", _time_expression("CONT_ZC", window)):
+    for batch in reader.batches("CONT_ZC", operational_expression("CONT_ZC", window)):
         for row in facts.zc(batch.to_pylist()):
             observation_id = row["id_observacion"]
             owners = [
@@ -346,7 +335,11 @@ def _spill_facts(
                 if wanted(production_id)
                 and _in_chunk(spans, production_id, row["periodo_inicio"], row["periodo_fin"])
             ]
-            if (only_ids is not None or spans is not None) and not owners:
+            if (
+                (only_ids is not None or spans is not None)
+                and not owners
+                and not include_unassigned_zc
+            ):
                 continue
             store.add(
                 "zc_observations",
@@ -1041,6 +1034,7 @@ def build(
     reference_snapshot=None,
     spill_root: Path | None = None,
     spill_db_bytes: int | None = None,
+    current_slot_seconds: int | None = None,
 ) -> tuple[SpilledTables | None, list[dict]]:
     """Score one lane. `all` is the manual full build; live and history score a chunk."""
     validate_config(config)
@@ -1069,12 +1063,20 @@ def build(
         "lane": lane,
     }
     previous_coverage = _previous_coverage(previous, max_total_rows)
-    stored_hours = {} if lane == "all" else _stored_hours(previous, max_total_rows)
+    stored_hours = (
+        {}
+        if lane == "all" or current_slot_seconds is not None
+        else _stored_hours(previous, max_total_rows)
+    )
     ar_version = None if lane == "all" else _ar_version(snapshot)
-    reopen, checked = _stops_to_reopen(snapshot, previous, prods, stored_hours, ar_version)
+    reopen, checked = (
+        _stops_to_reopen(snapshot, previous, prods, stored_hours, ar_version)
+        if current_slot_seconds is None
+        else (set(), [])
+    )
     hour_plan = (
         None
-        if lane == "all"
+        if lane == "all" or current_slot_seconds is not None
         else lanes.plan(
             prods,
             stored_hours,
@@ -1087,6 +1089,8 @@ def build(
             copied_until=copied_until,
         )
     )
+    if current_slot_seconds is not None:
+        hour_plan = lanes.current_slot(prods, cutoff, current_slot_seconds)
     recorded = list(checked)
     if hour_plan:
         recorded.extend(_hour_key(chunk.production_id, chunk.start) for chunk in hour_plan or [])
@@ -1135,6 +1139,7 @@ def build(
                 link_rules,
                 only_ids=chosen,
                 spans=spans,
+                include_unassigned_zc=current_slot_seconds is not None,
             )
             del decisions
             reader.release("observation_assignments")
@@ -1307,7 +1312,9 @@ def build(
                 for chunk in score_chunks
             )
         )
-        if lane == "live" and hour_plan:
+        if current_slot_seconds is not None:
+            score_stats["horizon_complete"] = True
+        elif lane == "live" and hour_plan:
             projected = {pid: dict(starts) for pid, starts in stored_hours.items()}
             done = set()
             copied_now = dict(copied_until or {})
@@ -1420,7 +1427,7 @@ def _remember_live(output_root: Path, silver_id: str, publication_id: str | None
     )
 
 
-def _live_caught_up(input_root: Path, output_root: Path) -> dict | None:
+def _live_caught_up(input_root: Path, output_root: Path, confirmed_input=None) -> dict | None:
     """Same Silver publication and a complete window: do not open the fact history."""
     receipt = _live_receipt(output_root)
     if (
@@ -1430,7 +1437,7 @@ def _live_caught_up(input_root: Path, output_root: Path) -> dict | None:
         or not (output_root / "current.json").exists()
     ):
         return None
-    snap = Snapshot.open(input_root)
+    snap = confirmed_input or Snapshot.open(input_root)
     if receipt.get("input_publication_id") != snap.publication_id:
         return None
     return {
@@ -1461,6 +1468,7 @@ def _run(
     recovery: tuple[str, dict] | None = None,
     spill_root: Path | None = None,
     spill_db_bytes: int | None = None,
+    current_slot_seconds: int | None = None,
 ) -> dict:
     input_root, output_root = input_root.resolve(strict=True), output_root.resolve()
     if (
@@ -1478,8 +1486,8 @@ def _run(
         recalculation_reason and recalculation_reason.strip()
     ):
         raise IntegrityError("Historical recalculation requires explicit productions and a reason")
-    if lane == "live":
-        caught_up = _live_caught_up(input_root, output_root)
+    if lane == "live" and recovery is None:
+        caught_up = _live_caught_up(input_root, output_root, confirmed_input)
         if caught_up is not None:
             return caught_up
     if lane == "history":
@@ -1559,6 +1567,7 @@ def _run(
                     "python": platform.python_version(),
                     "recalculation": recalculation,
                     "lane": lane,
+                    "current_slot_seconds": current_slot_seconds,
                 }
                 state_path = output_root / "runs" / f"{state['work_id']}.json"
                 atomic_json(state_path, state)
@@ -1585,7 +1594,7 @@ def _run(
             ):
                 raise IntegrityError("Recovery base differs from the published Gold snapshot")
             since = copied_until = None
-            if lane == "live":
+            if lane == "live" and current_slot_seconds is None:
                 since, _ = _mark_live_since(output_root, cutoff)
                 copied_until = _read_copied(output_root)
             statistics: dict[str, Any] = {}
@@ -1606,6 +1615,7 @@ def _run(
                 reference_snapshot=reference_snapshot,
                 spill_root=spill_root,
                 spill_db_bytes=spill_db_bytes,
+                current_slot_seconds=current_slot_seconds,
             )
             if tables is None:
                 if recovery is not None:

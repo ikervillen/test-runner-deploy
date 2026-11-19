@@ -152,16 +152,31 @@ def registry(projections):
     return result
 
 
-def attribution(document, tables):
+def operational_expression(family, window):
+    import pyarrow.dataset as ds
+
+    if window is None:
+        return None
+    left, right = window
+    if family == "LISTA_AR":
+        return (ds.field("FECHA_ON") < right) & (
+            ds.field("FECHA_OFF").is_null() | (ds.field("FECHA_OFF") > left)
+        )
+    return (ds.field("FECHA") > left) & (ds.field("FECHA") <= right)
+
+
+def attribution(document, tables, *, window=None):
     from ingesta_delta_lake import associations as native
     from ingesta_delta_lake.pipeline_rows import portable
 
-    bundle = {
-        **document["bundle"],
-        "sources": {
-            n: portable(t.to_pylist()) for n, t in tables.items() if n in native.SOURCE_KEYS
-        },
-    }
+    sources = {}
+    for name in native.SOURCE_KEYS:
+        if name in tables:
+            table = tables[name]
+            if window and name in ("LISTA_DEFECTOS", "LISTA_RECH", "CONT_ZC", "LISTA_AR"):
+                table = table.filter(operational_expression(name, window))
+            sources[name] = portable(table.to_pylist())
+    bundle = {**document["bundle"], "sources": sources}
     decisions = document["registry"]
     scopes = {native.review_scope(c["payload"]) for c in document.get("association_cases", [])} - {
         None

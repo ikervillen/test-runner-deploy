@@ -102,7 +102,7 @@ def _live(productions, stored_hours, accredited, ceiling, reopen, since, copied)
             if chunk is not None and _in_horizon(chunk, ceiling) and end > (watermark or start):
                 chunks.append(chunk)
                 seen.add(key)
-        start, end = _hour_holding(cutoff)
+        start, end = hour_holding(cutoff)
         if (identity, start) in seen:
             continue
         if cutoff == end:
@@ -127,6 +127,19 @@ def _live(productions, stored_hours, accredited, ceiling, reopen, since, copied)
         if chunk is not None and _in_horizon(chunk, ceiling):
             chunks.append(HourChunk(identity, start, end, cutoff, facts_only=True, read_from=left))
     return chunks
+
+
+def current_slot(productions, cutoff: datetime, slot_seconds: int) -> list[HourChunk]:
+    """Score the latest delivery with the context of its industrial hour."""
+    start, end = hour_holding(cutoff)
+    slot_start = cutoff - timedelta(seconds=slot_seconds)
+    return [
+        chunk
+        for production in productions
+        if _started(production) < cutoff
+        and (chunk := _clip(production, start, end, cutoff)) is not None
+        and chunk.cutoff > slot_start
+    ]
 
 
 def slot_start(moment: datetime) -> datetime:
@@ -170,7 +183,7 @@ def _history(productions, stored_hours, accredited, ceiling, reopen) -> list[Hou
 def _open_chunk(production, cutoff, ceiling) -> HourChunk | None:
     if cutoff is None:
         return None
-    start, end = _hour_holding(cutoff)
+    start, end = hour_holding(cutoff)
     chunk = _clip(production, start, end, cutoff)
     if chunk is None or not _in_horizon(chunk, ceiling):
         return None
@@ -208,7 +221,7 @@ def _clip(production, start, end, cutoff) -> HourChunk | None:
     return HourChunk(production["id_produccion"], start, end, score_cutoff)
 
 
-def _hour_holding(cutoff: datetime) -> tuple[datetime, datetime]:
+def hour_holding(cutoff: datetime) -> tuple[datetime, datetime]:
     """The clock hour of the accredited instant. An exact hour closes the previous one."""
     floored = _floor_hour(cutoff)
     if cutoff == floored:

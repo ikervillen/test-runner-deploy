@@ -9,6 +9,7 @@ import pyarrow as pa
 
 from .common import IntegrityError, digest
 from .evidence import attribution, registry, save
+from .lanes import hour_holding
 from .producer import FAMILIES, _apply_horizon, _apply_live, auxiliary
 
 AUXILIARY = frozenset(
@@ -101,7 +102,9 @@ def export(pipelines, lane, config):
     )
     if (storage.gold / "inputs" / "current.json").exists():
         previous = Evidence.open(storage.gold / "inputs")
-        if previous.document.get("source_vector") == vector:
+        if previous.document.get("source_vector") == vector and (
+            lane != "live" or "attribution_window" in previous.document
+        ):
             return previous
     projections = {family: own.control(family) for family in own.manifest.get("controls", {})}
     tables, lineages, coverage, rejections = {}, {}, [], {}
@@ -223,9 +226,14 @@ def export(pipelines, lane, config):
         },
         "coverage": coverage,
     }
+    window = None
     if lane == "live":
         retain_live(pipelines, tables, doc)
-    tables.update(attribution(doc, tables))
+        horizon = _source_horizon(coverage)
+        if horizon:
+            window = (hour_holding(horizon)[0], horizon)
+        doc["attribution_window"] = portable(window)
+    tables.update(attribution(doc, tables, window=window))
     tables.update(auxiliary_tables)
     doc["bronze_cursor"] = cursor
     doc["source_vector"] = vector
@@ -234,20 +242,19 @@ def export(pipelines, lane, config):
 
 def cutoff(evidence):
     """Industrial cutoff follows the latest confirmed Fenix block, even if stale."""
-    values = [
-        datetime.fromisoformat(r["live_until"])
-        for r in evidence.manifest["coverage"]
-        if r.get("live_until")
-    ]
+    horizon = _source_horizon(evidence.manifest["coverage"])
+    if horizon is None:
+        raise IntegrityError("Gold needs a confirmed source horizon")
+    return horizon
+
+
+def _source_horizon(coverage):
+    values = [datetime.fromisoformat(r["live_until"]) for r in coverage if r.get("live_until")]
     if not values:
         values = [
-            datetime.fromisoformat(r["covered_until"])
-            for r in evidence.manifest["coverage"]
-            if r.get("covered_until")
+            datetime.fromisoformat(r["covered_until"]) for r in coverage if r.get("covered_until")
         ]
-    if not values:
-        raise IntegrityError("Gold needs a confirmed source horizon")
-    return max(values)
+    return max(values, default=None)
 
 
 def published_evidence(root):

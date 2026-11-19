@@ -113,9 +113,21 @@ class Worker:
             max_rows_per_source=self.policy.read_max_rows,
             max_total_rows=self.policy.read_max_rows,
             recovery=recovery,
+            **self.publication_options(recovery),
             spill_root=self.spill_root,
             spill_db_bytes=self.spill_budget(),
         )
+
+    def publication_options(self, recovery):
+        if recovery is not None:
+            state = recovery[1]
+            return {
+                "lane": state.get("lane", "all"),
+                "current_slot_seconds": state.get("current_slot_seconds"),
+            }
+        if self.lane == "live":
+            return {"lane": "live", "current_slot_seconds": self.policy.window_seconds}
+        return {}
 
     def recover_publication(self):
         output = self.root / "published"
