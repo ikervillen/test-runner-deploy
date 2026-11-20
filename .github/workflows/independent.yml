@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  GOLD_CONTEXT_COMMIT: 359af06a7c0c0c6503b5422a4eab0862604f54d5
+  GOLD_CONTEXT_COMMIT: b795bcceba379e4c17f2f724afb69beda0c60a1f
   GOLD_SOURCE_COMMIT: ad88dc3d0bdedfbc4da3de06da74e3801b9b64f7
 
 jobs:
@@ -127,6 +127,7 @@ jobs:
           "${candidate[@]}" "$image" --help
           "${candidate[@]}" --entrypoint python "$image" -m app.gold.independent_runtime --help
           "${candidate[@]}" --entrypoint python "$image" -m app.gold.evidence_storage --help
+          "${candidate[@]}" --entrypoint python "$image" -m app.gold.storage_audit --help
           "${candidate[@]}" --entrypoint python "$image" -m deployment.independent --help
           "${candidate[@]}" --entrypoint python "$image" -c 'import importlib.metadata as m; from app.factory import create_app; from ingesta_delta_lake.pipeline_runtime import PipelineWorker; assert m.version("deltalake") == "1.6.6"'
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
