@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import signal
 import sqlite3
 import threading
@@ -37,6 +38,7 @@ class PipelineWorker:
         self.pipelines, self.lane = pipelines, lane
         self.storage, self.policy = pipelines.lane(lane), pipelines.policy
         self.parallel = getattr(self.policy, f"{lane}_workers")
+        self.history_enabled = os.environ.get("FENIX_HISTORY_ENABLED") != "0"
         self.source = replace(
             source,
             bronze_root=self.storage.bronze,
@@ -127,7 +129,9 @@ class PipelineWorker:
         stamp = datetime.now(UTC)
         intake.set("lot_policy", canonical(asdict(self.policy)))
         frontier = intake.lots.frontier(self.pipelines, window)
-        intake.lots.advance(self.pipelines, stamp, active_ids=active_ids)
+        intake.lots.advance(
+            self.pipelines, stamp, active_ids=active_ids, archive_enabled=self.history_enabled
+        )
         earlier = lanes["history"]
         if self.lane == "live":
             # Older daily snapshots are backfill. Preserve live ownership of timed
@@ -345,7 +349,12 @@ class PipelineWorker:
             RetirementQueue(intake, self.pipelines.history).acknowledge(result)
         if not lot_recorded or result.get("publication_error"):
             intake.lots.record(ids, result, manifest, datetime.now(UTC), self.policy)
-        intake.lots.advance(self.pipelines, datetime.now(UTC), active_ids=active_ids)
+        intake.lots.advance(
+            self.pipelines,
+            datetime.now(UTC),
+            active_ids=active_ids,
+            archive_enabled=self.history_enabled,
+        )
         if self.lane == "history":
             intake.lots.finish_reviews(self.storage)
         else:
@@ -355,6 +364,7 @@ class PipelineWorker:
     def maintenance_config(self, intake, active, dirty, reviews):
         if (
             self.lane != "live"
+            or not self.history_enabled
             or not self.archive_context
             or any(cfg.retirement_job for _, cfg in active.values())
         ):

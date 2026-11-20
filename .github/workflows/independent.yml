@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  GOLD_CONTEXT_COMMIT: b795bcceba379e4c17f2f724afb69beda0c60a1f
+  GOLD_CONTEXT_COMMIT: f772e23c37bc52aba12b4081e8ddf02fc715d6e3
   GOLD_SOURCE_COMMIT: ad88dc3d0bdedfbc4da3de06da74e3801b9b64f7
 
 jobs:
@@ -140,7 +140,7 @@ jobs:
       - name: Prepare the approved Gold worker update
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == 'b1dff6f484089a71cc58a7f1853da101ca5353e2' && github.event.head_commit.message == 'Roll out Gold scope updates and telemetry' && github.run_attempt == '1'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == 'cd9fef9097411d85bffb7d70d9de2411fca3d971' && github.event.head_commit.message == 'Roll out Fenix Live only' && github.run_attempt == '1'
         run: |
           set -euo pipefail
           mkdir -p bundle
@@ -220,7 +220,7 @@ jobs:
           pattern: live-image-*
           path: ${{ runner.temp }}/fenix-image-${{ github.run_id }}-${{ github.run_attempt }}
           merge-multiple: true
-      - name: Replace the Gold readers and workers
+      - name: Apply the Live profile and stop History
         shell: powershell
         env:
           FENIX_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
@@ -229,7 +229,7 @@ jobs:
         run: |
           $bundle = Join-Path $env:RUNNER_TEMP "fenix-image-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           try {
-            ./scripts/update_independent_workers.ps1 -GoldOnly -IncludeGoldHistory -IncludeBackend -Immediate -Bundle $bundle `
+            ./scripts/update_independent_workers.ps1 -LiveFlowOnly -Bundle $bundle `
               -Image $env:IMAGE -Revision $env:GITHUB_SHA -GoldRevision $env:GOLD_CONTEXT_COMMIT
           } finally {
             Remove-Item -LiteralPath (Join-Path $bundle 'image.tar.gz'), (Join-Path $bundle 'image.json') -ErrorAction SilentlyContinue

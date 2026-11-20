@@ -41,7 +41,7 @@
     "ingesta-live": {
       "cpus": "2",
       "cpuset": "0-1",
-      "memory": "2g",
+      "memory": "4g",
       "pids": 512,
       "tmpfs": "256m",
       "score_workers": 1
@@ -55,9 +55,9 @@
       "score_workers": 1
     },
     "gold-live": {
-      "cpus": "1",
-      "cpuset": "3",
-      "memory": "2g",
+      "cpus": "2",
+      "cpuset": "2-3",
+      "memory": "4g",
       "pids": 128,
       "tmpfs": "256m",
       "score_workers": 1
@@ -72,7 +72,7 @@
     },
     "backend": {
       "cpus": "1",
-      "cpuset": "5",
+      "cpuset": "3",
       "memory": "1g",
       "pids": 128,
       "tmpfs": "256m",

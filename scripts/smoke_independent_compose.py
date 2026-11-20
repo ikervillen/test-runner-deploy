@@ -60,7 +60,9 @@ def synthetic_stack(root, image, gold_context):
     (config / site["api_env_file"]).write_text("", encoding="utf-8")
     shutil.copyfile("deployment/pipelines.example.json", config / site["pipelines_file"])
     shutil.copyfile(gold_context / "config/customer_score.json", config / site["score_file"])
-    stack = render(site, ContainerPipelines(read(config / site["pipelines_file"])))
+    stack = render(
+        site, ContainerPipelines(read(config / site["pipelines_file"])), with_history=True
+    )
     for service in stack["services"].values():
         # Compose uses the actual image built in this job instead of a registry reference.
         service.update(image=image, pull_policy="never", network_mode="none")

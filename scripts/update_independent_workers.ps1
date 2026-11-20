@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Image,
     [Parameter(Mandatory = $true)][string]$Revision,
     [Parameter(Mandatory = $true)][string]$GoldRevision,
+    [switch]$LiveFlowOnly,
     [switch]$GoldOnly,
     [switch]$IncludeGoldHistory,
     [switch]$IncludeBackend,
@@ -18,7 +19,12 @@ $site = Get-Content -LiteralPath $sitePath -Raw | ConvertFrom-Json
 $context = if ($hasSite) { $site.docker_context } else { $env:FENIX_DOCKER_CONTEXT }
 if (-not $context) { throw 'No se ha configurado el contexto Docker.' }
 $project = $profile.project
-if ($GoldOnly) {
+if ($LiveFlowOnly) {
+    if ($GoldOnly -or $IncludeGoldHistory -or $IncludeBackend -or $Immediate) {
+        throw 'LiveFlowOnly configura el flujo completo y detiene History con drenaje.'
+    }
+    $services = @('gold-live', 'ingesta-live', 'backend')
+} elseif ($GoldOnly) {
     $services = @('gold-live')
     if ($IncludeGoldHistory) { $services += 'gold-history' }
     if ($IncludeBackend) { $services += 'backend' }
@@ -98,11 +104,32 @@ if ($loaded.Id -cne $proof.image_id -or
     throw 'Docker ha cargado una imagen distinta de la revisión aprobada.'
 }
 
+if ($LiveFlowOnly) {
+    $hostInfo = ((Invoke-Docker info --format '{{json .}}') -join '') | ConvertFrom-Json
+    $payload = @{ compose = $compose; host = $hostInfo } | ConvertTo-Json -Depth 40 -Compress
+    $transform = 'import json,sys; from pathlib import Path; from deployment.independent import configure_live_only,read,validate_host; data=json.load(sys.stdin); profile=read(Path("/opt/app/deployment/independent.example.json")); validate_host(profile,data["host"]); print(json.dumps(configure_live_only(data["compose"],profile)))'
+    $OutputEncoding = [Text.UTF8Encoding]::new($false)
+    $configured = $payload | docker --context $context run --rm -i --pull never --network none --read-only `
+        --entrypoint python $tag -B -c $transform
+    if ($LASTEXITCODE -ne 0) { throw 'El host no puede aplicar el perfil Live.' }
+    $compose = ($configured -join '') | ConvertFrom-Json
+}
+
 $activeDirectory = Split-Path -Parent $activeFile
 $candidate = Join-Path $activeDirectory "compose.$($Revision.Substring(0, 12)).json"
 [IO.File]::WriteAllText($candidate, ($compose | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
 Invoke-Docker compose -p $project -f $candidate config --quiet
-if ($Immediate) {
+if ($LiveFlowOnly) {
+    Invoke-Docker compose -p $project -f $candidate --profile history stop `
+        --timeout ([int]$site.drain_seconds) ingesta-history gold-history
+    foreach ($service in @('ingesta-history', 'gold-history')) {
+        $running = @(Invoke-Docker ps --filter "label=com.docker.compose.project=$project" `
+            --filter "label=com.docker.compose.service=$service" --format '{{.ID}}')
+        if ($running.Count) { throw "No se ha detenido $service." }
+    }
+    Invoke-Docker compose -p $project -f $candidate up -d --no-deps --no-build --pull never `
+        --timeout ([int]$site.drain_seconds) @services
+} elseif ($Immediate) {
     $order = if ($IncludeBackend) { @('backend', 'gold-history', 'gold-live') } else { $services }
     foreach ($service in $order) {
         Invoke-Docker compose -p $project -f $candidate up -d --no-deps --no-build --pull never `
@@ -121,10 +148,15 @@ foreach ($service in $services) {
     if ($worker.Image -cne $proof.image_id) {
         throw "No se ha reemplazado $service con la imagen aprobada."
     }
+    if ($LiveFlowOnly -and $service -in @('ingesta-live', 'gold-live')) {
+        if ($worker.HostConfig.NanoCpus -ne 2000000000 -or $worker.HostConfig.Memory -ne 4GB) {
+            throw "El presupuesto efectivo no coincide en $service."
+        }
+    }
     Write-Output "${service} | $($worker.Id.Substring(0, 12)) | $tag"
 }
 Invoke-Docker compose -p $project -f $candidate ps --all
-if (-not $Immediate) {
+if (-not $Immediate -and -not $LiveFlowOnly) {
     "FENIX_VERIFY_CONTEXT=$context", "FENIX_VERIFY_PROJECT=$project", "FENIX_VERIFY_SINCE=$started", `
         "FENIX_VERIFY_PENDING=$originalPending" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 }

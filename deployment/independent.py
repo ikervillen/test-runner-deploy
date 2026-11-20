@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from ingesta_delta_lake.pipeline_policy import LANES, STORES, IndependentPipelines, PipelinePolicy
 
 SERVICES = ("ingesta-live", "ingesta-history", "gold-live", "gold-history", "backend")
+HISTORY_SERVICES = ("ingesta-history", "gold-history")
+LIVE_SERVICES = tuple(name for name in SERVICES if name not in HISTORY_SERVICES)
 
 
 class ContainerPipelines:
@@ -169,19 +171,38 @@ def memory_bytes(value):
     return int(value[:-1]) * {"k": 1024, "m": 1024**2, "g": 1024**3}[value[-1].lower()]
 
 
-def validate_host(site, info):
+def validate_host(site, info, *, with_history=False):
     """Read-only preflight against docker info; never starts a workload."""
     cpus = int(info["NCPU"])
-    for limits in site["resources"].values():
+    names = SERVICES if with_history else LIVE_SERVICES
+    limits_by_service = [site["resources"][name] for name in names]
+    for limits in limits_by_service:
         assigned = cpu_ids(limits["cpuset"])
         if max(assigned) >= cpus or float(limits["cpus"]) > len(assigned):
             raise ValueError("Configured CPU reservations exceed this Docker host")
-    memory = sum(memory_bytes(limits["memory"]) for limits in site["resources"].values())
+    memory = sum(memory_bytes(limits["memory"]) for limits in limits_by_service)
     if memory + memory_bytes(site["host_reserve_memory"]) > int(info["MemTotal"]):
         raise ValueError("Process memory budgets leave insufficient Docker host reserve")
 
 
-def render(site, pipelines):
+def configure_live_only(compose, site):
+    services = compose["services"]
+    for name in HISTORY_SERVICES:
+        services[name]["profiles"] = ["history"]
+    for name in ("ingesta-live", "gold-live", "backend"):
+        limits = site["resources"][name]
+        services[name].update(
+            cpus=limits["cpus"],
+            cpuset=limits["cpuset"],
+            mem_limit=limits["memory"],
+            memswap_limit=limits["memory"],
+        )
+    services["ingesta-live"]["environment"]["FENIX_HISTORY_ENABLED"] = "0"
+    services["backend"]["environment"]["APP_GOLD_HISTORY_ENABLED"] = "false"
+    return compose
+
+
+def render(site, pipelines, *, with_history=False):
     validate(site, pipelines)
     config_root = site["configuration_target"]
 
@@ -349,7 +370,7 @@ def render(site, pipelines):
         "healthcheck": {"disable": True},
         "restart": "no",
     }
-    return {
+    compose = {
         "name": site["project"],
         "services": services,
         "volumes": {
@@ -358,6 +379,7 @@ def render(site, pipelines):
             for store in STORES
         },
     }
+    return compose if with_history else configure_live_only(compose, site)
 
 
 def main(argv=None):

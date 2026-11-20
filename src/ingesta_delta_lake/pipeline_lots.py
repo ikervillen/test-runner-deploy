@@ -279,11 +279,18 @@ class LotJournal:
                         ),
                     )
 
-    def advance(self, pipelines, stamp, *, active_ids=()):
+    def advance(self, pipelines, stamp, *, active_ids=(), archive_enabled=True):
         self.technical_now = stamp
         policy = pipelines.policy
         if self.intake.lane == "history":
             return
+        completed, reviewed = {}, set()
+        if archive_enabled:
+            completed, reviewed = self._archive_status(pipelines)
+        active = set(active_ids)
+        self._advance_live(policy, stamp, active, completed, reviewed, archive_enabled)
+
+    def _archive_status(self, pipelines):
         completed, reviewed = {}, set()
         try:
             from .pipeline_view import ArchiveSnapshot
@@ -303,7 +310,9 @@ class LotJournal:
                 }
         except (OSError, ValueError, IntegrityError, KeyError):
             pass
-        active = set(active_ids)
+        return completed, reviewed
+
+    def _advance_live(self, policy, stamp, active, completed, reviewed, archive_enabled):
         for row in self.db.execute(
             "SELECT * FROM lots WHERE state!='ARCHIVED_CONFIRMED'"
         ).fetchall():
@@ -317,8 +326,10 @@ class LotJournal:
                 continue
             origin = row["first_publication"] or row["first_attempt"]
             expired = (
-                stamp - datetime.fromisoformat(origin)
-            ).total_seconds() >= policy.retention_seconds
+                archive_enabled
+                and (stamp - datetime.fromisoformat(origin)).total_seconds()
+                >= policy.retention_seconds
+            )
             busy = any(u["input_id"] in active for u in units)
             if busy and expired:
                 continue

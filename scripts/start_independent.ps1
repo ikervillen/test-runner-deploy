@@ -70,15 +70,6 @@ if ($LiveOnly) {
 $profile.forbidden_volumes = @($profile.forbidden_volumes) + @(
     $oldSite.environments.main.volume, $oldSite.environments.develop.volume
 )
-$liveCpus = [int]$profile.resources.'ingesta-live'.cpus
-$sharedCpus = [int]$info.NCPU - $liveCpus
-if ($sharedCpus -lt 1) { throw 'Docker no dispone de CPU aparte de las reservadas para live.' }
-$index = 0
-foreach ($service in $profile.resources.PSObject.Properties) {
-    if ($service.Name -eq 'ingesta-live') { continue }
-    $service.Value.cpuset = [string]($liveCpus + ($index % $sharedCpus))
-    $index += 1
-}
 $present = @(Invoke-Docker volume ls --format '{{.Name}}')
 foreach ($lane in $profile.volumes.PSObject.Properties) {
     foreach ($store in $lane.Value.PSObject.Properties) {
@@ -198,7 +189,7 @@ if ($LiveOnly) {
         throw
     }
 } else {
-    Invoke-Docker compose -f $composeFile up -d --pull never --no-build
+    Invoke-Docker compose -f $composeFile up -d --pull never --no-build ingesta-live gold-live backend
 }
 Invoke-Docker compose -f $composeFile ps --all
 Write-Output "Compose: $composeFile"

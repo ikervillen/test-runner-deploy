@@ -106,6 +106,10 @@ def test_one_retry_at_source_hour_end_survives_restart_then_waits_for_eight_hour
         assert lot["retry_used"] == 1 and lot["state"] == "WAITING_HISTORY_REVIEW"
         assert lot["first_attempt"] == "2026-11-18T08:25:00+00:00"
         clock.value = datetime(2026, 11, 18, 16, 25, tzinfo=UTC)
+        live.history_enabled = False
+        live.capture(intake)
+        assert read_manifest(live.storage, "lots")["lots"][0]["state"] == "WAITING_HISTORY_REVIEW"
+        live.history_enabled = True
         live.capture(intake)
         lot = read_manifest(live.storage, "lots")["lots"][0]
         assert lot["state"] == "TRANSFERRED_FOR_REVIEW"

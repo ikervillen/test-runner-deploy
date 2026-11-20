@@ -85,6 +85,9 @@ def test_preflight_checks_real_docker_host_capacity_without_starting_services(st
 
     site, _plan = stack
     validate_host(site, {"NCPU": 8, "MemTotal": 16 * 1024**3})
+    validate_host(site, {"NCPU": 4, "MemTotal": 11 * 1024**3})
+    with pytest.raises(ValueError, match="CPU"):
+        validate_host(site, {"NCPU": 4, "MemTotal": 16 * 1024**3}, with_history=True)
     with pytest.raises(ValueError, match="CPU"):
         validate_host(site, {"NCPU": 2, "MemTotal": 16 * 1024**3})
     with pytest.raises(ValueError, match="memory"):
@@ -115,7 +118,13 @@ def test_cli_writes_compose_only_after_read_only_host_preflight(stack, tmp_path)
     live = services["ingesta-live"]
     assert live["pids_limit"] == 512
     assert live["cpus"] == "2"
-    assert live["mem_limit"] == "2g"
+    assert live["mem_limit"] == "4g"
+    assert live["environment"]["FENIX_HISTORY_ENABLED"] == "0"
+    assert services["gold-live"]["cpus"] == "2"
+    assert services["gold-live"]["mem_limit"] == "4g"
+    assert services["backend"]["environment"]["APP_GOLD_HISTORY_ENABLED"] == "false"
+    for name in ("ingesta-history", "gold-history"):
+        assert services[name]["profiles"] == ["history"]
     assert services["ingesta-history"]["pids_limit"] == 128
     for lane in ("live", "history"):
         assert "--health" in services[f"gold-{lane}"]["healthcheck"]["test"]
