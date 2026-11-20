@@ -38,9 +38,14 @@ function Invoke-Docker {
     if ($LASTEXITCODE -ne 0) { throw "Docker falló al ejecutar $($args[0])." }
 }
 
-function Get-Worker([string]$Service) {
-    $ids = @(Invoke-Docker ps --filter "label=com.docker.compose.project=$project" `
-        --filter "label=com.docker.compose.service=$Service" --format '{{.ID}}')
+function Get-Worker([string]$Service, [switch]$AllowStopped, [switch]$AllowMissing) {
+    $filters = @('--filter', "label=com.docker.compose.project=$project",
+        '--filter', "label=com.docker.compose.service=$Service", '--format', '{{.ID}}')
+    $ids = @(Invoke-Docker ps @filters)
+    if ($AllowStopped -and $ids.Count -eq 0) {
+        $ids = @(Invoke-Docker ps --all @filters)
+    }
+    if ($AllowMissing -and $ids.Count -eq 0) { return $null }
     if ($ids.Count -ne 1) { throw "Se esperaba un único contenedor activo para $Service." }
     $items = ((Invoke-Docker inspect $ids[0]) -join "`n") | ConvertFrom-Json
     return @($items)[0]
@@ -55,8 +60,12 @@ if ($IncludeBackend -and (-not $GoldOnly -or -not $IncludeGoldHistory -or -not $
     throw 'IncludeBackend requiere actualizar inmediatamente ambos workers Gold.'
 }
 $workers = @{}
-foreach ($service in $services) { $workers[$service] = Get-Worker $service }
+foreach ($service in $services) {
+    $workers[$service] = Get-Worker $service -AllowStopped:$LiveFlowOnly `
+        -AllowMissing:($LiveFlowOnly -and $service -eq 'gold-live')
+}
 $anchor = $workers[$services[0]]
+if (-not $anchor -and $LiveFlowOnly) { $anchor = $workers['ingesta-live'] }
 $activeFile = $anchor.Config.Labels.'com.docker.compose.project.config_files'
 if (-not $activeFile -or -not (Test-Path -LiteralPath $activeFile -PathType Leaf)) {
     throw "No se encuentra el Compose activo de $($services[0])."
@@ -67,18 +76,30 @@ $tag = "fenix-independent:sha-$Revision"
 foreach ($service in $services) {
     $definition = $compose.services.$service
     if (-not $definition) { throw "El Compose activo no contiene $service." }
-    $previousImageId = (Invoke-Docker image inspect $definition.image --format '{{.Id}}') -join ''
-    if ($previousImageId -cne $workers[$service].Image) {
-        $serviceFile = $workers[$service].Config.Labels.'com.docker.compose.project.config_files'
-        $ownCompose = Get-Content -LiteralPath $serviceFile -Raw | ConvertFrom-Json
-        $ownId = (Invoke-Docker image inspect $ownCompose.services.$service.image --format '{{.Id}}') -join ''
-        if ($definition.image -cne $tag -or $ownCompose.name -cne $project -or $ownId -cne $workers[$service].Image) {
-            throw "La imagen actual de $service difiere del Compose activo."
-        }
-    }
-    $expected = @($definition.volumes | Where-Object { $_.type -eq 'volume' } | ForEach-Object {
+    $namedMounts = @($definition.volumes | Where-Object { $_.type -eq 'volume' })
+    $expected = @($namedMounts | ForEach-Object {
         "$($compose.volumes.($_.source).name):$($_.target)"
     } | Sort-Object)
+    if (-not $workers[$service]) {
+        if (-not $expected.Count) { throw "El Compose no acredita los volúmenes de $service." }
+        foreach ($mount in $namedMounts) {
+            $volume = $compose.volumes.($mount.source).name
+            if (-not $volume) { throw "Falta definir el volumen $($mount.source)." }
+            $labels = ((Invoke-Docker volume inspect $volume --format '{{json .Labels}}') -join '') | ConvertFrom-Json
+            if ($labels.'com.docker.compose.project' -cne $project -or
+                $labels.'com.docker.compose.volume' -cne $mount.source) {
+                throw "El volumen $volume no pertenece a $project/$($mount.source)."
+            }
+        }
+        $definition.image = $tag
+        continue
+    }
+    $serviceFile = $workers[$service].Config.Labels.'com.docker.compose.project.config_files'
+    $ownCompose = Get-Content -LiteralPath $serviceFile -Raw | ConvertFrom-Json
+    $ownId = (Invoke-Docker image inspect $ownCompose.services.$service.image --format '{{.Id}}') -join ''
+    if ($ownCompose.name -cne $project -or $ownId -cne $workers[$service].Image) {
+        throw "La imagen actual de $service difiere de su Compose."
+    }
     $mounted = @($workers[$service].Mounts | Where-Object { $_.Type -eq 'volume' } | ForEach-Object {
         "$($_.Name):$($_.Destination)"
     } | Sort-Object)
@@ -107,7 +128,16 @@ if ($loaded.Id -cne $proof.image_id -or
 if ($LiveFlowOnly) {
     $hostInfo = ((Invoke-Docker info --format '{{json .}}') -join '') | ConvertFrom-Json
     $payload = @{ compose = $compose; host = $hostInfo } | ConvertTo-Json -Depth 40 -Compress
-    $transform = 'import json,sys; from pathlib import Path; from deployment.independent import configure_live_only,read,validate_host; data=json.load(sys.stdin); profile=read(Path("/opt/app/deployment/independent.example.json")); validate_host(profile,data["host"]); print(json.dumps(configure_live_only(data["compose"],profile)))'
+    $transform = @'
+import json, sys
+from pathlib import Path
+from deployment.independent import configure_live_only, read, validate_host
+
+data = json.load(sys.stdin)
+profile = read(Path('/opt/app/deployment/independent.example.json'))
+validate_host(profile, data['host'])
+print(json.dumps(configure_live_only(data['compose'], profile)))
+'@
     $OutputEncoding = [Text.UTF8Encoding]::new($false)
     $configured = $payload | docker --context $context run --rm -i --pull never --network none --read-only `
         --entrypoint python $tag -B -c $transform

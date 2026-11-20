@@ -81,10 +81,10 @@ def smoke(image, gold_context):
         compose = ["docker", "compose", "-f", str(path)]
         services = stack["services"]
 
-        def run(*args, capture_output=False):
+        def run(*args, capture_output=False, check=True):
             return subprocess.run(
                 [*compose, *args],
-                check=True,
+                check=check,
                 timeout=120,
                 capture_output=capture_output,
                 text=True,
@@ -100,10 +100,12 @@ def smoke(image, gold_context):
                 *services[service]["command"],
                 "--once",
                 capture_output=True,
+                check=False,
             )
             print(completed.stdout, end="", flush=True)
             if completed.stderr:
                 print(completed.stderr, end="", flush=True)
+            completed.check_returncode()
             events = [
                 json.loads(line) for line in completed.stdout.splitlines() if line.startswith("{")
             ]
