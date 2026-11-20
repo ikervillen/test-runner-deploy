@@ -347,9 +347,27 @@ def _validate_spilled(tables, *, complete=False):
     scores = {}
     score_grains = set()
     components = defaultdict(list)
+    references_by_child = defaultdict(list)
+    indexes = {}
+    for child, columns, parent, target in FOREIGN_KEYS:
+        dimensional = len(columns) == 1 and DIMENSION_KEYS.get(columns[0]) == (parent, target[0])
+        if child not in tables or (parent not in tables and not dimensional):
+            continue
+        index_key = parent, target
+        if index_key not in indexes:
+            indexes[index_key] = (
+                {tuple(row[k] for k in target) for row in _iter_table(tables, parent)}
+                if parent in tables
+                else set()
+            )
+        references_by_child[child].append((columns, parent, indexes[index_key]))
     for name in names:
         for raw in _iter_table(tables, name):
             row = check_row(name, raw) if name in tables.spilled else raw
+            for columns, parent, identities in references_by_child.get(name, ()):
+                key = tuple(row.get(k) for k in columns)
+                if None not in key and key not in identities:
+                    raise IntegrityError(f"{name}: missing {parent} reference {columns}")
             if {"inicio", "corte", "fin"}.issubset(row) and not (
                 row["inicio"] < row["corte"] <= row["fin"]
             ):
@@ -400,17 +418,6 @@ def _validate_spilled(tables, *, complete=False):
             raise IntegrityError("Score components and total/weight do not reconcile")
         if weight <= 0 or round(got_total / weight, 4) != normalized:
             raise IntegrityError("Normalized score does not reconcile")
-    for child, columns, parent, target in FOREIGN_KEYS:
-        if child not in tables or parent not in tables:
-            continue
-        identities = {tuple(r[k] for k in target) for r in _iter_table(tables, parent)}
-        for row in _iter_table(tables, child):
-            key = tuple(row.get(k) for k in columns)
-            if None not in key and key not in identities:
-                raise IntegrityError(f"{child}: missing {parent} reference {columns}")
-    from .dimensional import validate_links
-
-    validate_links(tables)
 
 
 def validate(tables, *, complete=False):

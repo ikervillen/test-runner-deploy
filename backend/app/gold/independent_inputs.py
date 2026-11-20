@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from datetime import datetime
+from functools import cache
 
 import pyarrow as pa
 
@@ -131,7 +132,12 @@ def export(pipelines, lane, config):
             lane != "live" or "series_handover_scopes" in previous.document
         ):
             return previous
-    projections = {family: own.control(family) for family in own.manifest.get("controls", {})}
+
+    @cache
+    def control(snapshot, family):
+        return snapshot.control(family)
+
+    projections = {family: control(own, family) for family in own.manifest.get("controls", {})}
     tables, lineages, coverage, rejections = {}, {}, [], {}
     views = {
         "operations": SilverView(**{lane: own}, archive=archive if lane == "history" else None),
@@ -144,7 +150,7 @@ def export(pipelines, lane, config):
     prior_proofs = (
         previous.proofs(max_rows=policy.read_max_rows)
         if lane == "live" and previous and "silver_refs" in previous.document
-        else {}
+        else None
     )
     incremental = {}
     if (
@@ -159,19 +165,19 @@ def export(pipelines, lane, config):
             )
         )
     ):
-        try:
-            for family in sorted(OPERATIONS):
+        for family in sorted(OPERATIONS):
+            try:
                 incremental[family] = materialize(
                     own,
                     previous,
-                    prior_proofs,
+                    prior_proofs or {},
                     family,
                     silver_refs.get(family),
                     CONTRACTS[family].schema.names,
                     budget=policy.read_max_rows,
                 )
-        except FullReadRequired:
-            incremental.clear()
+            except FullReadRequired:
+                continue
     cases, scanned, logical_rows = {}, 0, 0
     reused_catalogues = []
     for family in FAMILIES:
@@ -187,7 +193,7 @@ def export(pipelines, lane, config):
             and previous.document["silver_refs"].get(family) == silver_refs.get(family)
         ):
             rows = previous.rows(family, max_rows=policy.read_max_rows)
-            proofs, scanned_rows = prior_proofs.get(family, {}), 0
+            proofs, scanned_rows = (prior_proofs or {}).get(family, {}), 0
             reused_catalogues.append(family)
         else:
             result = view.rows(
@@ -203,7 +209,7 @@ def export(pipelines, lane, config):
         tables[family] = pa.Table.from_pylist(rows, schema=CONTRACTS[family].schema)
         lineages[family] = proofs
         controls = [
-            s.control(family)
+            control(s, family)
             for s in snapshots
             if family in s.manifest.get("controls", {}) and (family not in OPERATIONS or s is own)
         ]
@@ -249,14 +255,14 @@ def export(pipelines, lane, config):
                     _apply_live(row, family, origin, control["meta"].get("live_until"))
             coverage.append(portable(row))
     assoc = [
-        s.control("ASIGNACION_PRODUCCION_RAMAL")
+        control(s, "ASIGNACION_PRODUCCION_RAMAL")
         for s in snapshots
         if "ASIGNACION_PRODUCCION_RAMAL" in s.manifest.get("controls", {})
     ]
     published = [p["extra"]["association"] for p in assoc if p["extra"].get("association")]
     accepted_registry = registry(published)
     catalogs = [
-        s.control("CATALOGO_PRODUCCIONES")["extra"]
+        control(s, "CATALOGO_PRODUCCIONES")["extra"]
         for s in snapshots
         if "CATALOGO_PRODUCCIONES" in s.manifest.get("controls", {})
     ]
@@ -305,11 +311,21 @@ def export(pipelines, lane, config):
     }
     window = None
     if lane == "live":
-        doc["retained_live"] = (
-            bool(previous.document.get("retained_live"))
-            if incremental
-            else retain_live(pipelines, tables, doc, previous=previous)
-        )
+        full_families = OPERATIONS - incremental.keys()
+        retained = bool(incremental and previous and previous.document.get("retained_live"))
+        if full_families:
+            retained = (
+                retain_live(
+                    pipelines,
+                    tables,
+                    doc,
+                    previous=previous,
+                    families=full_families,
+                    previous_proofs=prior_proofs,
+                )
+                or retained
+            )
+        doc["retained_live"] = retained
         horizon = _source_horizon(coverage)
         if horizon:
             window = (hour_holding(horizon)[0], horizon)
@@ -323,8 +339,10 @@ def export(pipelines, lane, config):
         doc["silver_refs"] = silver_refs
         doc["silver_read"] = {
             "incremental": bool(incremental),
+            "full_read_families": sorted(full_families),
             "rows": scanned,
             "reused_catalogues": reused_catalogues,
+            "previous_evidence_reads": dict(previous.read_stats) if previous else {},
         }
     tables.update(attribution(doc, tables, window=window))
     tables.update(auxiliary_tables)
@@ -367,7 +385,9 @@ def published_evidence(root):
     return Evidence.open(root / "evidence", descriptor["evidence_id"])
 
 
-def retain_live(pipelines, tables, document, *, previous=None):
+def retain_live(
+    pipelines, tables, document, *, previous=None, families=OPERATIONS, previous_proofs=None
+):
     """Keep previously published live facts until historical Gold proves their copy."""
     from ingesta_delta_lake.pipeline_rows import business_key, review_hash
 
@@ -377,13 +397,13 @@ def retain_live(pipelines, tables, document, *, previous=None):
     if not (root / "current.json").exists():
         return False
     previous = previous or Evidence.open(root)
-    proofs = previous.proofs(max_rows=budget)
+    proofs = previous.proofs(max_rows=budget) if previous_proofs is None else previous_proofs
     historical = None
     with suppress(OSError, ValueError, StopIteration):
         historical = published_evidence(pipelines.history.gold / "published")
     copied = historical.proofs(max_rows=budget) if historical else {}
     retained = False
-    for family in OPERATIONS:
+    for family in families:
         table = previous.table(family, max_rows=budget)
         current = {business_key(family, r): r for r in tables[family].to_pylist()}
         for row in table.to_pylist():

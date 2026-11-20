@@ -40,13 +40,13 @@ from .common import (
     utc_now,
 )
 from .coverage import summary as coverage_summary
-from .evidence import operational_expression
+from .evidence import Evidence, operational_expression
 from .fingerprint import source_fingerprint
 from .freshness import source_freshness
 from .incremental import Prepared
 from .metrics import Window, ar_bases, live_windows, mia_bases, production_windows, zc_bases
 from .publications import CommitConflict, Publisher, Snapshot, commit_scope
-from .schemas import KEYS, SCHEMAS, check_row, make_table
+from .schemas import KEYS, SCHEMAS, check_row
 from .scoring import ScoreResult, calculate, validate_config
 from .spill import FactStore
 
@@ -175,12 +175,15 @@ class _SourceReader:
             self.count(len(self._cache[name]))
         return self._cache[name]
 
-    def batches(self, name: str, expression=None):
+    def batches(self, name: str, *, window=None):
+        expression = operational_expression(name, window)
+        options: dict[str, Any] = {"window": window} if isinstance(self.snapshot, Evidence) else {}
         for batch in self.snapshot.batches(
             name,
             max_rows=self.max_total_rows,
             expression=expression,
             pushdown=expression is not None,
+            **options,
         ):
             self.count(batch.num_rows)
             yield batch
@@ -284,7 +287,7 @@ def _spill_facts(
 
     window = current_window or _fact_window(spans)
     for target, family in (("mia_rejections", "LISTA_DEFECTOS"), ("mia_inspections", "LISTA_RECH")):
-        for batch in reader.batches(family, operational_expression(family, window)):
+        for batch in reader.batches(family, window=window):
             rows, issues = facts.mia(family, batch.to_pylist(), attribution)
             for row in rows:
                 if not wanted(row["id_produccion"]) or not _in_chunk(
@@ -300,7 +303,7 @@ def _spill_facts(
                     key=tuple(row[k] for k in KEYS[target]),
                 )
             pending.extend(issues)
-    for batch in reader.batches("LISTA_AR", operational_expression("LISTA_AR", window)):
+    for batch in reader.batches("LISTA_AR", window=window):
         rows, issues = facts.ar(
             batch.to_pylist(),
             attribution,
@@ -328,7 +331,7 @@ def _spill_facts(
     for production_id, observations in by_zc.items():
         for observation_id in observations:
             linked[observation_id].append(production_id)
-    for batch in reader.batches("CONT_ZC", operational_expression("CONT_ZC", window)):
+    for batch in reader.batches("CONT_ZC", window=window):
         for row in facts.zc(batch.to_pylist()):
             observation_id = row["id_observacion"]
             owners = [
@@ -1089,6 +1092,7 @@ def build(
     spill_db_bytes: int | None = None,
     current_slot_seconds: int | None = None,
     mia_reference_mode: str | None = None,
+    validate_result: bool = True,
 ) -> tuple[SpilledTables | None, list[dict]]:
     """Score one lane. `all` is the manual full build; live and history score a chunk."""
     validate_config(config)
@@ -1469,12 +1473,14 @@ def build(
                 if name in published.spilled:
                     continue
                 published[name] = _unique(name, published[name])
-                make_table(name, published[name])
-            contracts.validate(published, complete=True)
+            if validate_result:
+                contracts.validate(published, complete=True)
         if statistics is not None:
             statistics.update(score_stats)
             statistics["source_rows_read"] = reader.seen_rows
             statistics["stage_seconds"] = clock.stages
+            if isinstance(snapshot, Evidence):
+                statistics["evidence_reads"] = dict(snapshot.read_stats)
         handed = True
         return published, published["publication_scope_status"]
     finally:
@@ -1750,6 +1756,7 @@ def _run(
                 spill_db_bytes=spill_db_bytes,
                 current_slot_seconds=current_slot_seconds,
                 mia_reference_mode=mia_reference_mode,
+                validate_result=False,  # Publisher validates the final rows before any commit.
             )
             if tables is None:
                 if recovery is not None:
@@ -1816,6 +1823,7 @@ def _run(
                                 environment=environment,
                                 plant=plant,
                                 failpoint=failpoint,
+                                verified_base=previous,
                             ).publish(
                                 snap,
                                 tables,

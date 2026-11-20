@@ -503,10 +503,27 @@ class Publisher:
         environment: str,
         plant: str,
         failpoint: Callable[[str], None] | None = None,
+        verified_base: Snapshot | None = None,
     ):
         self.root = root.resolve()
         self.environment, self.plant = environment, plant
         self.failpoint = failpoint or (lambda _: None)
+        self.verified_base = verified_base
+
+    def _verify_receipts(self, refs):
+        base = self.verified_base
+        verified = (
+            {
+                ref["name"]: ref
+                for ref in base.manifest["tables"]
+                if ref["name"] in base._verified_tables
+            }
+            if base and base.root == self.root
+            else {}
+        )
+        for ref in refs:
+            if verified.get(ref["name"]) != ref:
+                Snapshot(self.root, {"tables": [ref]}).table(ref["name"])
 
     def publish(
         self,
@@ -566,6 +583,7 @@ class Publisher:
 
         began = time.perf_counter()
         validate(rows, complete=set(rows) == set(CONTRACTS))
+        validation_ms = round((time.perf_counter() - began) * 1000, 2)
         scope = commit_scope(replace_ids, hours)
         operation = digest(["gold-v1", snapshot.publication_id, config_id, cutoff, scope])
         pointer_path = self.root / "current.json"
@@ -824,8 +842,7 @@ class Publisher:
             prior_refs[name] = ref
         state["state"] = "VERIFIED"
         atomic_json(journal, state)
-        for ref in prior_refs.values():
-            Snapshot(self.root, {"tables": [ref]}).table(ref["name"])
+        self._verify_receipts(prior_refs.values())
         self.failpoint("verified")
         evidence = {}
         manifest = promote_cas(
@@ -860,7 +877,10 @@ class Publisher:
             "publication_id": manifest["publication_id"],
             "tables": len(prior_refs),
             "write_telemetry": publication_metrics(
-                writes, evidence, round((time.perf_counter() - began) * 1000, 2)
+                writes,
+                evidence,
+                round((time.perf_counter() - began) * 1000, 2),
+                validation_ms=validation_ms,
             ),
             **(
                 {
@@ -941,7 +961,9 @@ class Publisher:
                 candidate[name] = [*old_rows, *rows.get(name, [])]
             else:
                 candidate[name] = rows[name]
+        validation_start = time.perf_counter()
         validate(candidate, complete=set(candidate) == set(CONTRACTS))
+        validation_ms = round((time.perf_counter() - validation_start) * 1000, 2)
         if previous:
             prior_by_name = {r["name"]: r for r in previous["tables"]}
             if "quality_scores" in rows and "quality_scores" in prior_by_name:
@@ -1118,8 +1140,7 @@ class Publisher:
             prior_refs[name] = ref
         state["state"] = "VERIFIED"
         atomic_json(journal, state)
-        for ref in prior_refs.values():
-            Snapshot(self.root, {"tables": [ref]}).table(ref["name"])
+        self._verify_receipts(prior_refs.values())
         self.failpoint("verified")
         evidence = {}
         manifest = promote_cas(
@@ -1154,7 +1175,10 @@ class Publisher:
             "publication_id": manifest["publication_id"],
             "tables": len(prior_refs),
             "write_telemetry": publication_metrics(
-                writes, evidence, round((time.perf_counter() - began) * 1000, 2)
+                writes,
+                evidence,
+                round((time.perf_counter() - began) * 1000, 2),
+                validation_ms=validation_ms,
             ),
         }
 

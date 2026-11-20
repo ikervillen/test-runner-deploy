@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from .common import IntegrityError, atomic_json, canonical, digest, read_json, within
@@ -79,6 +80,29 @@ def _fragments(name, table, window_seconds):
     return [(key, table.take(groups[key])) for key in sorted(groups)]
 
 
+def _fragment_bounds(name, table):
+    field = "FECHA_ON" if name == "LISTA_AR" else "FECHA"
+    bounds = pc.min_max(table[field]).as_py()
+    if name == "LISTA_AR":
+        ends = table["FECHA_OFF"]
+        return [
+            bounds["min"].isoformat(),
+            None if ends.null_count else pc.max(ends).as_py().isoformat(),
+        ]
+    return [bounds["min"].isoformat(), bounds["max"].isoformat()]
+
+
+def _overlaps_fragment(name, item, window):
+    bounds = item.get("time_bounds")
+    if bounds is None:
+        return True  # Older evidence has no signed time bounds.
+    first, last = [datetime.fromisoformat(value) if value is not None else None for value in bounds]
+    left, right = window
+    if name == "LISTA_AR":
+        return first < right and (last is None or last > left)
+    return first <= right and last > left
+
+
 def save(root, document, tables, *, window_seconds=None, reuse=None):
     """Persist all bytes before making this input eligible for a Gold publication."""
     root.mkdir(parents=True, exist_ok=True)
@@ -109,9 +133,12 @@ def save(root, document, tables, *, window_seconds=None, reuse=None):
             for key, part in fragments:
                 old = previous.get(tuple(key))
                 if old and old[1].equals(part):
-                    descriptors.append(old[0])
+                    item = dict(old[0])
                 else:
-                    descriptors.append({**_write_table(root, part), "partition": list(key)})
+                    item = {**_write_table(root, part), "partition": list(key)}
+                if name in OPERATIONS and "time_bounds" not in item:
+                    item["time_bounds"] = _fragment_bounds(name, part)
+                descriptors.append(item)
             ref = {"parts": descriptors, "rows": table.num_rows}
         refs.append({"name": name, **ref})
     payload = {**document, "schema_id": SCHEMA, "tables": refs}
@@ -135,6 +162,7 @@ class Evidence:
         }
         self._tables = {}
         self._fragments = {}
+        self.read_stats = defaultdict(Counter)
 
     @classmethod
     def open(cls, root, identity=None):
@@ -157,12 +185,7 @@ class Evidence:
                 raise IntegrityError("Gold evidence exceeds its explicit row budget")
             parts = []
             for item in evidence_files(ref):
-                table = pq.ParquetFile(checked_file(self.root, item)).read(use_threads=False)
-                if table.num_rows != item["rows"]:
-                    raise IntegrityError("Gold evidence fragment count differs")
-                parts.append(table)
-                if "partition" in item:
-                    self._fragments.setdefault(name, {})[tuple(item["partition"])] = (item, table)
+                parts.append(self._read_part(name, item))
             table = pa.concat_tables(parts) if len(parts) > 1 else parts[0]
             if table.num_rows != ref["rows"]:
                 raise IntegrityError("Gold evidence count differs")
@@ -170,6 +193,21 @@ class Evidence:
         if self._tables[name].num_rows > max_rows:
             raise IntegrityError("Gold evidence exceeds its explicit row budget")
         return self._tables[name]
+
+    def _read_part(self, name, item):
+        partition = tuple(item.get("partition", ()))
+        parts = self._fragments.setdefault(name, {}) if partition else {}
+        previous = parts.get(partition)
+        if previous and previous[0] == item:
+            self.read_stats[name]["fragments_reused"] += 1
+            return previous[1]
+        table = pq.ParquetFile(checked_file(self.root, item)).read(use_threads=False)
+        if table.num_rows != item["rows"]:
+            raise IntegrityError("Gold evidence fragment count differs")
+        self.read_stats[name].update(fragments_opened=1, rows_decoded=table.num_rows)
+        if partition:
+            parts[partition] = (item, table)
+        return table
 
     def fragments(self, name):
         return self._fragments.get(name, {})
@@ -190,10 +228,26 @@ class Evidence:
             )
         return result
 
-    def batches(self, name, *, max_rows=None, expression=None, **_kwargs):
+    def batches(self, name, *, max_rows=None, expression=None, window=None, **_kwargs):
         max_rows = max_rows if max_rows is not None else self.document.get("row_budget")
         if type(max_rows) is not int or max_rows < 1:
             raise IntegrityError("Gold evidence needs an explicit row budget")
+        ref = next((r for r in self.document["tables"] if r["name"] == name), None)
+        if window and name in OPERATIONS and ref and "parts" in ref and name not in self._tables:
+            scanned = 0
+            for part in ref["parts"]:
+                if not _overlaps_fragment(name, part, window):
+                    self.read_stats[name]["fragments_pruned"] += 1
+                    continue
+                scanned += part["rows"]
+                if scanned > max_rows:
+                    raise IntegrityError("Gold evidence exceeds its explicit row budget")
+                table = self._read_part(name, part)
+                rule = (
+                    expression if expression is not None else operational_expression(name, window)
+                )
+                yield from table.filter(rule).to_batches()
+            return
         table = self.table(name, max_rows=max_rows)
         if expression is not None:
             import pyarrow.dataset as ds

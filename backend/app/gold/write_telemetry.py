@@ -97,12 +97,13 @@ def legacy_scope_metrics(metrics):
     }
 
 
-def publication_metrics(tables, evidence, milliseconds):
+def publication_metrics(tables, evidence, milliseconds, *, validation_ms):
     allocations = [m["physical_bytes_added"] for m in tables.values()]
     allocations.append(evidence.get("new_physical_bytes", 0))
     return {
         "tables": tables,
         "evidence": evidence,
         "publication_ms": milliseconds,
+        "validation_ms": validation_ms,
         "new_allocated_data_bytes": None if None in allocations else sum(allocations),
     }

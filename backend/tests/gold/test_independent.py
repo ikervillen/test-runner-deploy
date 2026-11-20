@@ -99,6 +99,22 @@ def test_auxiliary_cursor_without_scoring_changes_does_not_export(independent, m
     assert updated.publication_id != original.publication_id
     assert updated.document["silver_read"]["rows"] == 0
     assert "SIP_MODELO" in updated.document["silver_read"]["reused_catalogues"]
+    materialize = independent_inputs.materialize
+
+    def one_family_fallback(snapshot, previous, proofs, family, *args, **kwargs):
+        if family == "CONT_ZC":
+            raise independent_inputs.FullReadRequired
+        return materialize(snapshot, previous, proofs, family, *args, **kwargs)
+
+    monkeypatch.setattr(independent_inputs, "materialize", one_family_fallback)
+    monkeypatch.setattr(
+        independent_inputs,
+        "auxiliary_turn",
+        lambda *a, **k: (tables, cursor + 3, (version[0], cursor + 3)),
+    )
+    revised = independent_inputs.export(plan, "live", cfg)
+    assert revised.document["silver_read"]["full_read_families"] == ["CONT_ZC"]
+    assert revised.document["silver_read"]["incremental"] is True
 
 
 def test_registry_never_resolves_same_revision_by_arrival(native):
@@ -144,7 +160,7 @@ def test_independent_gold_publishes_self_contained_evidence(independent, tmp_pat
     assert run(evidence.root, root, **kwargs)["status"] == "UNCHANGED"
 
 
-def industrial_evidence(root, lane, *, recent, native, horizon=None):
+def industrial_evidence(root, lane, *, recent, native, horizon=None, window_seconds=None):
     from copy import deepcopy
     from datetime import timedelta
     from decimal import Decimal
@@ -262,7 +278,7 @@ def industrial_evidence(root, lane, *, recent, native, horizon=None):
             },
         )
     )
-    return save(root, document, tables)
+    return save(root, document, tables, window_seconds=window_seconds)
 
 
 def test_cross_boundary_facts_recalculate_the_same_as_one_complete_input(tmp_path, native):
@@ -650,7 +666,7 @@ def test_worker_recovers_original_input_before_exporting_new_silver(
     assert counter_id in {row["id_observacion"] for row in current.rows("zc_observations")}
 
 
-def test_gold_live_publishes_first_mia_reference_and_score_in_delta(tmp_path, native):
+def test_gold_live_publishes_first_mia_reference_and_score_in_delta(tmp_path, native, monkeypatch):
     from datetime import timedelta
 
     from app.gold.common import read_json
@@ -660,15 +676,13 @@ def test_gold_live_publishes_first_mia_reference_and_score_in_delta(tmp_path, na
 
     from .test_pipeline import CUTOFF, bundle
 
+    monkeypatch.setattr("app.gold.pipeline.utc_now", lambda: "2026-11-20T12:00:00+00:00")
     target = CUTOFF - timedelta(hours=1)
     evidence = industrial_evidence(
-        tmp_path / "inputs", "live", recent=True, native=native, horizon=target
+        tmp_path / "inputs", "live", recent=True, native=native, horizon=target, window_seconds=600
     )
     output = tmp_path / "published"
-    result = run(
-        evidence.root,
-        output,
-        confirmed_input=evidence,
+    options = dict(
         bundle=bundle(),
         config=read_json(Path(__file__).parents[3] / "config/customer_score.json"),
         cutoff=target,
@@ -678,7 +692,9 @@ def test_gold_live_publishes_first_mia_reference_and_score_in_delta(tmp_path, na
         current_slot_seconds=600,
         mia_reference_mode="live",
     )
+    result = run(evidence.root, output, confirmed_input=evidence, **options)
     assert result["status"] == "PUBLISHED"
+    assert result["write_telemetry"]["validation_ms"] >= 0
     published = Snapshot.open(output, require_gold_contract=True)
     samples = {
         r["reference_id"]
@@ -695,6 +711,29 @@ def test_gold_live_publishes_first_mia_reference_and_score_in_delta(tmp_path, na
         for r in parts
         if r["componente"] == "MIA" and r["id_resultado"] in {s["id_resultado"] for s in scores}
     } == {0.0}
+
+    batches = Evidence.batches
+
+    def baseline_batches(self, name, *, window=None, **kwargs):
+        return batches(self, name, **kwargs)
+
+    monkeypatch.setattr(Evidence, "batches", baseline_batches)
+    baseline_root = tmp_path / "baseline"
+    baseline = run(
+        evidence.root, baseline_root, confirmed_input=Evidence.open(evidence.root), **options
+    )
+    assert baseline["status"] == "PUBLISHED"
+    reference = Snapshot.open(baseline_root, require_gold_contract=True)
+    from app.gold.common import canonical
+
+    def values(snapshot, name):
+        return sorted(
+            canonical({k: v for k, v in row.items() if k != "fecha_calculo"})
+            for row in snapshot.rows(name)
+        )
+
+    for name in ("quality_scores", "quality_score_components", "publication_scope_status"):
+        assert values(published, name) == values(reference, name)
 
 
 def test_historical_gold_publishes_model_and_segment_statistics(tmp_path, native):

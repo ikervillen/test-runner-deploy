@@ -15,6 +15,46 @@ def native():
     pytest.importorskip("ingesta_delta_lake")
 
 
+@pytest.mark.parametrize("family", ["CONT_ZC", "LISTA_AR"])
+def test_window_prunes_verified_fragments_before_opening_parquet(tmp_path, monkeypatch, family):
+    from app.gold import evidence
+
+    def stamp(hour, minute=0):
+        return datetime(2026, 11, 20, hour, minute)
+
+    if family == "LISTA_AR":
+        values = {
+            "FECHA_ON": [stamp(5), stamp(6), stamp(7), stamp(8), stamp(10)],
+            "FECHA_OFF": [stamp(5, 5), None, stamp(8), stamp(8, 5), None],
+        }
+        selected = [1, 3]
+    else:
+        values = {"FECHA": [stamp(5), stamp(8), stamp(8, 5), stamp(8, 10), stamp(10)]}
+        selected = [2, 3]
+    table = pa.table({**values, "origen_fenix": ["AV21"] * 5, "value": list(range(5))})
+    root = tmp_path / "inputs"
+    item = save(root, {}, {family: table}, window_seconds=600)
+    window = (stamp(8), stamp(8, 10))
+    expression = evidence.operational_expression(family, window)
+    expected = item.rows(family, max_rows=10, expression=expression)
+    assert [row["value"] for row in expected] == selected
+    opens = []
+    verified = evidence.checked_file
+
+    def record(path, ref):
+        opens.append(ref["uri"])
+        return verified(path, ref)
+
+    monkeypatch.setattr(evidence, "checked_file", record)
+    fresh = Evidence.open(root)
+    assert fresh.rows(family, max_rows=10, expression=expression, window=window) == expected
+    assert len(opens) == 2
+    assert fresh.rows(family, max_rows=10, expression=expression, window=window) == expected
+    assert len(opens) == 2  # The same immutable fragments were already verified.
+    assert fresh.read_stats[family]["fragments_opened"] == 2
+    assert fresh.read_stats[family]["fragments_reused"] == 2
+
+
 def test_fragments_reuse_unchanged_block_and_publish_verified_links(tmp_path):
     root = tmp_path / "inputs"
     target = tmp_path / "published" / "evidence"
