@@ -140,7 +140,7 @@ jobs:
       - name: Prepare the approved Gold worker update
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '5d96ef69b7a9f0d83478683457e32d72028b59df' && github.event.head_commit.message == 'Bootstrap missing Gold Live storage' && github.run_attempt == '1'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '73c895f478c1b8091651ba776d9a5d900b9e155b' && github.event.head_commit.message == 'Accept PowerShell UTF-8 in Live rollout' && github.run_attempt == '1'
         run: |
           set -euo pipefail
           mkdir -p bundle

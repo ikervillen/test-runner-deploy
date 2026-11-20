@@ -217,7 +217,8 @@ import json, sys
 from pathlib import Path
 from deployment.independent import configure_live_only, read, validate_host
 
-data = json.load(sys.stdin)
+# Windows PowerShell can send a UTF-8 BOM to a native process.
+data = json.loads(sys.stdin.buffer.read().decode("utf-8-sig"))
 profile = read(Path('/opt/app/deployment/independent.example.json'))
 validate_host(profile, data['host'])
 print(json.dumps(configure_live_only(data['compose'], profile)))
