@@ -434,25 +434,37 @@ def chunk_delete_predicate(
     return _sql_in("id_produccion", sorted(replace_ids))
 
 
-def _same_scope_status(table, rows, *, complete):
-    """Compare values by key against an already confirmed Delta version."""
+_SCOPE_MERGE_MAX_KEYS = 128
+
+
+def _changed_scope_keys(table, rows, *, complete):
+    """Return a bounded set of upserts, or None when the existing writer is needed."""
     remaining = {}
     for row in rows:
         remaining[row["scope_id"]] = canonical(row)
+    changed = set()
     if not remaining and not complete:
-        return True
+        return changed
     scanner = table.to_pyarrow_dataset().scanner(use_threads=False)
     for batch in scanner.to_batches():
         for row in batch.to_pylist():
-            expected = remaining.pop(row["scope_id"], None)
+            key = row["scope_id"]
+            expected = remaining.pop(key, None)
             if expected is None:
                 if complete:
-                    return False
+                    return None  # An authoritative snapshot withdraws this key.
             elif expected != canonical(row):
-                return False
+                changed.add(key)
+                if len(changed) > _SCOPE_MERGE_MAX_KEYS:
+                    return None
         if not complete and not remaining:
-            return True
-    return not remaining
+            break
+    if len(changed) + len(remaining) > _SCOPE_MERGE_MAX_KEYS:
+        return None
+    changed.update(remaining)
+    if any("'" in key or "\\" in key for key in changed):
+        return None
+    return changed
 
 
 def _scope_write_metrics(target, ref, *, reused):
@@ -674,29 +686,32 @@ class Publisher:
                         raise IntegrityError(
                             "Output changed outside the pending confirmed operation"
                         )
+                changed_keys = None
+                if (
+                    name == "publication_scope_status"
+                    and current is not None
+                    and last.get("gold_operation_id") != operation
+                    and current.version() == prior_refs[name]["delta_version"]
+                    and (full_scope_snapshot or delete_predicate in (None, ""))
+                ):
+                    changed_keys = _changed_scope_keys(
+                        current,
+                        prepared(name),
+                        complete=full_scope_snapshot or delete_predicate == "",
+                    )
                 if last.get("gold_operation_id") == operation:
                     if last.get("gold_content_hash") != scoped_hash:
                         raise IntegrityError("Existing commit has different transformation content")
-                elif last.get("gold_content_hash") == scoped_hash and (
+                elif (
                     name != "publication_scope_status"
-                    or current.version() == prior_refs[name]["delta_version"]
+                    and last.get("gold_content_hash") == scoped_hash
                 ):
                     if name not in prior_refs:
                         raise IntegrityError(
                             "Unreferenced existing output requires explicit recovery"
                         )
                     ref = prior_refs[name]
-                elif (
-                    name == "publication_scope_status"
-                    and current is not None
-                    and current.version() == prior_refs[name]["delta_version"]
-                    and (full_scope_snapshot or delete_predicate in (None, ""))
-                    and _same_scope_status(
-                        current,
-                        prepared(name),
-                        complete=full_scope_snapshot or delete_predicate == "",
-                    )
-                ):
+                elif changed_keys is not None and not changed_keys:
                     ref = prior_refs[name]
                 else:
                     properties = CommitProperties(
@@ -706,20 +721,26 @@ class Publisher:
                         },
                         app_transactions=[Transaction(f"gold:{operation}:{name}", 1)],
                     )
-                    data = _batch_reader(name, prepared(name))
                     if current is None:
                         write_deltalake(
                             target,
-                            data,
+                            _batch_reader(name, prepared(name)),
                             mode="error",
                             partition_by=partition_columns(name),
                             configuration=RETENTION,
                             commit_properties=properties,
                         )
-                    elif name == "publication_scope_status" and full_scope_snapshot:
+                    elif (
+                        name == "publication_scope_status"
+                        and full_scope_snapshot
+                        and changed_keys is None
+                    ):
                         # A full scope snapshot is authoritative. Stream its replacement directly.
                         write_deltalake(
-                            target, data, mode="overwrite", commit_properties=properties
+                            target,
+                            _batch_reader(name, prepared(name)),
+                            mode="overwrite",
+                            commit_properties=properties,
                         )
                     else:
                         join = " AND ".join(f't."{k}" = s."{k}"' for k in KEYS[name])
@@ -727,28 +748,40 @@ class Publisher:
                             f'(t."{k}" IS DISTINCT FROM s."{k}")' for k in SCHEMAS[name].names
                         )
                         before_version = current.version()
-                        merge = (
-                            current.merge(
-                                data,
-                                join,
-                                source_alias="s",
-                                target_alias="t",
-                                commit_properties=properties,
-                                streamed_exec=True,
+                        sparse_data = None
+                        if changed_keys is not None:
+                            sparse_data = make_table(
+                                name, [r for r in prepared(name) if r["scope_id"] in changed_keys]
                             )
-                            .when_matched_update_all(predicate=changed)
-                            .when_not_matched_insert_all()
-                        )
-                        if delete_predicate is not None:
-                            delete = merge.when_not_matched_by_source_delete
-                            merge = (
-                                delete()
-                                if delete_predicate == ""
-                                else delete(predicate=delete_predicate)
-                            )
+                            join += " AND " + _sql_in("scope_id", sorted(changed_keys))
+                            delete_predicate = None
                         from deltalake.exceptions import CommitFailedError
 
                         for _attempt in range(8):
+                            data = (
+                                sparse_data
+                                if sparse_data is not None
+                                else _batch_reader(name, prepared(name))
+                            )
+                            merge = (
+                                current.merge(
+                                    data,
+                                    join,
+                                    source_alias="s",
+                                    target_alias="t",
+                                    commit_properties=properties,
+                                    streamed_exec=sparse_data is None,
+                                )
+                                .when_matched_update_all(predicate=changed)
+                                .when_not_matched_insert_all()
+                            )
+                            if delete_predicate is not None:
+                                delete = merge.when_not_matched_by_source_delete
+                                merge = (
+                                    delete()
+                                    if delete_predicate == ""
+                                    else delete(predicate=delete_predicate)
+                                )
                             try:
                                 merge.execute()
                                 break
@@ -756,25 +789,8 @@ class Publisher:
                                 if _attempt == 7:
                                     raise
                                 current = DeltaTable(str(target))
-                                merge = (
-                                    current.merge(
-                                        data,
-                                        join,
-                                        source_alias="s",
-                                        target_alias="t",
-                                        commit_properties=properties,
-                                        streamed_exec=True,
-                                    )
-                                    .when_matched_update_all(predicate=changed)
-                                    .when_not_matched_insert_all()
-                                )
-                                if delete_predicate is not None:
-                                    delete = merge.when_not_matched_by_source_delete
-                                    merge = (
-                                        delete()
-                                        if delete_predicate == ""
-                                        else delete(predicate=delete_predicate)
-                                    )
+                                if sparse_data is not None and current.version() != before_version:
+                                    raise
                         after = DeltaTable(str(target))
                         if after.version() == before_version:
                             if name not in prior_refs:

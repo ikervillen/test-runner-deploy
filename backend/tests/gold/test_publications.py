@@ -1,4 +1,5 @@
 from pathlib import Path
+from shutil import copytree
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -110,6 +111,85 @@ def test_spilled_scope_status_reuses_confirmed_version_for_equal_rows(tmp_path, 
     assert Snapshot.open(root, publication_id=first["publication_id"]).rows(
         "publication_scope_status"
     ) == [a, b]
+
+
+def test_full_scope_withdrawal_when_previous_patch_had_the_same_rows(tmp_path):
+    snap = source(tmp_path / "input")
+    root = tmp_path / "gold"
+    publisher = Publisher(root, environment="test", plant="AV")
+    a = coverage_row()
+    b = {**a, "scope_id": "two"}
+    publisher.publish(snap, ScopeSpill([a]), config_id="c", cutoff="1", coverage=[])
+    publisher.publish(snap, ScopeSpill([b]), config_id="c", cutoff="2", coverage=[], fact_bounds=())
+    publisher.publish(snap, ScopeSpill([b]), config_id="c", cutoff="3", coverage=[])
+    assert Snapshot.open(root).rows("publication_scope_status") == [b]
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_sparse_scope_update_keeps_unrelated_files_and_recovers(tmp_path, monkeypatch, partial):
+    from app.gold import publications
+
+    snap = source(tmp_path / "input")
+    root = tmp_path / "candidate"
+    legacy = tmp_path / "legacy"
+    rows = [{**coverage_row(), "scope_id": f"scope-{i:04}"} for i in range(80)]
+
+    def publish(path, values, cutoff, *, partial, failpoint=None):
+        return Publisher(path, environment="test", plant="AV", failpoint=failpoint).publish(
+            snap,
+            ScopeSpill(values),
+            config_id="config",
+            cutoff=str(cutoff),
+            coverage=[],
+            fact_bounds=() if partial else None,
+        )
+
+    for i in range(8):
+        initial = publish(root, rows[i * 10 : (i + 1) * 10], i, partial=True)
+    table_name = "publication_scope_status"
+    relative = f"tables/{table_name}"
+    original = set(DeltaTable(root / relative).file_uris())
+    assert len(original) == 8
+    copytree(root, legacy)
+    changed = {
+        **rows[12],
+        "estado": "WAITING_DEPENDENCY",
+        "reason_code": "LATE_CORRECTION",
+        "evidence_reference": "corrected",
+    }
+    expected = [*rows[:12], changed, *rows[13:]]
+    incoming = expected[10:20] if partial else expected
+    with monkeypatch.context() as patch:
+        patch.setattr(publications, "_changed_scope_keys", lambda *a, **k: None)
+        publish(legacy, incoming, 8, partial=partial)
+
+    def crash(point):
+        if point == f"commit:{table_name}":
+            raise RuntimeError("commit before receipt")
+
+    with pytest.raises(RuntimeError, match="commit before receipt"):
+        publish(root, incoming, 8, partial=partial, failpoint=crash)
+    assert Snapshot.open(root).publication_id == initial["publication_id"]
+    committed = DeltaTable(root / relative)
+    new_files = set(committed.file_uris())
+    assert len(original - new_files) == 1
+    assert all(Path(f).is_file() for f in original)
+    metrics = committed.history(1)[0]["operationMetrics"]
+    assert int(metrics["num_source_rows"]) == 1
+    assert int(metrics["num_target_files_scanned"]) == 1
+
+    result = publish(root, incoming, 8, partial=partial)
+    assert result["publication_scope_status_write"]["commits"] == 1
+    assert publish(root, incoming, 8, partial=partial)["status"] == "UNCHANGED"
+    assert DeltaTable(root / relative).version() == committed.version()
+
+    def sort_key(row):
+        return row["scope_id"]
+
+    assert sorted(Snapshot.open(root).rows(table_name), key=sort_key) == expected
+    assert sorted(Snapshot.open(legacy).rows(table_name), key=sort_key) == expected
+    old = Snapshot.open(root, publication_id=initial["publication_id"])
+    assert sorted(old.rows(table_name), key=sort_key) == rows
 
 
 @pytest.mark.parametrize(
