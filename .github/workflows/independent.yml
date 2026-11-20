@@ -138,7 +138,7 @@ jobs:
       - name: Prepare the approved Gold worker update
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '28203e74176d13081a48480a04d217fb4cf3df49' && github.event.head_commit.message == 'Roll out Gold MIA references'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '2090620559bdb9549ee224c0d85ed921767799c9' && github.event.head_commit.message == 'Roll out versioned MDL severities'
         run: |
           set -euo pipefail
           mkdir -p bundle
