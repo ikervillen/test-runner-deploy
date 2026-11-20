@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -16,7 +16,70 @@ from .producer import assignment_tables
 SCHEMA = "quality-independent-input-v1"
 
 
-def save(root, document, tables):
+OPERATIONS = {"LISTA_DEFECTOS", "LISTA_RECH", "CONT_ZC", "LISTA_AR"}
+
+
+def evidence_files(ref):
+    """Backward compatible with the original, single-Parquet manifest entries."""
+    return ref.get("parts", [ref])
+
+
+def checked_file(root, ref):
+    path = within(root, ref["uri"])
+    with path.open("rb") as stream:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != ref["hash"]:
+            raise IntegrityError("Gold evidence bytes differ")
+    return path
+
+
+def _write_table(root, table):
+    from ingesta_delta_lake.association_cas import publish
+
+    sink = pa.BufferOutputStream()
+    pq.write_table(table, sink)
+    data = sink.getvalue().to_pybytes()
+    identity = hashlib.sha256(data).hexdigest()
+    ref = {"uri": f"data/{identity}.parquet", "hash": identity, "rows": table.num_rows}
+    path = within(root, ref["uri"])
+    if path.exists():
+        checked_file(root, ref)
+    else:
+        publish(path, data)
+    return ref
+
+
+def _fragments(name, table, window_seconds):
+    if not window_seconds or not table.num_rows:
+        return None
+    groups = defaultdict(list)
+    if name in OPERATIONS:
+        epoch = datetime(1970, 1, 1)
+        field = "FECHA_ON" if name == "LISTA_AR" else "FECHA"
+        for i, (origin, stamp) in enumerate(zip(table["origen_fenix"], table[field], strict=True)):
+            offset = (stamp.as_py() - epoch) // timedelta(seconds=window_seconds)
+            groups[origin.as_py(), offset].append(i)
+    elif name == "__lineage":
+        for i, (family, key, proof) in enumerate(
+            zip(
+                table["family"],
+                table["key"],
+                table["proof"],
+                strict=True,
+            )
+        ):
+            parsed = json.loads(proof.as_py())
+            if family.as_py() in OPERATIONS:
+                part = parsed["source_table"], parsed["source_version"]
+            else:
+                part = "catalog", 0
+            groups[family.as_py(), *part].append((key.as_py(), proof.as_py(), i))
+        return [(key, table.take([i for _, _, i in sorted(groups[key])])) for key in sorted(groups)]
+    else:
+        return None
+    return [(key, table.take(groups[key])) for key in sorted(groups)]
+
+
+def save(root, document, tables, *, window_seconds=None, reuse=None):
     """Persist all bytes before making this input eligible for a Gold publication."""
     root.mkdir(parents=True, exist_ok=True)
     document, tables = dict(document), dict(tables)
@@ -35,21 +98,22 @@ def save(root, document, tables):
         )
     refs = []
     for name, table in sorted(tables.items()):
-        sink = pa.BufferOutputStream()
-        pq.write_table(table, sink)
-        data = sink.getvalue().to_pybytes()
-        identity = hashlib.sha256(data).hexdigest()
-        uri = f"data/{identity}.parquet"
-        path = root / uri
-        path.parent.mkdir(exist_ok=True)
-        if path.exists():
-            if hashlib.sha256(path.read_bytes()).hexdigest() != identity:
-                raise IntegrityError("Immutable Gold evidence changed")
+        fragments = _fragments(name, table, window_seconds)
+        if not fragments:
+            ref = reuse.matching_file(name, table) if reuse else None
+            if ref is None:
+                ref = _write_table(root, table)
         else:
-            from ingesta_delta_lake.association_cas import publish
-
-            publish(path, data)
-        refs.append({"name": name, "uri": uri, "hash": identity, "rows": table.num_rows})
+            previous = reuse.fragments(name) if reuse else {}
+            descriptors = []
+            for key, part in fragments:
+                old = previous.get(tuple(key))
+                if old and old[1].equals(part):
+                    descriptors.append(old[0])
+                else:
+                    descriptors.append({**_write_table(root, part), "partition": list(key)})
+            ref = {"parts": descriptors, "rows": table.num_rows}
+        refs.append({"name": name, **ref})
     payload = {**document, "schema_id": SCHEMA, "tables": refs}
     identity = digest(payload)
     from .common import immutable_json
@@ -70,6 +134,7 @@ class Evidence:
             "tables": [{**r, "delta_version": 0} for r in document["tables"]],
         }
         self._tables = {}
+        self._fragments = {}
 
     @classmethod
     def open(cls, root, identity=None):
@@ -90,17 +155,32 @@ class Evidence:
             ref = next((r for r in self.document["tables"] if r["name"] == name), None)
             if ref is None or ref["rows"] > max_rows:
                 raise IntegrityError("Gold evidence exceeds its explicit row budget")
-            path = within(self.root, ref["uri"])
-            with path.open("rb") as stream:
-                if hashlib.file_digest(stream, "sha256").hexdigest() != ref["hash"]:
-                    raise IntegrityError("Gold evidence bytes differ")
-            table = pq.read_table(path)
+            parts = []
+            for item in evidence_files(ref):
+                table = pq.ParquetFile(checked_file(self.root, item)).read(use_threads=False)
+                if table.num_rows != item["rows"]:
+                    raise IntegrityError("Gold evidence fragment count differs")
+                parts.append(table)
+                if "partition" in item:
+                    self._fragments.setdefault(name, {})[tuple(item["partition"])] = (item, table)
+            table = pa.concat_tables(parts) if len(parts) > 1 else parts[0]
             if table.num_rows != ref["rows"]:
                 raise IntegrityError("Gold evidence count differs")
             self._tables[name] = table
         if self._tables[name].num_rows > max_rows:
             raise IntegrityError("Gold evidence exceeds its explicit row budget")
         return self._tables[name]
+
+    def fragments(self, name):
+        return self._fragments.get(name, {})
+
+    def matching_file(self, name, table):
+        previous = self._tables.get(name)
+        if previous is not None and previous.equals(table):
+            ref = next(r for r in self.document["tables"] if r["name"] == name)
+            if "uri" in ref:
+                return {key: ref[key] for key in ("uri", "hash", "rows")}
+        return None
 
     def proofs(self, *, max_rows):
         result = {}

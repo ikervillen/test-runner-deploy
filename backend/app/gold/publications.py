@@ -1060,20 +1060,14 @@ def independent_dependencies(root, snapshot):
         or snapshot.document.get("schema_id") != "quality-independent-input-v1"
     ):
         return []
-    from ingesta_delta_lake.association_cas import publish
-
-    from .evidence import SCHEMA, Evidence
+    from .evidence import SCHEMA, Evidence, evidence_files
+    from .evidence_storage import publish_reference
 
     target = root / "evidence"
     target.mkdir(parents=True, exist_ok=True)
     for ref in snapshot.document["tables"]:
-        source = within(snapshot.root, ref["uri"])
-        destination = within(target, ref["uri"])
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        data = source.read_bytes()
-        if hashlib.sha256(data).hexdigest() != ref["hash"]:
-            raise IntegrityError("Gold publication cannot confirm altered input evidence")
-        publish(destination, data)
+        for item in evidence_files(ref):
+            publish_reference(snapshot.root, target, item)
     immutable_json(target / f"{snapshot.publication_id}.json", snapshot.document)
     copied = Evidence.open(target, snapshot.publication_id)
     if copied.document["schema_id"] != SCHEMA:
