@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     data_backend: Literal["legacy", "gold"] = "legacy"
     gold_root: Path | None = None
     gold_history_root: Path | None = None
+    gold_history_enabled: bool = True
     gold_query_max_rows: int = Field(default=250_000, ge=1, le=1_000_000)
     gold_query_total_rows: int = Field(default=500_000, ge=1, le=2_000_000)
     log_level: str = "INFO"
@@ -50,7 +51,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def independent_gold_stores(self) -> Settings:
-        if self.gold_history_root is not None:
+        if self.gold_history_enabled and self.gold_history_root is not None:
             live = self.resolved_gold_root
             history = self.gold_history_root.expanduser().resolve()
             if (

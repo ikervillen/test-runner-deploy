@@ -342,9 +342,11 @@ def test_combined_gold_never_counts_a_capture_twice(tmp_path, native):
 
 
 def test_combined_query_pins_both_publications_and_recalculates(tmp_path, native):
+    from app.config import Settings
     from app.gold.combined_query import CombinedQuery
     from app.gold.common import read_json
     from app.gold.pipeline import run
+    from app.gold.service import GoldService
 
     from .test_pipeline import CUTOFF, bundle
 
@@ -370,6 +372,16 @@ def test_combined_query_pins_both_publications_and_recalculates(tmp_path, native
     assert {r["inspeccionadas"] for r in exposures if r["tipo_ventana"] == "PRODUCTION"} == {1500}
     assert len(query.rows("mia_inspections")) == 8
     assert query.fork(None) is query
+    settings = Settings(
+        data_root=roots["live"],
+        data_backend="gold",
+        gold_root=roots["live"],
+        gold_history_root=roots["history"],
+        gold_history_enabled=False,
+    )
+    direct = GoldService(settings).query()
+    assert not isinstance(direct, CombinedQuery)
+    assert direct.snapshot.publication_id == query.live.snapshot.publication_id
 
 
 def test_live_gold_keeps_facts_until_historical_gold_confirms_them(independent, native):

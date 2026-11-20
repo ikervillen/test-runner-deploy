@@ -40,7 +40,7 @@ class GoldService:
         self.catalog_cache = LruCache(1)
 
     def query(self):
-        if self.settings.gold_history_root is not None:
+        if self.settings.gold_history_enabled and self.settings.gold_history_root is not None:
             from .combined_query import CombinedQuery
 
             return CombinedQuery(
