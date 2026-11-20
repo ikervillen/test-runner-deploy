@@ -1525,6 +1525,7 @@ def _remember_live(
     publication_id: str | None,
     *,
     mia_reference_mode=None,
+    effective_config_id=None,
 ) -> None:
     """The eight-hour window is stored for this Silver publication, so the next tick can exit."""
     atomic_json(
@@ -1534,6 +1535,7 @@ def _remember_live(
             "horizon": "COMPLETE",
             "input_publication_id": silver_id,
             "mia_reference_mode": mia_reference_mode,
+            "effective_config_id": effective_config_id,
             "publication_id": publication_id,
         },
     )
@@ -1545,6 +1547,7 @@ def _live_caught_up(
     confirmed_input=None,
     *,
     mia_reference_mode=None,
+    effective_config_id=None,
 ) -> dict | None:
     """Same Silver publication and a complete window: do not open the fact history."""
     receipt = _live_receipt(output_root)
@@ -1553,6 +1556,7 @@ def _live_caught_up(
         or receipt.get("status") != "ACKNOWLEDGED"
         or receipt.get("horizon") != "COMPLETE"
         or receipt.get("mia_reference_mode") != mia_reference_mode
+        or receipt.get("effective_config_id") != effective_config_id
         or not (output_root / "current.json").exists()
     ):
         return None
@@ -1606,12 +1610,14 @@ def _run(
         recalculation_reason and recalculation_reason.strip()
     ):
         raise IntegrityError("Historical recalculation requires explicit productions and a reason")
+    effective_config_id = digest([config, bundle])
     if lane == "live" and recovery is None:
         caught_up = _live_caught_up(
             input_root,
             output_root,
             confirmed_input,
             mia_reference_mode=mia_reference_mode,
+            effective_config_id=effective_config_id,
         )
         if caught_up is not None:
             return caught_up
@@ -1759,6 +1765,7 @@ def _run(
                         snap.publication_id,
                         published_id,
                         mia_reference_mode=mia_reference_mode,
+                        effective_config_id=effective_config_id,
                     )
                 return {
                     "status": "UNCHANGED",
@@ -1852,6 +1859,7 @@ def _run(
                             snap.publication_id,
                             result["publication_id"],
                             mia_reference_mode=mia_reference_mode,
+                            effective_config_id=effective_config_id,
                         )
                     spilled = getattr(tables, "spilled", ())
                     return {

@@ -16,6 +16,7 @@ from time import monotonic
 import portalocker
 import pyarrow as pa
 
+from .catalogs import load_independent_bundle
 from .common import IntegrityError, atomic_json, canonical, digest, read_json
 from .evidence import Evidence
 from .independent_inputs import cutoff, export
@@ -308,7 +309,7 @@ def main(argv=None):
         args.lane,
         load_config(args.source, require_inputs=False),
         score=read_json(args.score),
-        catalogs=read_json(args.catalogs),
+        catalogs=load_independent_bundle(args.catalogs),
     )
     signal.signal(signal.SIGINT, lambda *_: worker.stop.set())
     signal.signal(signal.SIGTERM, lambda *_: worker.stop.set())

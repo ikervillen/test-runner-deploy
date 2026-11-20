@@ -48,6 +48,37 @@ def categories(mdl: Path, severity: Path) -> dict[str, str | None]:
     }
 
 
+VERSIONED_AR_SEVERITY = (
+    Path(__file__).resolve().parents[3] / "config" / "ar_severity_overrides.json"
+)
+
+
+def load_independent_bundle(path: Path) -> dict:
+    """Apply approved MDL decisions to the site's baseline on each Gold start."""
+    bundle = read_json(path)
+    approved = read_json(VERSIONED_AR_SEVERITY)
+    if (
+        approved.get("schema_id") != "quality-ar-severity-overrides-v1"
+        or not isinstance(approved.get("source"), str)
+        or not approved["source"]
+        or not isinstance(approved.get("defect_categories"), dict)
+    ):
+        raise IntegrityError("Invalid versioned AR severity decisions")
+    categories = approved["defect_categories"]
+    if any(
+        not code.isascii()
+        or not code.isdigit()
+        or not isinstance(value, str)
+        or canonical_severity(value) != value
+        for code, value in categories.items()
+    ):
+        raise IntegrityError("Invalid Fenix code or category in versioned AR severity decisions")
+    return {
+        **bundle,
+        "defect_categories": {**bundle["defect_categories"], **categories},
+    }
+
+
 def build(snapshot, bundle: dict) -> tuple[dict[str, list[dict]], list[dict]]:
     """Bundle is a controlled, hash-versioned configuration, not guessed labels."""
     allowed = {

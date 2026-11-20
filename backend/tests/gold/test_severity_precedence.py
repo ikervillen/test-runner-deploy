@@ -45,3 +45,42 @@ def test_new_fenix_severity_uses_mdl_then_fallback_and_flags_internal_conflict(t
         "51": "Critico",
         "60": "Leve",
     }
+
+
+def test_gold_start_applies_the_versioned_mdl_decisions(tmp_path):
+    import json
+
+    from app.gold.catalogs import load_independent_bundle
+
+    path = tmp_path / "catalogs.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_id": "quality-catalog-bundle-v1",
+                "defect_categories": {"13": None, "39": "Leve", "999": "Menor"},
+                "model_segments": [{"modelo": "example"}],
+            }
+        )
+    )
+    result = load_independent_bundle(path)
+    assert result["defect_categories"] == {
+        "13": "Grave",
+        "39": "Mayor",
+        "130": "Grave",
+        "311": "Grave",
+        "999": "Menor",
+    }
+    assert result["model_segments"] == [{"modelo": "example"}]
+    assert json.loads(path.read_text())["defect_categories"]["39"] == "Leve"
+
+
+def test_live_receipt_does_not_skip_a_changed_catalog(tmp_path):
+    from types import SimpleNamespace
+
+    from app.gold.common import atomic_json
+    from app.gold.pipeline import _live_caught_up, _remember_live
+
+    atomic_json(tmp_path / "current.json", {"publication_id": "gold"})
+    _remember_live(tmp_path, "silver", "gold", effective_config_id="old")
+    source = SimpleNamespace(publication_id="silver", manifest={"coverage": []})
+    assert _live_caught_up(tmp_path, tmp_path, source, effective_config_id="new") is None

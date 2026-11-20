@@ -1,0 +1,10 @@
+{
+  "schema_id": "quality-ar-severity-overrides-v1",
+  "source": "Programación defectos MDL_enviado V01.xlsx",
+  "defect_categories": {
+    "13": "Grave",
+    "39": "Mayor",
+    "130": "Grave",
+    "311": "Grave"
+  }
+}
