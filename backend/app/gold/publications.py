@@ -434,6 +434,56 @@ def chunk_delete_predicate(
     return _sql_in("id_produccion", sorted(replace_ids))
 
 
+def _same_scope_status(table, rows, *, complete):
+    """Compare values by key against an already confirmed Delta version."""
+    remaining = {}
+    for row in rows:
+        remaining[row["scope_id"]] = canonical(row)
+    if not remaining and not complete:
+        return True
+    scanner = table.to_pyarrow_dataset().scanner(use_threads=False)
+    for batch in scanner.to_batches():
+        for row in batch.to_pylist():
+            expected = remaining.pop(row["scope_id"], None)
+            if expected is None:
+                if complete:
+                    return False
+            elif expected != canonical(row):
+                return False
+        if not complete and not remaining:
+            return True
+    return not remaining
+
+
+def _scope_write_metrics(target, ref, *, reused):
+    result = {
+        "delta_version": ref["delta_version"],
+        "reused_version": reused,
+        "commits": int(not reused),
+        "added_parquet": 0,
+        "added_bytes": 0,
+        "added_allocated_bytes": 0,
+    }
+    if reused:
+        return result
+    log = target / "_delta_log" / f"{ref['delta_version']:020d}.json"
+    try:
+        with log.open(encoding="utf-8") as stream:
+            for line in stream:
+                add = json.loads(line).get("add")
+                if add is not None:
+                    result["added_parquet"] += 1
+                    result["added_bytes"] += add["size"]
+                    info = (target / add["path"]).stat()
+                    result["added_allocated_bytes"] += (
+                        info.st_blocks * 512 if hasattr(info, "st_blocks") else info.st_size
+                    )
+    except (OSError, ValueError, KeyError):
+        # Incomplete telemetry does not alter the already verified receipt or recovery.
+        return {**result, "added_parquet": None, "added_bytes": None, "added_allocated_bytes": None}
+    return result
+
+
 class Publisher:
     """One active writer. Journal contains receipts/hashes, never business rows."""
 
@@ -600,6 +650,7 @@ class Publisher:
             atomic_json(journal, state)
         self.failpoint("prepared")
         prior_refs = {r["name"]: r for r in previous["tables"]} if previous else {}
+        scope_write = None
         for name in names:
             target = self.root / "tables" / name
             scoped_hash = digest([hashes[name], scope])
@@ -607,6 +658,10 @@ class Publisher:
             if ref is None:
                 current = DeltaTable(str(target)) if (target / "_delta_log").exists() else None
                 last = current.history(1)[0] if current else {}
+                delete_predicate = chunk_delete_predicate(
+                    name, replace_ids, hours, result_ids, fact_bounds
+                )
+                full_scope_snapshot = not scope and fact_bounds is None
                 if current is not None and last.get("gold_operation_id") != operation:
                     accepted = prior_refs.get(name)
                     if accepted is None:
@@ -622,11 +677,26 @@ class Publisher:
                 if last.get("gold_operation_id") == operation:
                     if last.get("gold_content_hash") != scoped_hash:
                         raise IntegrityError("Existing commit has different transformation content")
-                elif last.get("gold_content_hash") == scoped_hash:
+                elif last.get("gold_content_hash") == scoped_hash and (
+                    name != "publication_scope_status"
+                    or current.version() == prior_refs[name]["delta_version"]
+                ):
                     if name not in prior_refs:
                         raise IntegrityError(
                             "Unreferenced existing output requires explicit recovery"
                         )
+                    ref = prior_refs[name]
+                elif (
+                    name == "publication_scope_status"
+                    and current is not None
+                    and current.version() == prior_refs[name]["delta_version"]
+                    and (full_scope_snapshot or delete_predicate in (None, ""))
+                    and _same_scope_status(
+                        current,
+                        prepared(name),
+                        complete=full_scope_snapshot or delete_predicate == "",
+                    )
+                ):
                     ref = prior_refs[name]
                 else:
                     properties = CommitProperties(
@@ -646,7 +716,7 @@ class Publisher:
                             configuration=RETENTION,
                             commit_properties=properties,
                         )
-                    elif name == "publication_scope_status" and not scope and fact_bounds is None:
+                    elif name == "publication_scope_status" and full_scope_snapshot:
                         # A full scope snapshot is authoritative. Stream its replacement directly.
                         write_deltalake(
                             target, data, mode="overwrite", commit_properties=properties
@@ -669,12 +739,13 @@ class Publisher:
                             .when_matched_update_all(predicate=changed)
                             .when_not_matched_insert_all()
                         )
-                        predicate = chunk_delete_predicate(
-                            name, replace_ids, hours, result_ids, fact_bounds
-                        )
-                        if predicate is not None:
+                        if delete_predicate is not None:
                             delete = merge.when_not_matched_by_source_delete
-                            merge = delete() if predicate == "" else delete(predicate=predicate)
+                            merge = (
+                                delete()
+                                if delete_predicate == ""
+                                else delete(predicate=delete_predicate)
+                            )
                         from deltalake.exceptions import CommitFailedError
 
                         for _attempt in range(8):
@@ -697,10 +768,12 @@ class Publisher:
                                     .when_matched_update_all(predicate=changed)
                                     .when_not_matched_insert_all()
                                 )
-                                if predicate is not None:
+                                if delete_predicate is not None:
                                     delete = merge.when_not_matched_by_source_delete
                                     merge = (
-                                        delete() if predicate == "" else delete(predicate=predicate)
+                                        delete()
+                                        if delete_predicate == ""
+                                        else delete(predicate=delete_predicate)
                                     )
                         after = DeltaTable(str(target))
                         if after.version() == before_version:
@@ -713,6 +786,8 @@ class Publisher:
                     ref = reference(self.root, name, f"tables/{name}", current.version(), operation)
                 state["receipts"][name] = ref
                 atomic_json(journal, state)
+            if name == "publication_scope_status":
+                scope_write = _scope_write_metrics(target, ref, reused=ref == prior_refs.get(name))
             prior_refs[name] = ref
         state["state"] = "VERIFIED"
         atomic_json(journal, state)
@@ -750,6 +825,7 @@ class Publisher:
             "status": "PUBLISHED",
             "publication_id": manifest["publication_id"],
             "tables": len(prior_refs),
+            **({"publication_scope_status_write": scope_write} if scope_write is not None else {}),
         }
 
     def _publish(

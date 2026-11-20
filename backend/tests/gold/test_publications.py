@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pytest
@@ -56,6 +57,59 @@ def coverage_row():
         "pending_files": 0,
         "earliest_pending_period": None,
     }
+
+
+class ScopeSpill(dict):
+    def __init__(self, rows):
+        super().__init__(publication_scope_status=rows)
+        self.spilled = {"publication_scope_status"}
+        self.store = SimpleNamespace(iter_rows=lambda _name: iter(rows))
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+def test_spilled_scope_status_reuses_confirmed_version_for_equal_rows(tmp_path, scoped):
+    snap = source(tmp_path / "input")
+    root = tmp_path / "gold"
+    publisher = Publisher(root, environment="test", plant="AV")
+    a = coverage_row()
+    b = {**a, "scope_id": "two", "origin": "AV21"}
+    changed = {**a, "estado": "REVIEW", "reason_code": "LATE_CORRECTION"}
+
+    def write(rows, cutoff, *, partial=False):
+        return publisher.publish(
+            snap,
+            ScopeSpill(rows),
+            config_id="config",
+            cutoff=cutoff,
+            coverage=[],
+            fact_bounds=() if partial else None,
+        )
+
+    first = write([a, b], "1")
+    directory = root / "tables" / "publication_scope_status"
+    original = sorted(directory.glob("*.parquet"))
+    stats = first["publication_scope_status_write"]
+    assert stats["commits"] == 1 and stats["added_parquet"] == len(original) > 0
+    second = write([a] if scoped else [b, a], "2", partial=scoped)
+    assert second["publication_id"] != first["publication_id"]
+    assert second["publication_scope_status_write"] == {
+        "delta_version": 0,
+        "reused_version": True,
+        "commits": 0,
+        "added_parquet": 0,
+        "added_bytes": 0,
+        "added_allocated_bytes": 0,
+    }
+    assert sorted(directory.glob("*.parquet")) == original
+    assert write([a] if scoped else [b, a], "2", partial=scoped)["status"] == "UNCHANGED"
+    third = write([changed], "3", partial=scoped)
+    assert third["publication_scope_status_write"]["commits"] == 1
+    assert {r["scope_id"]: r for r in Snapshot.open(root).rows("publication_scope_status")} == (
+        {"one": changed, "two": b} if scoped else {"one": changed}
+    )
+    assert Snapshot.open(root, publication_id=first["publication_id"]).rows(
+        "publication_scope_status"
+    ) == [a, b]
 
 
 @pytest.mark.parametrize(
