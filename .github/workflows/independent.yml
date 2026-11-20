@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  GOLD_CONTEXT_COMMIT: 9820b13bba631c34cefeba837b9696dd96b0769e
+  GOLD_CONTEXT_COMMIT: 88af2c18e0ce874cf44189ed68ab0125678333cf
   GOLD_SOURCE_COMMIT: ad88dc3d0bdedfbc4da3de06da74e3801b9b64f7
 
 jobs:

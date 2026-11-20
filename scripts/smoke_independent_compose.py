@@ -48,7 +48,7 @@ def synthetic_stack(root, image, gold_context):
         json.dumps(
             {
                 "schema_id": "quality-catalog-bundle-v1",
-                "defect_categories": {},
+                "defect_categories": {"13": None, "39": "Leve", "999": "Menor"},
                 "mia_labels": {"15": "Synthetic defect"},
                 "zone_rules": {},
                 "profiles": [],
@@ -156,12 +156,33 @@ def smoke(image, gold_context):
                 "python",
                 "backend",
                 "-c",
-                "from main import app; from app.gold.publications import Snapshot; "
-                "from pathlib import Path; import os; "
-                "live, history = [Snapshot.open(Path(os.environ[key]), require_gold_contract=True) "
-                "for key in ('APP_GOLD_ROOT', 'APP_GOLD_HISTORY_ROOT')]; "
-                "assert app and live.publication_id != history.publication_id; "
-                "assert live.rows('publication_scope_status')",
+                dedent("""
+                    import json
+                    import os
+                    from pathlib import Path
+
+                    from main import app
+                    from app.gold.catalogs import VERSIONED_AR_SEVERITY
+                    from app.gold.publications import Snapshot
+
+                    keys = ("APP_GOLD_ROOT", "APP_GOLD_HISTORY_ROOT")
+                    roots = [Path(os.environ[key]) for key in keys]
+                    live, history = (
+                        Snapshot.open(root, require_gold_contract=True) for root in roots
+                    )
+                    assert app and live.publication_id != history.publication_id
+                    assert live.rows("publication_scope_status")
+                    expected = json.loads(
+                        VERSIONED_AR_SEVERITY.read_text(encoding="utf-8")
+                    )["defect_categories"]
+                    for root in roots:
+                        configs = list((root / "configs").glob("*.json"))
+                        assert len(configs) == 1
+                        frozen = json.loads(configs[0].read_text(encoding="utf-8"))
+                        categories = frozen["catalogs"]["defect_categories"]
+                        assert {code: categories[code] for code in expected} == expected
+                        assert categories["999"] == "Menor"
+                """),
             )
         finally:
             run("down", "--volumes", "--remove-orphans")
