@@ -42,13 +42,61 @@ function Get-Worker([string]$Service, [switch]$AllowStopped, [switch]$AllowMissi
     $filters = @('--filter', "label=com.docker.compose.project=$project",
         '--filter', "label=com.docker.compose.service=$Service", '--format', '{{.ID}}')
     $ids = @(Invoke-Docker ps @filters)
+    if ($ids.Count -gt 1) {
+        throw "Hay $($ids.Count) contenedores en ejecucion para ${Service}: $($ids -join ', ')."
+    }
     if ($AllowStopped -and $ids.Count -eq 0) {
         $ids = @(Invoke-Docker ps --all @filters)
+        if ($ids.Count -gt 1) {
+            # A failed Compose recreation may keep an old container under a prefixed name.
+            $expectedName = "$project-$Service-1"
+            $canonical = @(Invoke-Docker ps --all --filter "name=^/$expectedName$" @filters)
+            if ($canonical.Count -eq 1) { $ids = $canonical }
+        }
     }
     if ($AllowMissing -and $ids.Count -eq 0) { return $null }
-    if ($ids.Count -ne 1) { throw "Se esperaba un único contenedor activo para $Service." }
+    if ($ids.Count -ne 1) {
+        throw "Se esperaba un contenedor identificable para ${Service}. Encontrados: $($ids.Count) [$($ids -join ', ')]."
+    }
     $items = ((Invoke-Docker inspect $ids[0]) -join "`n") | ConvertFrom-Json
     return @($items)[0]
+}
+
+function Find-SavedCompose {
+    $directory = Join-Path $env:LOCALAPPDATA 'FenixIngesta/independent'
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        throw "No existe el directorio de Compose guardados: $directory"
+    }
+    $files = @(Get-ChildItem -LiteralPath $directory -Directory |
+        Where-Object { $_.Name -cmatch '^[0-9a-f]{7,40}$' } |
+        ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -Filter 'compose*.json' -File } |
+        Where-Object { $_.Name -cmatch '^compose(?:\.[0-9a-f]{7,40})?\.json$' } |
+        Sort-Object LastWriteTimeUtc, FullName -Descending)
+    foreach ($file in $files) {
+        try { $saved = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json }
+        catch { continue }
+        if ($saved.name -cne $project -or
+            @($services | Where-Object { -not $saved.services.$_ }).Count -or
+            -not $saved.services.'ingesta-history' -or -not $saved.services.'gold-history') {
+            continue
+        }
+        $bind = @($saved.services.'ingesta-live'.volumes | Where-Object {
+            $_.type -eq 'bind' -and $_.target -ceq $profile.input_target -and $_.read_only
+        })
+        if ($bind.Count -ne 1 -or
+            $bind[0].source.Replace('\', '/').TrimEnd('/') -ine $site.input_bind.Replace('\', '/').TrimEnd('/')) {
+            continue
+        }
+        $config = @($saved.services.'ingesta-live'.volumes | Where-Object {
+            $_.type -eq 'bind' -and $_.target -ceq $profile.configuration_target -and $_.read_only
+        })
+        if ($config.Count -ne 1 -or
+            -not (Test-Path -LiteralPath (Join-Path $config[0].source $profile.pipelines_file) -PathType Leaf)) {
+            continue
+        }
+        return $file.FullName
+    }
+    throw "No hay un Compose guardado del proyecto $project con el origen Fenix autorizado."
 }
 
 if ($Revision -cnotmatch '^[a-f0-9]{40}$' -or $GoldRevision -cnotmatch '^[a-f0-9]{40}$' -or
@@ -62,16 +110,23 @@ if ($IncludeBackend -and (-not $GoldOnly -or -not $IncludeGoldHistory -or -not $
 $workers = @{}
 foreach ($service in $services) {
     $workers[$service] = Get-Worker $service -AllowStopped:$LiveFlowOnly `
-        -AllowMissing:($LiveFlowOnly -and $service -eq 'gold-live')
+        -AllowMissing:$LiveFlowOnly
 }
-$anchor = $workers[$services[0]]
-if (-not $anchor -and $LiveFlowOnly) { $anchor = $workers['ingesta-live'] }
-$activeFile = $anchor.Config.Labels.'com.docker.compose.project.config_files'
+$activeFile = $null
+foreach ($service in $services) {
+    $candidateFile = $workers[$service].Config.Labels.'com.docker.compose.project.config_files'
+    if ($candidateFile -and (Test-Path -LiteralPath $candidateFile -PathType Leaf)) {
+        $activeFile = $candidateFile
+        break
+    }
+}
+if (-not $activeFile -and $LiveFlowOnly) { $activeFile = Find-SavedCompose }
 if (-not $activeFile -or -not (Test-Path -LiteralPath $activeFile -PathType Leaf)) {
     throw "No se encuentra el Compose activo de $($services[0])."
 }
 $compose = Get-Content -LiteralPath $activeFile -Raw | ConvertFrom-Json
 if ($compose.name -cne $project) { throw 'El Compose activo pertenece a otro proyecto.' }
+Write-Output "Compose base: $activeFile"
 $tag = "fenix-independent:sha-$Revision"
 foreach ($service in $services) {
     $definition = $compose.services.$service

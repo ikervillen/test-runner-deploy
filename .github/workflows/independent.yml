@@ -140,7 +140,7 @@ jobs:
       - name: Prepare the approved Gold worker update
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '2b96067a6cc2db44fba08726fdffb0ff4dec5d19' && github.event.head_commit.message == 'Roll out scoped Gold Live reads' && github.run_attempt == '1'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '765e0de5c7a0635b3338b4affc768a2683e592e0' && github.event.head_commit.message == 'Recover and roll out Fenix Live' && github.run_attempt == '1'
         run: |
           set -euo pipefail
           mkdir -p bundle
