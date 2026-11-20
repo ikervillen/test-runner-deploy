@@ -134,6 +134,9 @@ def test_independent_gold_publishes_self_contained_evidence(independent, tmp_pat
     )
     result = run(evidence.root, root, **kwargs)
     assert result["status"] == "PUBLISHED"
+    stored = result["write_telemetry"]["evidence"]
+    assert stored["new_links"] > 0 and stored["new_physical_bytes"] == 0
+    assert result["write_telemetry"]["tables"]["publication_scope_status"]["commits"] == 1
     assert published_evidence(root).publication_id == evidence.publication_id
     snapshot = Snapshot.open(root, require_gold_contract=True)
     assert snapshot.rows("productions") == []

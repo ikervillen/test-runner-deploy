@@ -33,6 +33,12 @@ from .common import (
     within,
 )
 from .schemas import KEYS, SCHEMAS, check_row, make_table, partition_columns, schema_id
+from .write_telemetry import (
+    allocated_bytes,
+    commit_metrics,
+    legacy_scope_metrics,
+    publication_metrics,
+)
 
 MANIFEST_SCHEMA = "quality-publication-v1"
 POINTER_SCHEMA = "quality-pointer-v1"
@@ -437,12 +443,14 @@ def chunk_delete_predicate(
 _SCOPE_MERGE_MAX_KEYS = 128
 
 
-def _changed_scope_keys(table, rows, *, complete):
+def _changed_scope_keys(table, rows, *, complete, telemetry=None):
     """Return a bounded set of upserts, or None when the existing writer is needed."""
     remaining = {}
     for row in rows:
         remaining[row["scope_id"]] = canonical(row)
     changed = set()
+    if telemetry is not None:
+        telemetry.update(rows_compared_unchanged=0, comparison_outcome="eligible")
     if not remaining and not complete:
         return changed
     scanner = table.to_pyarrow_dataset().scanner(use_threads=False)
@@ -452,48 +460,37 @@ def _changed_scope_keys(table, rows, *, complete):
             expected = remaining.pop(key, None)
             if expected is None:
                 if complete:
+                    if telemetry is not None:
+                        telemetry["comparison_outcome"] = "withdrawal"
                     return None  # An authoritative snapshot withdraws this key.
             elif expected != canonical(row):
                 changed.add(key)
                 if len(changed) > _SCOPE_MERGE_MAX_KEYS:
+                    if telemetry is not None:
+                        telemetry.update(comparison_outcome="limit", changed_keys_min=len(changed))
                     return None
+            elif telemetry is not None:
+                telemetry["rows_compared_unchanged"] += 1
         if not complete and not remaining:
             break
     if len(changed) + len(remaining) > _SCOPE_MERGE_MAX_KEYS:
+        if telemetry is not None:
+            telemetry.update(
+                comparison_outcome="limit", changed_keys_min=len(changed) + len(remaining)
+            )
         return None
     changed.update(remaining)
+    if telemetry is not None:
+        telemetry.update(
+            changed_keys=len(changed),
+            compared_inserted=len(remaining),
+            compared_updated=len(changed) - len(remaining),
+        )
     if any("'" in key or "\\" in key for key in changed):
+        if telemetry is not None:
+            telemetry["comparison_outcome"] = "unsupported_key"
         return None
     return changed
-
-
-def _scope_write_metrics(target, ref, *, reused):
-    result = {
-        "delta_version": ref["delta_version"],
-        "reused_version": reused,
-        "commits": int(not reused),
-        "added_parquet": 0,
-        "added_bytes": 0,
-        "added_allocated_bytes": 0,
-    }
-    if reused:
-        return result
-    log = target / "_delta_log" / f"{ref['delta_version']:020d}.json"
-    try:
-        with log.open(encoding="utf-8") as stream:
-            for line in stream:
-                add = json.loads(line).get("add")
-                if add is not None:
-                    result["added_parquet"] += 1
-                    result["added_bytes"] += add["size"]
-                    info = (target / add["path"]).stat()
-                    result["added_allocated_bytes"] += (
-                        info.st_blocks * 512 if hasattr(info, "st_blocks") else info.st_size
-                    )
-    except (OSError, ValueError, KeyError):
-        # Incomplete telemetry does not alter the already verified receipt or recovery.
-        return {**result, "added_parquet": None, "added_bytes": None, "added_allocated_bytes": None}
-    return result
 
 
 class Publisher:
@@ -567,6 +564,7 @@ class Publisher:
         """Publish from the spill file, one batch of 1000 rows at a time."""
         from .contracts import CONTRACT_VERSION, CONTRACTS, contract_id, ordered, validate
 
+        began = time.perf_counter()
         validate(rows, complete=set(rows) == set(CONTRACTS))
         scope = commit_scope(replace_ids, hours)
         operation = digest(["gold-v1", snapshot.publication_id, config_id, cutoff, scope])
@@ -662,8 +660,11 @@ class Publisher:
             atomic_json(journal, state)
         self.failpoint("prepared")
         prior_refs = {r["name"]: r for r in previous["tables"]} if previous else {}
-        scope_write = None
+        writes = {}
         for name in names:
+            table_start = time.perf_counter()
+            timings = {}
+            strategy = "recovered"
             target = self.root / "tables" / name
             scoped_hash = digest([hashes[name], scope])
             ref = state["receipts"].get(name)
@@ -694,11 +695,14 @@ class Publisher:
                     and current.version() == prior_refs[name]["delta_version"]
                     and (full_scope_snapshot or delete_predicate in (None, ""))
                 ):
+                    compare_start = time.perf_counter()
                     changed_keys = _changed_scope_keys(
                         current,
                         prepared(name),
                         complete=full_scope_snapshot or delete_predicate == "",
+                        telemetry=timings,
                     )
+                    timings["compare_ms"] = round((time.perf_counter() - compare_start) * 1000, 2)
                 if last.get("gold_operation_id") == operation:
                     if last.get("gold_content_hash") != scoped_hash:
                         raise IntegrityError("Existing commit has different transformation content")
@@ -711,8 +715,10 @@ class Publisher:
                             "Unreferenced existing output requires explicit recovery"
                         )
                     ref = prior_refs[name]
+                    strategy = "reuse"
                 elif changed_keys is not None and not changed_keys:
                     ref = prior_refs[name]
+                    strategy = "reuse"
                 else:
                     properties = CommitProperties(
                         custom_metadata={
@@ -722,6 +728,7 @@ class Publisher:
                         app_transactions=[Transaction(f"gold:{operation}:{name}", 1)],
                     )
                     if current is None:
+                        strategy = "create"
                         write_deltalake(
                             target,
                             _batch_reader(name, prepared(name)),
@@ -735,6 +742,7 @@ class Publisher:
                         and full_scope_snapshot
                         and changed_keys is None
                     ):
+                        strategy = "overwrite"
                         # A full scope snapshot is authoritative. Stream its replacement directly.
                         write_deltalake(
                             target,
@@ -743,6 +751,7 @@ class Publisher:
                             commit_properties=properties,
                         )
                     else:
+                        strategy = "sparse_merge" if changed_keys is not None else "merge"
                         join = " AND ".join(f't."{k}" = s."{k}"' for k in KEYS[name])
                         changed = " OR ".join(
                             f'(t."{k}" IS DISTINCT FROM s."{k}")' for k in SCHEMAS[name].names
@@ -757,6 +766,7 @@ class Publisher:
                             delete_predicate = None
                         from deltalake.exceptions import CommitFailedError
 
+                        merge_start = time.perf_counter()
                         for _attempt in range(8):
                             data = (
                                 sparse_data
@@ -791,6 +801,9 @@ class Publisher:
                                 current = DeltaTable(str(target))
                                 if sparse_data is not None and current.version() != before_version:
                                     raise
+                        timings["merge_wall_ms"] = round(
+                            (time.perf_counter() - merge_start) * 1000, 2
+                        )
                         after = DeltaTable(str(target))
                         if after.version() == before_version:
                             if name not in prior_refs:
@@ -802,14 +815,19 @@ class Publisher:
                     ref = reference(self.root, name, f"tables/{name}", current.version(), operation)
                 state["receipts"][name] = ref
                 atomic_json(journal, state)
-            if name == "publication_scope_status":
-                scope_write = _scope_write_metrics(target, ref, reused=ref == prior_refs.get(name))
+            writes[name] = {
+                **commit_metrics(target, ref, prior_refs.get(name), operation),
+                **timings,
+                "strategy": strategy,
+                "table_ms": round((time.perf_counter() - table_start) * 1000, 2),
+            }
             prior_refs[name] = ref
         state["state"] = "VERIFIED"
         atomic_json(journal, state)
         for ref in prior_refs.values():
             Snapshot(self.root, {"tables": [ref]}).table(ref["name"])
         self.failpoint("verified")
+        evidence = {}
         manifest = promote_cas(
             self.root,
             list(prior_refs.values()),
@@ -831,7 +849,7 @@ class Publisher:
                 }
                 for name in sorted(prior_refs)
             ]
-            + independent_dependencies(self.root, snapshot),
+            + independent_dependencies(self.root, snapshot, telemetry=evidence),
             contract=expected_contract,
         )
         self.failpoint("promoted")
@@ -841,7 +859,18 @@ class Publisher:
             "status": "PUBLISHED",
             "publication_id": manifest["publication_id"],
             "tables": len(prior_refs),
-            **({"publication_scope_status_write": scope_write} if scope_write is not None else {}),
+            "write_telemetry": publication_metrics(
+                writes, evidence, round((time.perf_counter() - began) * 1000, 2)
+            ),
+            **(
+                {
+                    "publication_scope_status_write": legacy_scope_metrics(
+                        writes["publication_scope_status"]
+                    )
+                }
+                if "publication_scope_status" in writes
+                else {}
+            ),
         }
 
     def _publish(
@@ -873,6 +902,7 @@ class Publisher:
                 result_ids,
                 fact_bounds,
             )
+        began = time.perf_counter()
         ordered(rows)
         for name, values in rows.items():
             make_table(name, values)
@@ -965,7 +995,11 @@ class Publisher:
             atomic_json(journal, state)
         self.failpoint("prepared")
         prior_refs = {r["name"]: r for r in previous["tables"]} if previous else {}
+        writes = {}
         for name in ordered(tables):
+            table_start = time.perf_counter()
+            strategy = "recovered"
+            timings = {}
             table = tables[name]
             target = self.root / "tables" / name
             scope = scopes.get(name, {})
@@ -1016,6 +1050,7 @@ class Publisher:
                             "Unreferenced existing output requires explicit recovery"
                         )
                     ref = prior_refs[name]
+                    strategy = "reuse"
                 else:
                     properties = CommitProperties(
                         custom_metadata={
@@ -1025,6 +1060,7 @@ class Publisher:
                         app_transactions=[Transaction(f"gold:{operation}:{name}", 1)],
                     )
                     if current is None:
+                        strategy = "create"
                         write_deltalake(
                             target,
                             table,
@@ -1034,6 +1070,7 @@ class Publisher:
                             commit_properties=properties,
                         )
                     else:
+                        strategy = "merge"
                         join = " AND ".join(f't."{k}" = s."{k}"' for k in KEYS[name])
                         changed = " OR ".join(
                             f'(t."{k}" IS DISTINCT FROM s."{k}")' for k in SCHEMAS[name].names
@@ -1056,7 +1093,11 @@ class Publisher:
                         if delete_scope:
                             for column in scope:
                                 delete_scope = delete_scope.replace(f'"{column}"', f't."{column}"')
+                        merge_start = time.perf_counter()
                         merger.when_not_matched_by_source_delete(predicate=delete_scope).execute()
+                        timings["merge_wall_ms"] = round(
+                            (time.perf_counter() - merge_start) * 1000, 2
+                        )
                         after = DeltaTable(str(target))
                         if after.version() == before_version:
                             if name not in prior_refs:
@@ -1068,12 +1109,19 @@ class Publisher:
                     ref = reference(self.root, name, f"tables/{name}", current.version(), operation)
                 state["receipts"][name] = ref
                 atomic_json(journal, state)
+            writes[name] = {
+                **commit_metrics(target, ref, prior_refs.get(name), operation),
+                **timings,
+                "strategy": strategy,
+                "table_ms": round((time.perf_counter() - table_start) * 1000, 2),
+            }
             prior_refs[name] = ref
         state["state"] = "VERIFIED"
         atomic_json(journal, state)
         for ref in prior_refs.values():
             Snapshot(self.root, {"tables": [ref]}).table(ref["name"])
         self.failpoint("verified")
+        evidence = {}
         manifest = promote_cas(
             self.root,
             list(prior_refs.values()),
@@ -1095,7 +1143,7 @@ class Publisher:
                 }
                 for name in sorted(prior_refs)
             ]
-            + independent_dependencies(self.root, snapshot),
+            + independent_dependencies(self.root, snapshot, telemetry=evidence),
             contract=expected_contract,
         )
         self.failpoint("promoted")
@@ -1105,6 +1153,9 @@ class Publisher:
             "status": "PUBLISHED",
             "publication_id": manifest["publication_id"],
             "tables": len(prior_refs),
+            "write_telemetry": publication_metrics(
+                writes, evidence, round((time.perf_counter() - began) * 1000, 2)
+            ),
         }
 
 
@@ -1145,7 +1196,7 @@ def _validate_scopes(rows, scopes):
             raise IntegrityError("Output row falls outside its declared replacement scope")
 
 
-def independent_dependencies(root, snapshot):
+def independent_dependencies(root, snapshot, *, telemetry=None):
     """A Gold pointer can refer only to evidence already copied and verified locally."""
     if (
         not hasattr(snapshot, "document")
@@ -1157,9 +1208,30 @@ def independent_dependencies(root, snapshot):
 
     target = root / "evidence"
     target.mkdir(parents=True, exist_ok=True)
+    seen = set()
+    if telemetry is not None:
+        telemetry.update(
+            new_links=0, existing_links=0, new_copies=0, existing_copies=0, new_physical_bytes=0
+        )
     for ref in snapshot.document["tables"]:
         for item in evidence_files(ref):
-            publish_reference(snapshot.root, target, item)
+            uri = item["uri"]
+            kind = publish_reference(snapshot.root, target, item)
+            if telemetry is None or uri in seen:
+                continue
+            seen.add(uri)
+            if kind.endswith("_link"):
+                telemetry[f"{kind}s"] += 1
+            else:
+                telemetry[f"{kind.removesuffix('_copy')}_copies"] += 1
+            if kind == "new_copy" and telemetry["new_physical_bytes"] is not None:
+                try:
+                    size = allocated_bytes(target / uri)
+                except OSError:
+                    size = None
+                telemetry["new_physical_bytes"] = (
+                    None if size is None else telemetry["new_physical_bytes"] + size
+                )
     immutable_json(target / f"{snapshot.publication_id}.json", snapshot.document)
     copied = Evidence.open(target, snapshot.publication_id)
     if copied.document["schema_id"] != SCHEMA:

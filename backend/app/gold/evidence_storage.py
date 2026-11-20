@@ -24,20 +24,25 @@ def publish_reference(source, target, ref):
         if not src.samefile(dst):
             checked_file(source, ref)
             checked_file(target, ref)
-        return
+            return "existing_copy"
+        return "existing_link"
     checked_file(source, ref)
     dst.parent.mkdir(parents=True, exist_ok=True)
     sync(dst.parent.parent)
+    kind = "new_link"
     try:
         os.link(src, dst)
     except FileExistsError:
         checked_file(target, ref)
+        kind = "existing_link" if src.samefile(dst) else "existing_copy"
     except OSError as exc:
         # Separate filesystems can still use the existing, self-contained copy protocol.
         if exc.errno not in {errno.EXDEV, errno.ENOTSUP}:
             raise
         publish(dst, src.read_bytes())
+        kind = "new_copy"
     sync(dst.parent)
+    return kind
 
 
 def inventory(root):
