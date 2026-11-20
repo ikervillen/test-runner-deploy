@@ -128,6 +128,34 @@ $compose = Get-Content -LiteralPath $activeFile -Raw | ConvertFrom-Json
 if ($compose.name -cne $project) { throw 'El Compose activo pertenece a otro proyecto.' }
 Write-Output "Compose base: $activeFile"
 $tag = "fenix-independent:sha-$Revision"
+$initializeGold = $false
+$initializer = $null
+if ($LiveFlowOnly) {
+    $present = @(Invoke-Docker volume ls --format '{{.Name}}')
+    $goldName = $compose.volumes.'live-gold'.name
+    if (-not $goldName) { throw 'Falta definir el volumen Gold Live.' }
+    if ($goldName -cnotin $present) {
+        if ($goldName -cne $profile.volumes.live.gold) {
+            throw "No se puede inicializar un volumen Gold Live distinto del perfil: $goldName."
+        }
+        $initializer = $compose.services.initialize
+        $goldMount = @($initializer.volumes | Where-Object {
+            $_.type -eq 'volume' -and $_.source -ceq 'live-gold' -and -not $_.read_only
+        })
+        if ($goldMount.Count -ne 1 -or -not $goldMount[0].target) {
+            throw 'El Compose no define la inicializacion de Gold Live.'
+        }
+        $initializeGold = $true
+    }
+    $historyGold = $compose.volumes.'history-gold'.name
+    if ($historyGold -and $historyGold -cnotin $present) {
+        # Live supports starting without a published historical reference.
+        foreach ($service in $services) {
+            $compose.services.$service.volumes = @($compose.services.$service.volumes |
+                Where-Object { $_.type -ne 'volume' -or $_.source -cne 'history-gold' })
+        }
+    }
+}
 foreach ($service in $services) {
     $definition = $compose.services.$service
     if (-not $definition) { throw "El Compose activo no contiene $service." }
@@ -138,6 +166,7 @@ foreach ($service in $services) {
     if (-not $workers[$service]) {
         if (-not $expected.Count) { throw "El Compose no acredita los volúmenes de $service." }
         foreach ($mount in $namedMounts) {
+            if ($initializeGold -and $mount.source -ceq 'live-gold') { continue }
             $volume = $compose.volumes.($mount.source).name
             if (-not $volume) { throw "Falta definir el volumen $($mount.source)." }
             $labels = ((Invoke-Docker volume inspect $volume --format '{{json .Labels}}') -join '') | ConvertFrom-Json
@@ -205,6 +234,24 @@ $candidate = Join-Path $activeDirectory "compose.$($Revision.Substring(0, 12)).j
 [IO.File]::WriteAllText($candidate, ($compose | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
 Invoke-Docker compose -p $project -f $candidate config --quiet
 if ($LiveFlowOnly) {
+    if ($initializeGold) {
+        $initializer.image = $tag
+        $initializer.command = @('--uid', [string]$profile.uid, '--gid', [string]$profile.gid, $goldMount[0].target)
+        $initializer.volumes = @($goldMount[0])
+        $initialization = @{
+            name = $project
+            services = @{ initialize = $initializer }
+            volumes = @{ 'live-gold' = $compose.volumes.'live-gold' }
+        }
+        $initFile = Join-Path $activeDirectory 'initialize-live-gold.json'
+        [IO.File]::WriteAllText($initFile, ($initialization | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+        try {
+            Write-Output "Inicializando Gold Live desde Silver confirmado: $goldName"
+            Invoke-Docker compose -p $project -f $initFile run --rm --no-deps --pull never initialize
+        } finally {
+            Remove-Item -LiteralPath $initFile -ErrorAction SilentlyContinue
+        }
+    }
     Invoke-Docker compose -p $project -f $candidate --profile history stop `
         --timeout ([int]$site.drain_seconds) ingesta-history gold-history
     foreach ($service in @('ingesta-history', 'gold-history')) {
