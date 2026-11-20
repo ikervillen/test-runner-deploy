@@ -140,7 +140,7 @@ jobs:
       - name: Prepare the approved Gold worker update
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '520d806a54cf71fb867136de0ba52f97413c9072' && github.event.head_commit.message == 'Roll out incremental Gold evidence'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == 'b1dff6f484089a71cc58a7f1853da101ca5353e2' && github.event.head_commit.message == 'Roll out Gold scope updates and telemetry' && github.run_attempt == '1'
         run: |
           set -euo pipefail
           mkdir -p bundle
