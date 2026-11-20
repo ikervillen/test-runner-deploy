@@ -134,10 +134,12 @@ def export(pipelines, lane, config):
             return previous
 
     @cache
-    def control(snapshot, family):
+    def confirmed_control(snapshot, family):
         return snapshot.control(family)
 
-    projections = {family: control(own, family) for family in own.manifest.get("controls", {})}
+    projections = {
+        family: confirmed_control(own, family) for family in own.manifest.get("controls", {})
+    }
     tables, lineages, coverage, rejections = {}, {}, [], {}
     views = {
         "operations": SilverView(**{lane: own}, archive=archive if lane == "history" else None),
@@ -209,7 +211,7 @@ def export(pipelines, lane, config):
         tables[family] = pa.Table.from_pylist(rows, schema=CONTRACTS[family].schema)
         lineages[family] = proofs
         controls = [
-            control(s, family)
+            confirmed_control(s, family)
             for s in snapshots
             if family in s.manifest.get("controls", {}) and (family not in OPERATIONS or s is own)
         ]
@@ -255,24 +257,24 @@ def export(pipelines, lane, config):
                     _apply_live(row, family, origin, control["meta"].get("live_until"))
             coverage.append(portable(row))
     assoc = [
-        control(s, "ASIGNACION_PRODUCCION_RAMAL")
+        confirmed_control(s, "ASIGNACION_PRODUCCION_RAMAL")
         for s in snapshots
         if "ASIGNACION_PRODUCCION_RAMAL" in s.manifest.get("controls", {})
     ]
     published = [p["extra"]["association"] for p in assoc if p["extra"].get("association")]
     accepted_registry = registry(published)
     catalogs = [
-        control(s, "CATALOGO_PRODUCCIONES")["extra"]
+        confirmed_control(s, "CATALOGO_PRODUCCIONES")["extra"]
         for s in snapshots
         if "CATALOGO_PRODUCCIONES" in s.manifest.get("controls", {})
     ]
     composition = {}
     for catalog in catalogs:
         for key, value in catalog.get("composition", {}).items():
-            previous = composition.get(key)
+            prior_production = composition.get(key)
             composition[key] = (
                 {**value, "coverage": "REVIEW"}
-                if previous is not None and previous != value
+                if prior_production is not None and prior_production != value
                 else value
             )
     diagnostics = catalogs[0].get("diagnostics", {}) if catalogs else {}

@@ -33,6 +33,7 @@ def independent(tmp_path, native):
         bronze_root=(tmp_path / "unused-bronze").resolve(),
         silver_root=(tmp_path / "unused-silver").resolve(),
         control_root=(tmp_path / "unused-control").resolve(),
+        timestamp_policy="local_naive_test_v1",
         stable_wait_seconds=0.001,
     )
     template = json.loads(
@@ -77,6 +78,27 @@ def test_evidence_verifies_bytes_and_rejects_unbounded_read(tmp_path, native):
     path.write_bytes(b"corrupt")
     with pytest.raises(IntegrityError, match="bytes"):
         Evidence.open(tmp_path).table("rows", max_rows=2)
+
+
+def test_gold_bridge_accepts_multiple_confirmed_families(independent, native):
+    from ingesta_delta_lake.pipeline_intake import Intake
+    from ingesta_delta_lake.pipeline_runtime import PipelineWorker
+
+    from app.gold.independent_inputs import export
+
+    plan, cfg = independent
+    folder = cfg.sources[0][1]
+    values = ["15/10/2026 12:00:00", 0, 1, 13, 15, 96, 2, 2, *([0] * 9), ""]
+    (folder / "15102026_120000_LISTA_DEFECTOS.csv").write_text(";".join(map(str, values)) + ";\n")
+    worker = PipelineWorker(plan, "live", cfg)
+    worker.prepare()
+    with closing(
+        Intake(worker.source.intake_path, lane="live", identity=worker.identity)
+    ) as intake:
+        worker.cycle(intake, phases=(("LISTA_DEFECTOS",),))
+    result = export(plan, "live", cfg)
+    assert len(result.rows("LISTA_DEFECTOS", max_rows=10)) == 1
+    assert len(result.rows("SIP_MODELO", max_rows=10)) == 1
 
 
 def test_auxiliary_cursor_without_scoring_changes_does_not_export(independent, monkeypatch):
