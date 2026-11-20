@@ -13,24 +13,38 @@ from .common import IntegrityError, digest, read_json
 from .schemas import make_table
 
 
-def categories(mdl: Path, severity: Path) -> dict[str, str | None]:
-    """New Fenix codes: use the NEW code column, never run the legacy normalizer."""
+def _category_choices(path, *, first_row, severity_column):
     choices = defaultdict(set)
-    for path, start, code_column, severity_column in [(mdl, 4, 2, 1), (severity, 3, 2, 10)]:
-        book = load_workbook(path, read_only=True, data_only=True)
-        try:
-            for row in book.worksheets[0].iter_rows(min_row=start, values_only=True):
-                code, category = row[code_column], canonical_severity(row[severity_column])
-                if code is not None and category is not None:
-                    try:
-                        number = int(code)
-                    except (TypeError, ValueError):
-                        continue
-                    choices[str(number)].add(category)
-        finally:
-            book.close()
+    book = load_workbook(path, read_only=True, data_only=True)
+    try:
+        for row in book.worksheets[0].iter_rows(
+            min_row=first_row,
+            max_col=max(3, severity_column + 1),
+            values_only=True,
+        ):
+            code, category = row[2], canonical_severity(row[severity_column])
+            if code is None or isinstance(code, bool) or category is None:
+                continue
+            try:
+                number = int(code)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if isinstance(code, float) and number != code:
+                continue
+            choices[str(number)].add(category)
+    finally:
+        book.close()
+    return choices
+
+
+def categories(mdl: Path, severity: Path) -> dict[str, str | None]:
+    """The new Fenix code is the key. Use MDL first; conflicting MDL rows stay unresolved."""
+    primary = _category_choices(mdl, first_row=4, severity_column=1)
+    fallback = _category_choices(severity, first_row=3, severity_column=10)
     return {
-        code: next(iter(values)) if len(values) == 1 else None for code, values in choices.items()
+        code: next(iter(values)) if len(values) == 1 else None
+        for code in sorted(primary.keys() | fallback.keys())
+        if (values := primary.get(code) or fallback[code])
     }
 
 
