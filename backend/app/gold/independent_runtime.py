@@ -90,9 +90,13 @@ class Worker:
         root = self.pipelines.history.gold / "published"
         cache = self.root / "checkpoint" / "history-reference.json"
         try:
-            self.reference = Snapshot.open(root, require_gold_contract=True)
-            atomic_json(cache, {"publication_id": self.reference.publication_id})
-        except (OSError, ValueError):
+            identity = read_json(root / "current.json")["publication_id"]
+            if self.reference is None or self.reference.publication_id != identity:
+                self.reference = Snapshot.open(
+                    root, publication_id=identity, require_gold_contract=True
+                )
+                atomic_json(cache, {"publication_id": identity})
+        except (OSError, ValueError, KeyError):
             if self.reference is None and cache.exists():
                 with suppress(OSError, ValueError):
                     self.reference = Snapshot.open(
@@ -242,6 +246,7 @@ class Worker:
         result.update(
             silver_publication_id=sources[0] if sources else None,
             spill_directory=str(self.spill_root),
+            silver_read=evidence.document.get("silver_read"),
             export_seconds=round(began_publish - began_export, 3),
             calculation_and_publish_seconds=round(monotonic() - began_publish, 3),
         )

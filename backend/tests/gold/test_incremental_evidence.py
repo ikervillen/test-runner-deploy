@@ -1,0 +1,98 @@
+from datetime import datetime
+from types import SimpleNamespace
+
+import pyarrow as pa
+import pytest
+from deltalake import DeltaTable, write_deltalake
+
+from app.gold.evidence import Evidence, save
+from app.gold.evidence_storage import consolidate, publish_reference
+from app.gold.silver_incremental import FullReadRequired, materialize
+
+
+@pytest.fixture(autouse=True)
+def native():
+    pytest.importorskip("ingesta_delta_lake")
+
+
+def test_fragments_reuse_unchanged_block_and_publish_verified_links(tmp_path):
+    root = tmp_path / "inputs"
+    target = tmp_path / "published" / "evidence"
+    table = pa.table(
+        {
+            "origen_fenix": ["AV21", "AV21"],
+            "FECHA": [datetime(2026, 11, 20, 8), datetime(2026, 11, 20, 8, 10)],
+            "value": [10, 20],
+        }
+    )
+    legacy = save(root, {}, {"CONT_ZC": table})
+    assert legacy.table("CONT_ZC", max_rows=2).equals(table)
+    original = save(root, {}, {"CONT_ZC": table}, window_seconds=600)
+    assert original.table("CONT_ZC", max_rows=2).equals(table)
+    changed = table.set_column(2, "value", pa.array([10, 30]))
+    latest = save(root, {}, {"CONT_ZC": changed}, window_seconds=600, reuse=original)
+    old, new = (item.document["tables"][0]["parts"] for item in (original, latest))
+    assert old[0] == new[0]
+    assert old[1]["hash"] != new[1]["hash"]
+    assert Evidence.open(root).table("CONT_ZC", max_rows=2).equals(changed)
+
+    publish_reference(root, target, new[0])
+    assert (root / new[0]["uri"]).samefile(target / new[0]["uri"])
+    copy = target / old[1]["uri"]
+    initial_bytes = (root / old[1]["uri"]).read_bytes()
+    copy.write_bytes(initial_bytes)
+    assert consolidate(tmp_path)[0] == 1
+    assert not copy.samefile(root / old[1]["uri"])
+    assert consolidate(tmp_path, apply=True)[0] == 1
+    assert copy.samefile(root / old[1]["uri"])
+    assert copy.read_bytes() == initial_bytes
+    assert consolidate(tmp_path) == (0, 0)
+
+
+def test_silver_cdf_applies_correction_and_new_row(tmp_path):
+    from ingesta_delta_lake.contracts import CONTRACTS
+    from ingesta_delta_lake.pipeline_rows import business_key
+
+    family = "LISTA_RECH"
+    schema = CONTRACTS[family].schema
+    first = dict(
+        origen_fenix="AV21",
+        FECHA=datetime(2026, 11, 20, 8),
+        MOLDE=3,
+        LINEA=21,
+        COD_MAQ_ZF=4,
+        INSPECC=100,
+        RECH=6,
+        RECH_AUTO=2,
+        CAVIDAD="1",
+        FECHA_R=None,
+    )
+    later = {**first, "FECHA": datetime(2026, 11, 20, 8, 10)}
+    path = tmp_path / "silver"
+    source = pa.Table.from_pylist([first], schema=schema)
+    write_deltalake(path, source, configuration={"delta.enableChangeDataFeed": "true"})
+    table = DeltaTable(str(path))
+
+    def ref():
+        return {
+            "table_id": table.metadata().id,
+            "version": table.version(),
+            "rejected_hashes": [],
+        }
+
+    previous = save(tmp_path / "evidence", {"silver_refs": {family: ref()}}, {family: source})
+    table.update(updates={"RECH": "7"})
+    write_deltalake(path, pa.Table.from_pylist([later], schema=schema), mode="append")
+    table.update_incremental()
+    snapshot = SimpleNamespace(table=lambda name: table if name == family else None)
+    rows, proofs, scanned = materialize(
+        snapshot, previous, {}, family, ref(), schema.names, budget=10
+    )
+    assert rows == [{**first, "RECH": 7}, later]
+    assert scanned == 3
+    assert proofs[business_key(family, first)][0]["source_version"] == 1
+    assert proofs[business_key(family, later)][0]["source_version"] == 2
+
+    table.delete()
+    with pytest.raises(FullReadRequired):
+        materialize(snapshot, previous, {}, family, ref(), schema.names, budget=10)

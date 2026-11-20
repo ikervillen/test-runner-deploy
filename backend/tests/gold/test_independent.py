@@ -79,6 +79,28 @@ def test_evidence_verifies_bytes_and_rejects_unbounded_read(tmp_path, native):
         Evidence.open(tmp_path).table("rows", max_rows=2)
 
 
+def test_auxiliary_cursor_without_scoring_changes_does_not_export(independent, monkeypatch):
+    from app.gold import independent_inputs
+
+    plan, cfg = independent
+    original = independent_inputs.export(plan, "live", cfg)
+    tables, cursor, version = independent_inputs.auxiliary_turn(plan, "live", encoding=cfg.encoding)
+    monkeypatch.setattr(
+        independent_inputs, "auxiliary_turn", lambda *a, **k: (tables, cursor + 1, version)
+    )
+    assert independent_inputs.export(plan, "live", cfg).publication_id == original.publication_id
+
+    monkeypatch.setattr(
+        independent_inputs,
+        "auxiliary_turn",
+        lambda *a, **k: (tables, cursor + 2, (version[0], cursor + 2)),
+    )
+    updated = independent_inputs.export(plan, "live", cfg)
+    assert updated.publication_id != original.publication_id
+    assert updated.document["silver_read"]["rows"] == 0
+    assert "SIP_MODELO" in updated.document["silver_read"]["reused_catalogues"]
+
+
 def test_registry_never_resolves_same_revision_by_arrival(native):
     from app.gold.common import digest
 
