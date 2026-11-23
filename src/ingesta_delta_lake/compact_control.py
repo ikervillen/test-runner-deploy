@@ -22,6 +22,10 @@ RECEIPT_KEY = "$control_receipt"
 MAX_DOCUMENT = 256 * 1024 * 1024
 
 
+class PreparedArtifactTooLarge(IntegrityError):
+    """The same preparation cannot fit within the recovery budget."""
+
+
 def inspection_payload(group):
     """The current index needs only the accepted base to restore a released hold."""
     return canonical({"accepted_inspection_values": group["accepted_inspection_values"]})
@@ -50,7 +54,7 @@ def publish(root, document):
                     data = token.encode("utf-8")
                     size += len(data)
                     if size > MAX_DOCUMENT:
-                        raise IntegrityError("Prepared artifact exceeds recovery budget")
+                        raise PreparedArtifactTooLarge("Prepared artifact exceeds recovery budget")
                     fingerprint.update(data)
                     encoded.write(data)
             raw.flush()

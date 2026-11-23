@@ -314,12 +314,18 @@ class DefectsControl(Control):
                 ],
             )
 
-    def confirm(self, batch_id, version):
+    def confirm(self, batch_id, version, *, confirmed_rows=None):
         from .compact_control import inspection_payload
 
         with self.db:
             batch = self.batch(batch_id)
             prepared = self.prepared(batch)
+            if prepared.get("inspection_groups_from_confirmed_rows"):
+                if self.model.CONTRACT != "lista_rech_v1" or confirmed_rows is None:
+                    raise IntegrityError("LISTA_RECH confirmation requires verified scoped rows")
+                prepared["inspection_groups"] = self.model.groups_from_holds(
+                    confirmed_rows, prepared["inspection_holds"]
+                )
             self.db.execute(
                 "UPDATE batches SET state=?,confirmed_at=?,delta_version=? WHERE batch_id=?",
                 (prepared["outcome_state"], now(), version, batch_id),

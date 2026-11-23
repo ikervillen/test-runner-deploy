@@ -1,29 +1,38 @@
 """Bound MIA reads by complete origin/time contexts, retaining append evidence."""
 
+from collections import defaultdict
 from datetime import datetime
 
 import pyarrow as pa
 import pyarrow.dataset as ds
+from deltalake import DeltaTable
 
 from .common import IntegrityError, digest
 
 
-def scope_for(parsed, model):
+def scope_for(parsed, model, *, exact_periods=False):
     bounds, groups = {}, set()
+    periods = defaultdict(set)
     for entry in parsed.entries:
         row = {"origen_fenix": entry[0], **dict(zip(model.FIELDS, entry[1:], strict=True))}
         origin, stamp = row["origen_fenix"], row["FECHA"]
         start, end = bounds.get(origin, (stamp, stamp))
         bounds[origin] = min(start, stamp), max(end, stamp)
         groups.add(digest(model.group(row)))
-    return {
+        if exact_periods:
+            periods[origin].add(stamp)
+    scope = {
         "ranges": [[origin, *bounds[origin]] for origin in sorted(bounds)],
         "groups": sorted(groups),
     }
+    if exact_periods:
+        scope["periods"] = {origin: sorted(stamps) for origin, stamps in periods.items()}
+    return scope
 
 
 def expression(scope):
     ranges = scope["ranges"] if isinstance(scope, dict) else scope
+    periods = scope.get("periods") if isinstance(scope, dict) else None
     result = ds.scalar(False)
     seen = set()
     for origin, start, end in ranges:
@@ -33,11 +42,18 @@ def expression(scope):
         first, last = datetime.fromisoformat(start), datetime.fromisoformat(end)
         if first.tzinfo or last.tzinfo or first.microsecond or last.microsecond or first > last:
             raise IntegrityError("Invalid MIA read scope timestamps")
-        result |= (
-            (ds.field("origen_fenix").cast(pa.string()) == origin)
-            & (ds.field("FECHA") >= first)
-            & (ds.field("FECHA") <= last)
-        )
+        date = ds.field("FECHA")
+        in_range = (date >= first) & (date <= last)
+        if periods is not None:
+            stamps = [datetime.fromisoformat(value) for value in periods.get(origin, [])]
+            if not stamps or any(
+                stamp.tzinfo or stamp.microsecond or not first <= stamp <= last for stamp in stamps
+            ):
+                raise IntegrityError("Invalid exact MIA read periods")
+            in_range &= date.isin(pa.array(stamps, type=pa.timestamp("us")))
+        result |= (ds.field("origen_fenix").cast(pa.string()) == origin) & in_range
+    if periods is not None and set(periods) != seen:
+        raise IntegrityError("Exact MIA read periods differ from their declared origins")
     return result
 
 
@@ -59,7 +75,20 @@ def files(table):
 
 
 def verify_files(table, prepared, *, after):
-    actual, before = files(table), prepared["before_files"]
+    actual = files(table)
+    if "before_files_hash" in prepared:
+        base_version = prepared["before_version"]
+        before = actual
+        if after:
+            before = (
+                files(DeltaTable(table.table_uri, version=base_version))
+                if base_version is not None
+                else []
+            )
+        if digest(before) != prepared["before_files_hash"]:
+            raise IntegrityError("MIA snapshot file manifest changed")
+    else:
+        before = prepared["before_files"]
     if not after:
         if actual != before:
             raise IntegrityError("MIA snapshot file manifest changed")
