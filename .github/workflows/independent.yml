@@ -140,7 +140,7 @@ jobs:
       - name: Prepare the approved Live flow update
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == 'd38aa5cff916146378bfbd4e840f845000277c96' && github.event.head_commit.message == 'Deploy Silver Live production continuity' && github.run_attempt == '1'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == 'eaacf150213e4f6324fb759f15a0b2ca17fb009a' && github.event.head_commit.message == 'Deploy bounded Silver Live assignments and current ZC' && github.run_attempt == '1'
         run: |
           set -euo pipefail
           mkdir -p bundle
