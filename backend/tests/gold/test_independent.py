@@ -717,6 +717,14 @@ def test_gold_live_publishes_first_mia_reference_and_score_in_delta(tmp_path, na
     result = run(evidence.root, output, confirmed_input=evidence, **options)
     assert result["status"] == "PUBLISHED"
     assert result["write_telemetry"]["validation_ms"] >= 0
+    timings = result["incremental"]["score_timing"]
+    assert result["incremental"]["stage_seconds"]["reference_samples"] >= 0
+    assert timings["productions"] > 0
+    assert timings["worker_calls"]["sqlite_load"] == timings["productions"]
+    for stage in ("mia_bases", "ar_bases", "zc_bases", "calculate"):
+        assert timings["worker_calls"][stage] > 0
+        assert timings["worker_seconds"][stage] >= 0
+    assert timings["slow_productions"][0]["windows"][0]["cutoff"] == target.isoformat()
     published = Snapshot.open(output, require_gold_contract=True)
     samples = {
         r["reference_id"]
