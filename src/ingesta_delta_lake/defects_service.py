@@ -21,6 +21,7 @@ from .common import (
     slot_stamp,
     split_live_backlog,
 )
+from .compact_control import PreparedArtifactTooLarge
 from .defects_storage import DefectsStore
 from .mia_scope import files, group_holds, scope_for
 from .service import _apply
@@ -28,6 +29,7 @@ from .sources import available_captures, discover, input_scan, orphan_captures, 
 
 MAX_FILE_BYTES = 8 * 1024 * 1024
 POLICY = "bounded-context-v2"
+OVERSIZED_RECH = "lista_rech_oversized_preparation_v1"
 
 
 def slot_commits(snapshots):
@@ -271,11 +273,32 @@ def process_batch(
     from .reviews import process as process_reviews
 
     process_reviews(config, control)
+    bounded_rech = control.compact and config.family == "LISTA_RECH"
+    inputs = sorted({(s.origin, s.sha256) for s in snapshots})
+
+    def recovery_fingerprint(cases):
+        return digest(
+            [
+                __version__,
+                config.encoding,
+                config.timestamp_policy,
+                config.archive_context,
+                control.setting("last_version"),
+                inputs,
+                cases,
+            ]
+        )
+
+    blocked = control.setting(OVERSIZED_RECH) if bounded_rech else None
+    if blocked and blocked == recovery_fingerprint(control.cases()):
+        raise PreparedArtifactTooLarge(
+            "Prepared artifact exceeds recovery budget (unchanged input)"
+        )
     parsed = model.parse(snapshots, config.encoding)
     from .review_adapters import filter_rejected
 
     filter_rejected(control, parsed)
-    scope = scope_for(parsed, model)
+    scope = scope_for(parsed, model, exact_periods=bounded_rech)
     store.set_scope(scope)
     before_files = files(store.table())
     from .pipeline_retired import logical_rows
@@ -301,7 +324,7 @@ def process_batch(
             config.encoding,
             config.timestamp_policy,
             version,
-            sorted({(s.origin, s.sha256) for s in snapshots}),
+            inputs,
             digest(control.cases()),
         ]
     )
@@ -320,8 +343,10 @@ def process_batch(
     }
     control.rejected(batch_id, {}, issues, config.plant, create_batch=False)
     cases = control.cases()
-    groups = model.inspection_groups(merged, cases)
-    complete = not cases and all(g["status"] == "RESOLVED" for g in groups)
+    groups = None if bounded_rech else model.inspection_groups(merged, cases)
+    # LISTA_RECH admits at most one accepted row per signature. Pending groups
+    # come from open cases, and the confirmed scoped read enforces uniqueness.
+    complete = not cases and (groups is None or all(g["status"] == "RESOLVED" for g in groups))
     prepared = {
         "contract": model.CONTRACT,
         "transformer_version": __version__,
@@ -333,18 +358,31 @@ def process_batch(
         "inserts": inserts,
         "outcome_state": "COMPLETED" if complete else "PARTIAL",
         "stats": stats,
-        "inspection_groups": groups,
         "read_scope": scope,
-        "before_files": before_files,
         "inspection_holds": group_holds(cases),
     }
+    if bounded_rech:
+        prepared["before_files_hash"] = digest(before_files)
+        prepared["inspection_groups_from_confirmed_rows"] = True
+    else:
+        prepared.update(before_files=before_files, inspection_groups=groups)
     prior = control.batch(batch_id)
     wrote = False
     scoped_rows = len(merged)
     blank_marks = dict(getattr(parsed, "observed", {}))
     del existing, merged, parsed
     if prior is None:
-        control.prepare(batch_id, digest([batch_id, operation_kind]), prepared)
+        try:
+            control.prepare(batch_id, digest([batch_id, operation_kind]), prepared)
+        except PreparedArtifactTooLarge:
+            if bounded_rech:
+                with control.db:
+                    control.db.execute(
+                        "INSERT INTO settings VALUES(?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (OVERSIZED_RECH, recovery_fingerprint(cases)),
+                    )
+            raise
         version, wrote = _apply(config, control, store, control.batch(batch_id))
     elif inserts:
         raise IntegrityError(f"Un lote {config.family} confirmado exige nuevas inserciones")
