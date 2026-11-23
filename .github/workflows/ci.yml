@@ -23,10 +23,10 @@ jobs:
         with:
           version: "0.11.6"
       - run: uv sync --locked --dev --extra gold --python 3.12
-      - run: uv run ruff check backend orchestration
-      - run: uv run ruff format --check backend orchestration
+      - run: uv run --locked --python 3.12 --extra gold ruff check backend orchestration
+      - run: uv run --locked --python 3.12 --extra gold ruff format --check backend orchestration
       # Scope and strictness live in [tool.mypy] (pyproject.toml); no path overrides here.
-      - run: uv run mypy
+      - run: uv run --locked --python 3.12 --extra gold mypy
       - run: >
           uv run --locked --python 3.12 --extra gold --with-editable ./.fenix-contracts
           pytest backend/tests -q --junitxml=test-results.xml --cov-report=xml
