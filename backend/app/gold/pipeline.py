@@ -137,6 +137,7 @@ class _Stopwatch:
 
     def __init__(self):
         self.stages: dict[str, float] = {}
+        self.calls: dict[str, int] = {}
 
     @contextmanager
     def stage(self, name: str):
@@ -144,7 +145,9 @@ class _Stopwatch:
         try:
             yield
         finally:
-            self.stages[name] = round(self.stages.get(name, 0.0) + perf_counter() - started, 6)
+            elapsed = perf_counter() - started
+            self.stages[name] = round(self.stages.get(name, 0.0) + elapsed, 6)
+            self.calls[name] = self.calls.get(name, 0) + 1
 
 
 class _SourceReader:
@@ -407,25 +410,27 @@ def _score_workers() -> int:
     return count
 
 
-def _prepared_for(store, production, capacities, by_zc, previous_states, old_tables):
+def _prepared_for(store, production, capacities, by_zc, previous_states, old_tables, *, clock=None):
     """One production's rows. The caller drops this object before loading the next."""
     identity = production["id_produccion"]
-    rows = {
-        "mia_rejections": store.load("mia_rejections", identity),
-        "mia_inspections": store.load("mia_inspections", identity),
-        "ar_intervals": store.load("ar_intervals", identity),
-        "zc_observations": store.load("zc_for_production", identity),
-    }
+    with clock.stage("sqlite_load") if clock else nullcontext():
+        rows = {
+            "mia_rejections": store.load("mia_rejections", identity),
+            "mia_inspections": store.load("mia_inspections", identity),
+            "ar_intervals": store.load("ar_intervals", identity),
+            "zc_observations": store.load("zc_for_production", identity),
+        }
     own_capacities = [r for r in capacities if r["id_produccion"] == identity]
     state = previous_states.get(identity)
-    prepared = Prepared(
-        [production],
-        rows,
-        own_capacities,
-        {identity: set(by_zc.get(identity, ()))},
-        {identity: state} if state else {},
-        old_tables,
-    )
+    with clock.stage("prepare") if clock else nullcontext():
+        prepared = Prepared(
+            [production],
+            rows,
+            own_capacities,
+            {identity: set(by_zc.get(identity, ()))},
+            {identity: state} if state else {},
+            old_tables,
+        )
     return prepared, rows
 
 
@@ -439,7 +444,10 @@ class _CoverageView:
 
 def _score_job(payload: dict) -> dict:
     """Score one production from its spilled rows and return only that production's output."""
-    store = FactStore(Path(payload["spill"]))
+    clock = _Stopwatch()
+    windows_timing: list[dict] = []
+    with clock.stage("sqlite_open"):
+        store = FactStore(Path(payload["spill"]))
     try:
         prepared, fact_rows = _prepared_for(
             store,
@@ -448,6 +456,7 @@ def _score_job(payload: dict) -> dict:
             payload["by_zc"],
             payload["previous_states"],
             payload["old_tables"],
+            clock=clock,
         )
     finally:
         store.close()
@@ -460,15 +469,16 @@ def _score_job(payload: dict) -> dict:
         and payload["previous_states"].get(identity, {}).get("raw_inputs_hash") == raw_hash
         and identity not in payload["recalculate_closed_ids"]
     )
-    ref = payload.get("mia_reference") or references.build(
-        production,
-        payload["productions"],
-        payload["segments"],
-        payload["rates"],
-        input_version=payload["publication_id"],
-        catalog_version=payload["catalog_version"],
-        minimum=payload["minimum_samples"],
-    )
+    with clock.stage("reference"):
+        ref = payload.get("mia_reference") or references.build(
+            production,
+            payload["productions"],
+            payload["segments"],
+            payload["rates"],
+            input_version=payload["publication_id"],
+            catalog_version=payload["catalog_version"],
+            minimum=payload["minimum_samples"],
+        )
     scope_row, production_cutoff = coverage.production_scope(
         production,
         payload["coverage"],
@@ -506,6 +516,8 @@ def _score_job(payload: dict) -> dict:
                 last_discovery=payload["last_discovery"],
                 windows=payload.get("windows"),
                 live_mia="mia_reference" in payload,
+                production_clock=clock,
+                windows_timing=windows_timing,
             )
         )
         produced = {
@@ -526,6 +538,7 @@ def _score_job(payload: dict) -> dict:
         "reused": prepared.stats["mia_windows_reused"],
         "recalculated": prepared.stats["mia_windows_recalculated"],
         "unchanged": identity in prepared.unchanged,
+        "timing": {"seconds": clock.stages, "calls": clock.calls, "windows": windows_timing},
     }
 
 
@@ -589,6 +602,8 @@ def _score_production(
     last_discovery,
     windows=None,
     live_mia=False,
+    production_clock,
+    windows_timing,
 ):
     """Window bases and scores for one production; returns its scope status rows."""
     scope_rows = []
@@ -597,28 +612,33 @@ def _score_production(
         pending.append(context.issue("quality_scores", "NO_OPERATIVE_WINDOW", p["id_produccion"]))
     segment = segments.get(p["codigo_modelo_botella"], {})
     for w in windows:
-        m = prepared.mia(w)
+        clock = _Stopwatch()
+        with clock.stage("mia_bases"):
+            m = prepared.mia(w)
         tables.setdefault("inspection_bases", []).extend(m["inspection_bases"])
         tables.setdefault("mia_window_exposures", []).append(m["exposure"])
         tables.setdefault("mia_window_bases", []).extend(m["amounts"])
         ar_pending_reason = "ASSIGNED_CAPACITY_PENDING"
         try:
-            a = ar_bases(tables["ar_intervals"], capacities, w)
+            with clock.stage("ar_bases"):
+                a = ar_bases(tables["ar_intervals"], capacities, w)
         except PendingBasis as exc:
             a = None
             ar_pending_reason = exc.code
         if a:
             tables.setdefault("ar_window_exposures", []).append(a["exposure"])
             tables.setdefault("ar_window_bases", []).extend(a["amounts"])
-        z = zc_bases(tables["zc_observations"], w, by_zc[p["id_produccion"]])
+        with clock.stage("zc_bases"):
+            z = zc_bases(tables["zc_observations"], w, by_zc[p["id_produccion"]])
         tables.setdefault("zc_window_bases", []).extend(z)
-        ready = _coverage_ready(
-            snapshot,
-            p,
-            w,
-            pending,
-            LIVE_FAMILIES - MIA_FAMILIES if live_mia else None,
-        )
+        with clock.stage("coverage"):
+            ready = _coverage_ready(
+                snapshot,
+                p,
+                w,
+                pending,
+                LIVE_FAMILIES - MIA_FAMILIES if live_mia else None,
+            )
         if (
             not live_mia
             and preserve_closed
@@ -626,35 +646,53 @@ def _score_production(
             and ready
             and all(previous_scores[w.identity][k] == v for k, v in w.key.items())
         ):
-            result = _preserved_result(w, previous_scores, old_tables)
+            with clock.stage("preserved_result"):
+                result = _preserved_result(w, previous_scores, old_tables)
         else:
-            result = calculate(
-                w,
-                mia=m,
-                ar=a,
-                zc=z,
-                reference=ref,
-                config=config,
-                config_id=config_id,
-                profile_confirmed=segment.get("estado_correspondencia") == "CONFIRMED"
-                and segment.get("estado_dar") != "PENDING",
-                configuration_status="PROVISIONAL_DAR"
-                if segment.get("estado_dar") == "PROVISIONAL"
-                else "CONFIRMED",
-                coverage_ready=ready,
-                calculation_time=calculation_time,
-                line=p["linea"],
-                ar_pending_reason=ar_pending_reason,
-                live_mia=live_mia,
-                mia_coverage_ready=not live_mia
-                or _coverage_ready(
+            with clock.stage("mia_coverage"):
+                mia_ready = not live_mia or _coverage_ready(
                     snapshot,
                     p,
                     w,
                     pending,
                     MIA_FAMILIES,
-                ),
+                )
+            with clock.stage("calculate"):
+                result = calculate(
+                    w,
+                    mia=m,
+                    ar=a,
+                    zc=z,
+                    reference=ref,
+                    config=config,
+                    config_id=config_id,
+                    profile_confirmed=segment.get("estado_correspondencia") == "CONFIRMED"
+                    and segment.get("estado_dar") != "PENDING",
+                    configuration_status="PROVISIONAL_DAR"
+                    if segment.get("estado_dar") == "PROVISIONAL"
+                    else "CONFIRMED",
+                    coverage_ready=ready,
+                    calculation_time=calculation_time,
+                    line=p["linea"],
+                    ar_pending_reason=ar_pending_reason,
+                    live_mia=live_mia,
+                    mia_coverage_ready=mia_ready,
+                )
+        for name, seconds in clock.stages.items():
+            production_clock.stages[name] = round(
+                production_clock.stages.get(name, 0.0) + seconds, 6
             )
+            production_clock.calls[name] = production_clock.calls.get(name, 0) + clock.calls[name]
+        windows_timing.append(
+            {
+                "start": w.start.isoformat(),
+                "cutoff": w.cutoff.isoformat(),
+                "seconds": clock.stages,
+                "total_seconds": sum(clock.stages.values()),
+            }
+        )
+        windows_timing.sort(key=lambda row: row["total_seconds"], reverse=True)
+        del windows_timing[8:]
         for name, rows in result.tables.items():
             tables.setdefault(name, []).extend(rows)
         scope_rows.append(
@@ -750,36 +788,29 @@ def _store_row(store: FactStore, name: str, production_id, row: dict) -> None:
     store.add(name, str(production_id or ""), str(key[0]), row, key=key)
 
 
-def _history(previous, production_id: str, max_rows: int):
+def _history(previous, production_id: str, max_rows: int, *, clock=None):
     """Previous rows for one production. A later pass never reloads the whole publication."""
     if previous is None:
         return {}, {}, {}
     import pyarrow.dataset as ds
 
     available = {r["name"] for r in previous.manifest["tables"]}
+
+    def load(name, expression):
+        with clock.stage(name) if clock else nullcontext():
+            return previous.rows(name, expression=expression, max_rows=max_rows)
+
     old = {}
     for name in REUSED_TABLES:
         if name not in available or "id_produccion" not in SCHEMAS[name].names:
             continue
-        old[name] = previous.rows(
-            name,
-            expression=ds.field("id_produccion") == production_id,
-            max_rows=max_rows,
-        )
+        old[name] = load(name, ds.field("id_produccion") == production_id)
     scores = {r["id_resultado"]: r for r in old.get("quality_scores", [])}
     result_ids = list(scores)
     for name in SCORE_TABLES:
         if name in old or name not in available:
             continue
-        old[name] = (
-            previous.rows(
-                name,
-                expression=ds.field("id_resultado").isin(result_ids),
-                max_rows=max_rows,
-            )
-            if result_ids
-            else []
-        )
+        old[name] = load(name, ds.field("id_resultado").isin(result_ids)) if result_ids else []
     states = {r["id_produccion"]: r for r in old.get("production_calculation_state", [])}
     return old, states, scores
 
@@ -1281,25 +1312,34 @@ def build(
                 minimum = int(config["mia"]["historical_scope"]["min_samples"])
                 previous_sets = _reference_rows(previous, "mia_reference_sets", max_total_rows)
                 if mia_reference_mode == "live":
-                    historical = mia_statistics.historical_index(
-                        _reference_rows(reference_snapshot, "mia_reference_sets", max_total_rows),
-                        _reference_rows(reference_snapshot, "mia_reference_values", max_total_rows),
-                        minimum=minimum,
-                    )
-                    samples = _live_mia_samples(snapshot, store, selected, score_windows, pending)
-                    published_refs, effective = mia_statistics.live_statistics(
-                        samples,
-                        cutoff,
-                        previous_sets=previous_sets,
-                        previous_values=_reference_rows(
-                            previous,
-                            "mia_reference_values",
-                            max_total_rows,
-                        ),
-                        historical=historical,
-                        segments=segments,
-                        catalog=catalog_version,
-                    )
+                    with clock.stage("reference_history"):
+                        historical = mia_statistics.historical_index(
+                            _reference_rows(
+                                reference_snapshot, "mia_reference_sets", max_total_rows
+                            ),
+                            _reference_rows(
+                                reference_snapshot, "mia_reference_values", max_total_rows
+                            ),
+                            minimum=minimum,
+                        )
+                    with clock.stage("reference_samples"):
+                        samples = _live_mia_samples(
+                            snapshot, store, selected, score_windows, pending
+                        )
+                    with clock.stage("reference_statistics"):
+                        published_refs, effective = mia_statistics.live_statistics(
+                            samples,
+                            cutoff,
+                            previous_sets=previous_sets,
+                            previous_values=_reference_rows(
+                                previous,
+                                "mia_reference_values",
+                                max_total_rows,
+                            ),
+                            historical=historical,
+                            segments=segments,
+                            catalog=catalog_version,
+                        )
                 else:
                     published_refs = mia_statistics.historical_statistics(
                         prods,
@@ -1352,8 +1392,36 @@ def build(
                 )
             return payload
 
+        history_clock = _Stopwatch()
+        history_timing: dict[str, float] = {}
+        slow_productions: list[dict] = []
+        score_work: dict[str, float] = defaultdict(float)
+        score_calls: dict[str, int] = defaultdict(int)
+
+        def read_score_history(production):
+            started = perf_counter()
+            identity = production["id_produccion"]
+            result = _history(previous, identity, max_total_rows, clock=history_clock)
+            history_timing[identity] = round(perf_counter() - started, 6)
+            return result
+
         def absorb(result):
             identity = result["state"]["id_produccion"]
+            timing = result["timing"]
+            for name, seconds in timing["seconds"].items():
+                score_work[name] += seconds
+                score_calls[name] += timing["calls"][name]
+            history_seconds = history_timing.pop(identity)
+            slow_productions.append(
+                {
+                    "production": identity,
+                    "history_seconds": history_seconds,
+                    "total_seconds": history_seconds + sum(timing["seconds"].values()),
+                    **timing,
+                }
+            )
+            slow_productions.sort(key=lambda row: row["total_seconds"], reverse=True)
+            del slow_productions[16:]
             tables.setdefault("production_calculation_state", []).append(result["state"])
             for key, name in zip(("sets", "members", "values"), REFERENCE_TABLES, strict=True):
                 for row in result["reference"][key]:
@@ -1372,9 +1440,7 @@ def build(
             if workers == 1 or len(selected) < 2:
                 score_stats["score_workers"] = 1
                 for production in selected:
-                    old_tables, previous_states, previous_scores = _history(
-                        previous, production["id_produccion"], max_total_rows
-                    )
+                    old_tables, previous_states, previous_scores = read_score_history(production)
                     absorb(
                         _score_job(
                             payload_for(production, old_tables, previous_states, previous_scores)
@@ -1384,9 +1450,7 @@ def build(
             else:
                 payloads = []
                 for production in selected:
-                    old_tables, previous_states, previous_scores = _history(
-                        previous, production["id_produccion"], max_total_rows
-                    )
+                    old_tables, previous_states, previous_scores = read_score_history(production)
                     payloads.append(
                         payload_for(production, old_tables, previous_states, previous_scores)
                     )
@@ -1396,6 +1460,14 @@ def build(
                 ) as pool:
                     for result in pool.map(_score_job, payloads, chunksize=1):
                         absorb(result)
+        score_stats["score_timing"] = {
+            "productions": len(selected),
+            "worker_seconds": {name: round(value, 6) for name, value in score_work.items()},
+            "worker_calls": dict(score_calls),
+            "history_table_seconds": history_clock.stages,
+            "history_table_calls": history_clock.calls,
+            "slow_productions": slow_productions,
+        }
         store.dedupe()
         scope_rows.extend(_pending_scope_rows(pending, snapshot, last_discovery))
         score_chunks = [chunk for chunk in hour_plan or [] if not chunk.facts_only]
