@@ -231,12 +231,18 @@ class PipelineWorker:
         selected_window = (
             intake.lots.pending_window(ids, self.policy) if self.lane == "live" else None
         )
+        if family == "CONT_ZC" and self.lane == "live" and window:
+            current_ids = intake.pending(
+                family, self.policy.live_batch_files, window=window, include_untimed=False
+            )
+            if current_ids:
+                selected_window = window
         if selected_window:
             ids = intake.pending(
                 family,
                 self.policy.live_batch_files,
                 window=selected_window,
-                include_untimed=family not in {"LISTA_DEFECTOS", "LISTA_RECH"},
+                include_untimed=family not in {"LISTA_DEFECTOS", "LISTA_RECH", "CONT_ZC"},
             )
         bounds = (
             (selected_window.start.isoformat(), selected_window.end.isoformat())
@@ -324,6 +330,7 @@ class PipelineWorker:
             or (self.lane == "live" and family == "ASIGNACION_PRODUCCION_RAMAL")
         ) and not result.get("remaining_versions", 0):
             try:
+                publish_at = time.monotonic()
                 manifest = publish_family(
                     cfg,
                     self.storage,
@@ -332,6 +339,10 @@ class PipelineWorker:
                     family=family,
                     captured_ids=ids,
                 )
+                if family == "CONT_ZC":
+                    result.setdefault("timing_zc", {})["silver_publish_seconds"] = round(
+                        time.monotonic() - publish_at, 6
+                    )
                 if result.get("status") == "APPLIED" and (
                     manifest is None or family not in manifest["tables"]
                 ):
@@ -419,6 +430,22 @@ class PipelineWorker:
 
     def transform(self, cfg, executor):
         events = []
+        timing = {}
+        if self.lane == "live" and cfg.family == "CONT_ZC" and cfg.intake_ids:
+            dispatched = datetime.now(UTC)
+            with closing(sqlite3.connect(cfg.intake_path.as_uri() + "?mode=ro", uri=True)) as db:
+                oldest, newest = db.execute(
+                    "SELECT min(captured_at),max(captured_at) FROM inputs "
+                    "WHERE input_id IN (SELECT value FROM json_each(?))",
+                    (canonical(cfg.intake_ids),),
+                ).fetchone()
+            if oldest:
+                timing["oldest_capture_to_dispatch_seconds"] = round(
+                    (dispatched - datetime.fromisoformat(oldest)).total_seconds(), 6
+                )
+                timing["newest_capture_to_dispatch_seconds"] = round(
+                    (dispatched - datetime.fromisoformat(newest)).total_seconds(), 6
+                )
         executor(
             self.source,
             (cfg.family,),
@@ -429,7 +456,12 @@ class PipelineWorker:
             lane="live" if self.lane == "live" else "all",
             configs={cfg.family: cfg},
         )
-        return events[0][1:] if events else ({"status": "FAILED", "error": "No unit result"}, 0)
+        if not events:
+            return {"status": "FAILED", "error": "No unit result"}, 0
+        _, result, seconds = events[0]
+        if timing:
+            result.setdefault("timing_zc", {}).update(timing)
+        return result, seconds
 
     def cycle(self, intake, *, phases=PHASES, executor=run_phase):
         """One-shot operation shares intake and confirmation with the continuous scheduler."""
@@ -552,17 +584,26 @@ class PipelineWorker:
                     if cfg.intake_ids or family in dirty:
                         first_seen = dirty_since.setdefault(family, time.monotonic())
                         overdue = time.monotonic() - first_seen
+                        current_zc = (
+                            self.lane == "live"
+                            and family == "CONT_ZC"
+                            and cfg.intake_ids
+                            and window is not None
+                            and cfg.processing_window
+                            == (window.start.isoformat(), window.end.isoformat())
+                        )
                         ready.append(
                             (
                                 not (self.lane == "history" and cfg.scheduled_lot_attempt),
                                 not (overdue >= self.policy.latency_seconds),
+                                not bool(current_zc),
                                 not bool(cfg.intake_ids),
                                 first_seen,
                                 families.index(family),
                                 cfg,
                             )
                         )
-                for _, _, _, _, _, cfg in sorted(ready):
+                for _, _, _, _, _, _, cfg in sorted(ready):
                     if len(active) >= self.parallel:
                         break
                     if (

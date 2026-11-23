@@ -515,3 +515,165 @@ def test_realtime_waits_for_the_next_slot_and_history_takes_october(config, monk
         ('{"AV21":"2026-11-16T16:10:00"}',)
     ]
     assert len(rows(config)) == 3
+
+
+def test_live_scoped_zc_matches_full_reads_across_cuts_and_recovers_commit(
+    config, tmp_path, monkeypatch
+):
+    from contextlib import closing
+    from datetime import UTC, datetime, timedelta
+    from time import perf_counter
+
+    history = datetime(2026, 11, 19)
+    old_rows = [
+        {
+            "origen_fenix": "AV21",
+            **{
+                field: zc.value(field, token)
+                for field, token in zip(
+                    zc.FIELDS,
+                    line(FECHA=(history + timedelta(minutes=10 * i)).strftime("%d/%m/%Y %H:%M:%S"))
+                    .strip()
+                    .rstrip(";")
+                    .split(";"),
+                    strict=True,
+                )
+            },
+        }
+        for i in range(6000)
+    ]
+    cfgs = {}
+    for mode in ("all", "live"):
+        base = tmp_path / mode
+        base.mkdir()
+        bronze = base / "bronze"
+        bronze.mkdir()
+        cfg = replace(
+            config,
+            change_data_feed=True,
+            control_format=3,
+            silver_root=base / "silver",
+            control_root=base / "control",
+            bronze_root=bronze,
+        )
+        cfg = replace(cfg, processing_window=("2027-01-02T10:00:00", "2027-01-02T10:10:00"))
+        cfg.control_root.mkdir()
+        with closing(ZcControl(cfg)) as control:
+            store = ZcStore(cfg, control.control_id)
+            store.insert(old_rows, "fixture-seed", None)
+            control.db.execute("INSERT INTO settings VALUES ('last_version','0')")
+            control.db.commit()
+        cfgs[mode] = cfg
+
+    for number in range(3):
+        start = datetime(2027, 1, 2, 10, number * 10)
+        end = start + timedelta(minutes=10)
+        results = {}
+        for mode, cfg in cfgs.items():
+            cfg = replace(cfg, processing_window=(start.isoformat(), end.isoformat()))
+            captures = []
+            for index, origin in enumerate(("AV21", "AV22", "AV23", "AV31", "AV32")):
+                path = cfg.bronze_root / f"{origin}-{number}.csv"
+                content = line(MAQ_IS=21 + index, FECHA=end.strftime("%d/%m/%Y %H:%M:%S"))
+                path.write_text(content, encoding="utf-8")
+                captures.append(
+                    Snapshot(
+                        origin,
+                        str(path),
+                        hashlib.sha256(path.read_bytes()).hexdigest(),
+                        str(path),
+                        path.stat().st_size,
+                        number,
+                        datetime.now(UTC).isoformat(),
+                        (start + timedelta(seconds=index)).isoformat(),
+                    )
+                )
+
+            def process(control, attempt, *, cfg=cfg, captures=captures, mode=mode):
+                return zc_service._commit_batch(
+                    cfg,
+                    control,
+                    attempt,
+                    ZcStore(cfg, control.control_id),
+                    captures,
+                    [],
+                    0,
+                    scoped=mode == "live",
+                )
+
+            with closing(ZcControl(cfg)) as control:
+                if number == 1 and mode == "live":
+                    original = ZcStore.insert
+
+                    def lost_ack(self, *args, original=original):
+                        original(self, *args)
+                        raise OSError("lost ack")
+
+                    with monkeypatch.context() as patch:
+                        patch.setattr(ZcStore, "insert", lost_ack)
+                        with pytest.raises(IngestaError, match="lost ack"):
+                            process(control, control.start_attempt())
+                    assert control.pending()
+                    recorded = json.loads(control.setting("observed_until"))
+                    assert all(mark < end.isoformat() for mark in recorded.values())
+                    pending = control.pending()[0]
+                    assert zc_service._apply(
+                        cfg, control, ZcStore(cfg, control.control_id), pending
+                    ) == (2, False)
+                    assert all(
+                        mark == end.isoformat()
+                        for mark in json.loads(control.setting("observed_until")).values()
+                    )
+
+                began = perf_counter()
+                result = process(control, control.start_attempt())
+                results[mode] = (perf_counter() - began, result)
+                version, accepted = ZcStore(cfg, control.control_id).read()
+                assert version == number + 1
+                assert len(accepted) == len(old_rows) + 5 * (number + 1)
+                if mode == "all":
+                    expected = accepted
+                else:
+                    assert accepted == expected
+        print("ZC_AB", number, results["all"][0], results["live"][0])
+
+    # Accept a late correction to an earlier cut without touching another origin.
+    from ingesta_delta_lake.common import digest
+
+    archive = tmp_path / "archive.json"
+    archive_payload = {"schema_id": "fenix-archive-snapshot-v1", "tables": {}, "completed": {}}
+    archive.write_text(json.dumps({**archive_payload, "publication_id": digest(archive_payload)}))
+    cfg = replace(
+        cfgs["live"],
+        pipeline_lane="live",
+        archive_root=tmp_path,
+        archive_manifest=archive,
+        read_max_rows=20,
+    )
+    path = cfg.bronze_root / "late-correction.csv"
+    path.write_text(line(MAQ_IS=22, FECHA="02/01/2027 10:10:00", VEL_A="81.00"), encoding="utf-8")
+    late = Snapshot(
+        "AV22",
+        str(path),
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+        str(path),
+        path.stat().st_size,
+        4,
+        datetime.now(UTC).isoformat(),
+        "2027-01-02T10:00:08",
+    )
+    with closing(ZcControl(cfg)) as control:
+        assert not control.pending()
+        store = ZcStore(cfg, control.control_id)
+        result = zc_service._commit_batch(
+            cfg, control, control.start_attempt(), store, [late], [], 0, scoped=True
+        )
+        assert result["delta_version"] == 4
+        assert store.timings["rows_read"] == 3
+        assert result["yield_summary_scope"] == "affected_minutes"
+        _, corrected = ZcStore(
+            replace(cfg, archive_root=None, archive_manifest=None), control.control_id
+        ).read()
+        key = ("AV22", 22, "2027-01-02T10:10:00")
+        assert corrected.pop(key) != expected.pop(key)
+        assert corrected == expected

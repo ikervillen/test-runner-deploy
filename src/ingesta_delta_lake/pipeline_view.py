@@ -74,7 +74,7 @@ class SilverView:
     def __init__(self, *, live=None, history=None, archive=None):
         self.live, self.history, self.archive = live, history, archive
 
-    def rows(self, family, *, max_rows, batch_size, expression=None):
+    def rows(self, family, *, max_rows, batch_size, expression=None, cdf_predicate=None):
         grouped, scanned = defaultdict(list), 0
         rejected = set()
         for snapshot in (self.live, self.history):
@@ -114,7 +114,7 @@ class SilverView:
                         if h.get("ingesta_maintenance") == "archive-retirement"
                     }
                     for batch in pa.RecordBatchReader.from_stream(
-                        table.load_cdf(start, ref["version"])
+                        table.load_cdf(start, ref["version"], predicate=cdf_predicate)
                     ):
                         # CDF evidence is bounded even when a caller filter excludes all rows.
                         scanned += batch.num_rows

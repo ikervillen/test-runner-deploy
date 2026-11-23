@@ -247,3 +247,35 @@ def test_consumer_validates_source_metadata_without_mounting_fenix(config):
     with pytest.raises(ConfigurationError):
         consumer.validate()
     consumer.validate(require_inputs=False)
+
+
+def test_live_cont_zc_dispatch_groups_every_ready_origin_in_the_current_cut(
+    config, pipeline_config
+):
+    paths = {"AV21": config.input_root / "AV21"}
+    for origin in ("AV22", "AV23"):
+        paths[origin] = config.input_root / origin
+        paths[origin].mkdir()
+    for offset, (origin, directory) in enumerate(paths.items()):
+        (directory / f"23112026_17300{offset}_CONT_ZC.csv").write_text(origin)
+    worker = PipelineWorker(pipeline_config, "live", replace(config, sources=tuple(paths.items())))
+    worker.prepare()
+    with closing(
+        Intake(worker.source.intake_path, lane="live", identity=worker.identity)
+    ) as intake:
+        window, summary = worker.capture(intake)
+        selected = worker.selected_config(intake, "CONT_ZC", window)
+        assert summary["captured"] == len(selected.intake_ids) == 3
+        assert selected.processing_window == ("2026-11-23T17:30:00", "2026-11-23T17:40:00")
+
+        def executor(base, phase, stop, stop_path, on_result, **kwargs):
+            assert kwargs["configs"]["CONT_ZC"].intake_ids == selected.intake_ids
+            on_result("CONT_ZC", {"status": "NO_CHANGE"}, 0.1)
+
+        result, _ = worker.transform(selected, executor)
+        timings = result["timing_zc"]
+        assert (
+            timings["oldest_capture_to_dispatch_seconds"]
+            >= timings["newest_capture_to_dispatch_seconds"]
+            >= 0
+        )

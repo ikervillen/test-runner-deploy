@@ -6,6 +6,7 @@ import sqlite3
 from collections import defaultdict
 from contextlib import closing
 from datetime import datetime
+from time import perf_counter
 
 from . import __version__
 from . import cont_zc as zc
@@ -16,6 +17,7 @@ from .common import (
     digest,
     history_yields,
     horizon_marks,
+    note_observed_time,
     parse_int64,
     shared_bronze_window,
     slot_stamp,
@@ -42,7 +44,14 @@ def process(config, control, attempt, *, lane="all"):
                 "wrote_this_attempt": wrote,
             }
         )
-    version, _existing = store.read()
+    scoped = lane == "live" and config.change_data_feed
+    if scoped:
+        table = store.table()
+        version = table.version() if table is not None else None
+        published = {}
+    else:
+        version, existing = store.read()
+        published = {"published_records": len(existing)}
     if control.setting("last_version") not in (None, str(version)):
         raise IntegrityError("Snapshot CONT_ZC distinto de su control")
     snapshots = capture_inputs(config, control, attempt)
@@ -58,8 +67,14 @@ def process(config, control, attempt, *, lane="all"):
         live, backlog, bronze_now = split_live_backlog(
             pending, bronze or snapshots, window, origins
         )
-    if lane != "history" and not pending:
+
+    def mark_live():
+        started = perf_counter()
         control.set_live_slot(bronze_now)
+        store.timings["coverage_seconds"] += perf_counter() - started
+
+    if lane != "history" and not pending:
+        mark_live()
         if snapshots:
             return {
                 "status": "NO_CHANGE",
@@ -67,13 +82,14 @@ def process(config, control, attempt, *, lane="all"):
                 "source_files": len(snapshots),
                 "inserted_this_attempt": recovered_count,
                 "recovered_operations": recovered,
-                "published_records": len(_existing),
+                **published,
                 "delta_version": version,
                 "committed_captures": [],
                 "remaining_versions": 0,
+                "timing_zc": {k: round(v, 6) for k, v in store.timings.items()},
             }
     if lane != "history" and not live:
-        control.set_live_slot(bronze_now)
+        mark_live()
     if lane == "history" and config.intake_path is None and history_yields():
         return {
             "status": "BACKLOG_PENDING" if backlog else "NO_INPUTS",
@@ -81,7 +97,7 @@ def process(config, control, attempt, *, lane="all"):
             "source_files": len(snapshots),
             "inserted_this_attempt": recovered_count,
             "recovered_operations": recovered,
-            "published_records": len(_existing),
+            **published,
             "delta_version": version,
             "committed_captures": [],
             "remaining_versions": len(backlog),
@@ -109,13 +125,16 @@ def process(config, control, attempt, *, lane="all"):
             parsing,
             recovered if index == 0 else [],
             recovered_count if index == 0 else 0,
+            scoped=scoped,
         )
         inserted += result["inserted_this_attempt"]
         wrote_any = wrote_any or result["status"] == "APPLIED"
         if is_live_batch:
-            control.set_live_slot(bronze_now)
+            mark_live()
         if batch:
             committed.extend(batch)
+    store.timings["coverage_seconds"] += control.coverage_seconds
+    result["timing_zc"] = {k: round(v, 6) for k, v in store.timings.items()}
     result["inserted_this_attempt"] = inserted
     result["committed_captures"] = [(item.origin, item.sha256) for item in committed]
     if lane == "history":
@@ -147,12 +166,24 @@ def _with_stored_slot(batch, bronze):
     return [*batch, *company]
 
 
-def _commit_batch(config, control, attempt, store, snapshots, recovered, recovered_count):
-    version, existing = store.read()
+def _commit_batch(
+    config, control, attempt, store, snapshots, recovered, recovered_count, *, scoped
+):
+    started = perf_counter()
     parsed = zc.parse(snapshots, config.encoding)
     from .review_adapters import filter_rejected
 
     filter_rejected(control, parsed)
+    if scoped:
+        periods = defaultdict(set)
+        for origin, _, stamp, *_ in (*parsed.entries, *parsed.invalid_keys):
+            periods[origin].add(stamp)
+        store.set_scope([[origin, sorted(stamps)] for origin, stamps in sorted(periods.items())])
+    store.timings["prepare_seconds"] += perf_counter() - started
+    started = perf_counter()
+    version, existing = store.read()
+    store.timings["previous_state_seconds"] += perf_counter() - started
+    started = perf_counter()
     inserts, issues, matches = zc.decide(parsed, existing, control.held())
     merged = {**existing, **{zc.key(r): {f: r[f] for f in zc.SCHEMA.names} for r in inserts}}
     batch_id = digest(
@@ -165,6 +196,7 @@ def _commit_batch(config, control, attempt, store, snapshots, recovered, recover
             version,
             sorted({(s.origin, s.sha256) for s in snapshots}),
             digest(control.cases()),
+            *([store.scope] if scoped else []),
         ]
     )
     control.rejected(batch_id, {}, issues, config.plant, create_batch=False)
@@ -195,13 +227,22 @@ def _commit_batch(config, control, attempt, store, snapshots, recovered, recover
         "yield_summary": summary,
         "outcome_state": "COMPLETED" if complete else "PARTIAL",
     }
+    if scoped:
+        marks = dict(parsed.observed)
+        for row in inserts:
+            note_observed_time(marks, row["origen_fenix"], row["FECHA"])
+        prepared.update(read_scope=store.scope, observed_marks=marks)
     prior, wrote = control.batch(batch_id), False
     if prior is None:
         control.prepare(batch_id, digest([batch_id, "cont_zc_insert_v1"]), prepared)
+        store.timings["prepare_seconds"] += perf_counter() - started
         version, wrote = _apply(config, control, store, control.batch(batch_id))
     elif inserts:
         raise IntegrityError("Un lote CONT_ZC confirmado exige nuevas inserciones")
-    control.advance_observed_until(horizon_marks(parsed.observed, inserts, wrote=wrote))
+    if not scoped:
+        started = perf_counter()
+        control.advance_observed_until(horizon_marks(parsed.observed, inserts, wrote=wrote))
+        store.timings["coverage_seconds"] += perf_counter() - started
     return {
         "attempt_id": attempt,
         "batch_id": batch_id,
@@ -219,7 +260,11 @@ def _commit_batch(config, control, attempt, store, snapshots, recovered, recover
         if snapshots
         else "NO_INPUTS",
         "complete": complete,
-        "published_records": len(merged),
+        **(
+            {"scoped_records": len(merged), "yield_summary_scope": "affected_minutes"}
+            if scoped
+            else {"published_records": len(merged)}
+        ),
         "open_reviews": len(cases),
         "recovered_operations": recovered,
         "inserted_this_attempt": recovered_count + (len(inserts) if wrote else 0),

@@ -4,6 +4,7 @@ import json
 import logging
 import sqlite3
 import uuid
+from contextlib import nullcontext
 
 from .common import IntegrityError, canonical, digest, now
 from .config import Config
@@ -150,7 +151,7 @@ class Control:
                 (canonical(current),),
             )
 
-    def _advance_mark(self, key: str, marks: dict) -> None:
+    def _advance_mark(self, key: str, marks: dict, *, transaction=True) -> None:
         if not marks:
             return
         current = json.loads(self.setting(key) or "{}")
@@ -163,7 +164,7 @@ class Control:
                 changed = True
         if not changed:
             return
-        with self.db:
+        with self.db if transaction else nullcontext():
             self.db.execute(
                 f"INSERT INTO settings VALUES('{key}', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

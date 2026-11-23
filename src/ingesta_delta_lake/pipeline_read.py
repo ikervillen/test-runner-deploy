@@ -116,6 +116,7 @@ class AcceptedScanner:
             max_rows=view.store.config.read_max_rows,
             batch_size=self.batch_size,
             expression=self.expression,
+            cdf_predicate=getattr(view.store, "cdf_predicate", None),
         )
         if result.conflicts:
             raise IntegrityError("Accepted archive context has unresolved cross-lane conflicts")

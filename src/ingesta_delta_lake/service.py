@@ -41,25 +41,32 @@ def _apply(
     config: Config, control: Control, store: DeltaStore, batch: dict
 ) -> tuple[int | None, bool]:
     previous_context = store.read_context
+    previous_zc_scope = store.scope if config.family == "CONT_ZC" else None
     try:
         return _apply_pinned(config, control, store, batch)
     finally:
         store.read_context = previous_context
+        if config.family == "CONT_ZC":
+            store.set_scope(previous_zc_scope)
 
 
 def _apply_pinned(config, control, store, batch):
     prepared = control.prepared(batch)
     store.read_context = prepared.get("archive_context")
     scoped = "read_scope" in prepared
-    if scoped:
+    scoped_zc = scoped and config.family == "CONT_ZC"
+    if config.family == "CONT_ZC":
+        store.set_scope(prepared.get("read_scope"))
+    elif scoped:
         if config.family not in {"LISTA_RECH", "LISTA_DEFECTOS"}:
-            raise IntegrityError("Scoped intentions are restricted to MIA sources")
+            raise IntegrityError("Unsupported scoped intention")
         store.set_scope(prepared["read_scope"])
+    scoped_mia = scoped and not scoped_zc
     content_hash = config.contract.content_hash
     operation = batch["operation_id"]
     _check_evidence(config, prepared)
     table = store.table()
-    if scoped:
+    if scoped_mia:
         from .mia_scope import verify_files
     version, rows = store.read(table)
     commits = (
@@ -78,15 +85,17 @@ def _apply_pinned(config, control, store, batch):
             or content_hash(rows) != prepared["after_hash"]
         ):
             raise IntegrityError("No se puede reconciliar el resultado del commit pendiente")
-        if scoped:
+        if scoped_mia:
             verify_files(table, prepared, after=True)
+        elif scoped_zc:
+            store.verify_commit(table, table.version(), prepared)
         control.confirm(batch["batch_id"], version)
         return version, False
     if version != prepared["before_version"] or content_hash(rows) != prepared["before_hash"]:
         raise IntegrityError(
             "Resultado incierto: cambió el destino sin evidencia de esta operación"
         )
-    if scoped:
+    if scoped_mia:
         verify_files(table, prepared, after=False)
     del rows  # Do not retain a second historical snapshot during append/confirmation.
     if not prepared["inserts"] and not prepared.get("updates"):
@@ -115,8 +124,10 @@ def _apply_pinned(config, control, store, batch):
             or not any(h.get("ingesta_operation_id") == operation for h in history)
         ):
             raise IntegrityError("La confirmación Delta no corresponde a la intención preparada")
-        if scoped:
+        if scoped_mia:
             verify_files(table, prepared, after=True)
+        elif scoped_zc:
+            store.verify_commit(table, table.version(), prepared)
         control.confirm(batch["batch_id"], after_version)
         return after_version, True
     except Exception as exc:
