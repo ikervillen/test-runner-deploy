@@ -43,7 +43,7 @@ from .coverage import summary as coverage_summary
 from .evidence import Evidence, operational_expression
 from .fingerprint import source_fingerprint
 from .freshness import source_freshness
-from .incremental import Prepared
+from .incremental import Prepared, window_key
 from .metrics import Window, ar_bases, live_windows, mia_bases, production_windows, zc_bases
 from .publications import CommitConflict, Publisher, Snapshot, commit_scope
 from .schemas import KEYS, SCHEMAS, check_row
@@ -788,7 +788,7 @@ def _store_row(store: FactStore, name: str, production_id, row: dict) -> None:
     store.add(name, str(production_id or ""), str(key[0]), row, key=key)
 
 
-def _history(previous, production_id: str, max_rows: int, *, clock=None):
+def _history(previous, production_id: str, max_rows: int, *, clock=None, prune=False):
     """Previous rows for one production. A later pass never reloads the whole publication."""
     if previous is None:
         return {}, {}, {}
@@ -796,23 +796,117 @@ def _history(previous, production_id: str, max_rows: int, *, clock=None):
 
     available = {r["name"] for r in previous.manifest["tables"]}
 
-    def load(name, expression):
+    def load(name, field, keys):
         with clock.stage(name) if clock else nullcontext():
-            return previous.rows(name, expression=expression, max_rows=max_rows)
+            return previous.rows(
+                name,
+                expression=ds.field(field).isin(keys),
+                max_rows=max_rows,
+                file_pruning_predicate=[(field, "in", keys)] if prune else None,
+            )
 
     old = {}
     for name in REUSED_TABLES:
         if name not in available or "id_produccion" not in SCHEMAS[name].names:
             continue
-        old[name] = load(name, ds.field("id_produccion") == production_id)
+        old[name] = load(name, "id_produccion", [production_id])
     scores = {r["id_resultado"]: r for r in old.get("quality_scores", [])}
     result_ids = list(scores)
     for name in SCORE_TABLES:
         if name in old or name not in available:
             continue
-        old[name] = load(name, ds.field("id_resultado").isin(result_ids)) if result_ids else []
+        old[name] = load(name, "id_resultado", result_ids) if result_ids else []
     states = {r["id_produccion"]: r for r in old.get("production_calculation_state", [])}
     return old, states, scores
+
+
+class _SharedHistoryBudget(Exception):
+    """The selected projections cannot be held within a single cycle's row budget."""
+
+
+def _shared_history(previous, windows, max_rows, *, clock, decoded):
+    """Load only the inputs that the independent Live MIA reuse path consumes."""
+    import pyarrow as pa
+    import pyarrow.dataset as ds
+
+    old: dict[str, dict[str, list[dict]]] = {identity: {} for identity in windows}
+    available = {r["name"] for r in previous.manifest["tables"]}
+    remaining = max_rows
+    batch_size = 8192
+
+    def load(name, field, owners, *, filter_=None, pruning=(), accepts=None):
+        nonlocal remaining
+        if not owners or name not in available:
+            return
+        keys = list(owners)
+        expression = ds.field(field).isin(keys)
+        if filter_ is not None:
+            expression &= filter_
+
+        def note_decode(count):
+            decoded[name] += count
+
+        with clock.stage(name):
+            for batch in previous.batches(
+                name,
+                expression=expression,
+                file_pruning_predicate=[(field, "in", keys), *pruning],
+                batch_size=batch_size,
+                max_rows=max_rows + batch_size,
+                on_decode=note_decode,
+            ):
+                remaining -= batch.num_rows
+                if remaining < 0:
+                    raise _SharedHistoryBudget
+                for row in batch.to_pylist():
+                    if accepts is None or accepts(row):
+                        old[owners[row[field]]].setdefault(name, []).append(row)
+
+    productions = {identity: identity for identity in windows}
+    load("production_calculation_state", "id_produccion", productions)
+    wanted = {window_key(w.key): w for group in windows.values() for w in group}
+    if wanted:
+        cutoffs = sorted({w.cutoff for w in wanted.values()})
+        load(
+            "mia_window_exposures",
+            "id_produccion",
+            productions,
+            filter_=ds.field("corte").isin(pa.array(cutoffs, type=pa.timestamp("us"))),
+            pruning=(("corte", ">=", cutoffs[0]), ("corte", "<=", cutoffs[-1])),
+            accepts=lambda r: window_key(r) in wanted,
+        )
+    exposures = defaultdict(list)
+    basis_owners = {}
+    for identity, tables in old.items():
+        for row in tables.get("mia_window_exposures", []):
+            basis = row["inspected_basis_id"]
+            if basis in basis_owners and basis_owners[basis] != identity:
+                raise IntegrityError("A published MIA basis belongs to multiple productions")
+            basis_owners[basis] = identity
+            exposures[identity].append(wanted[window_key(row)])
+    load("mia_window_bases", "inspected_basis_id", basis_owners)
+    if exposures:
+        start = min(w.start for group in exposures.values() for w in group)
+        end = max(w.cutoff for group in exposures.values() for w in group)
+        load(
+            "inspection_bases",
+            "id_produccion",
+            {identity: identity for identity in exposures},
+            filter_=(ds.field("periodo_inicio") >= start) & (ds.field("periodo_fin") <= end),
+            pruning=(("periodo_inicio", ">=", start), ("periodo_fin", "<=", end)),
+            accepts=lambda r: any(
+                r["seleccion_id"] == w.selection_id and w.includes_sample(r)
+                for w in exposures[r["id_produccion"]]
+            ),
+        )
+    return {
+        identity: (
+            tables,
+            {r["id_produccion"]: r for r in tables.get("production_calculation_state", [])},
+            {},
+        )
+        for identity, tables in old.items()
+    }
 
 
 def _carry_references(previous, store: FactStore, max_rows: int, *, exclude=()) -> None:
@@ -1394,6 +1488,12 @@ def build(
 
         history_clock = _Stopwatch()
         history_timing: dict[str, float] = {}
+        history_decoded: dict[str, int] = defaultdict(int)
+        shared_history = None
+        shared_history_fallback = False
+        live_history = (
+            lane == "live" and current_slot_seconds is not None and mia_reference_mode == "live"
+        )
         slow_productions: list[dict] = []
         score_work: dict[str, float] = defaultdict(float)
         score_calls: dict[str, int] = defaultdict(int)
@@ -1401,7 +1501,11 @@ def build(
         def read_score_history(production):
             started = perf_counter()
             identity = production["id_produccion"]
-            result = _history(previous, identity, max_total_rows, clock=history_clock)
+            if shared_history is not None:
+                return shared_history.pop(identity)
+            result = _history(
+                previous, identity, max_total_rows, clock=history_clock, prune=live_history
+            )
             history_timing[identity] = round(perf_counter() - started, 6)
             return result
 
@@ -1411,12 +1515,12 @@ def build(
             for name, seconds in timing["seconds"].items():
                 score_work[name] += seconds
                 score_calls[name] += timing["calls"][name]
-            history_seconds = history_timing.pop(identity)
+            history_seconds = history_timing.pop(identity, None)
             slow_productions.append(
                 {
                     "production": identity,
                     "history_seconds": history_seconds,
-                    "total_seconds": history_seconds + sum(timing["seconds"].values()),
+                    "total_seconds": (history_seconds or 0.0) + sum(timing["seconds"].values()),
                     **timing,
                 }
             )
@@ -1436,6 +1540,21 @@ def build(
             score_stats["unchanged_productions"] += int(result["unchanged"])
 
         with clock.stage("scores"):
+            if live_history and previous is not None and selected:
+                with clock.stage("shared_score_history"):
+                    try:
+                        shared_history = _shared_history(
+                            previous,
+                            {
+                                p["id_produccion"]: score_windows[p["id_produccion"]]
+                                for p in selected
+                            },
+                            max_total_rows,
+                            clock=history_clock,
+                            decoded=history_decoded,
+                        )
+                    except _SharedHistoryBudget:
+                        shared_history_fallback = True
             workers = score_stats["score_workers"]
             if workers == 1 or len(selected) < 2:
                 score_stats["score_workers"] = 1
@@ -1466,6 +1585,9 @@ def build(
             "worker_calls": dict(score_calls),
             "history_table_seconds": history_clock.stages,
             "history_table_calls": history_clock.calls,
+            "history_shared_rows_decoded": dict(history_decoded),
+            "history_shared_seconds": clock.stages.get("shared_score_history"),
+            "history_shared_budget_fallback": shared_history_fallback,
             "slow_productions": slow_productions,
         }
         store.dedupe()

@@ -825,3 +825,67 @@ def test_historical_gold_publishes_model_and_segment_statistics(tmp_path, native
     assert live_result["status"] == "PUBLISHED"
     details = Snapshot.open(live_root).rows("mia_score_details")
     assert details and {r["muestras"] for r in details} == {4}
+
+
+def test_live_shared_history_matches_previous_route_with_same_pinned_cut(
+    tmp_path, native, monkeypatch
+):
+    from copy import deepcopy
+    from datetime import timedelta
+    from shutil import copytree
+
+    from app.gold import pipeline
+    from app.gold.common import canonical, read_json
+    from app.gold.publications import Snapshot
+
+    from .test_pipeline import CUTOFF, bundle
+
+    monkeypatch.setattr(pipeline, "utc_now", lambda: "2026-11-20T12:00:00+00:00")
+    target = CUTOFF - timedelta(hours=1)
+    evidence = industrial_evidence(
+        tmp_path / "inputs", "live", recent=True, native=native, horizon=target, window_seconds=600
+    )
+    config = read_json(Path(__file__).parents[3] / "config/customer_score.json")
+    options = dict(
+        confirmed_input=evidence,
+        bundle=bundle(),
+        cutoff=target,
+        environment="test",
+        plant="AV",
+        lane="live",
+        current_slot_seconds=600,
+        mia_reference_mode="live",
+    )
+    baseline = tmp_path / "baseline"
+    alternate = tmp_path / "candidate"
+    initial = pipeline.run(evidence.root, baseline, config=config, **options)
+    assert initial["status"] == "PUBLISHED"
+    copytree(baseline, alternate)
+    scoring = deepcopy(config)
+    scoring["weights"]["zc"] += 1
+
+    def force_budget_fallback(*args, **kwargs):
+        raise pipeline._SharedHistoryBudget
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pipeline, "_shared_history", force_budget_fallback)
+        old = pipeline.run(evidence.root, baseline, config=scoring, **options)
+    new = pipeline.run(evidence.root, alternate, config=scoring, **options)
+    assert old["status"] == new["status"] == "PUBLISHED"
+    before = old["incremental"]["score_timing"]
+    after = new["incremental"]["score_timing"]
+    assert before["history_shared_budget_fallback"]
+    assert not after["history_shared_budget_fallback"]
+    assert "quality_scores" in before["history_table_calls"]
+    assert "quality_scores" not in after["history_table_calls"]
+    assert after["history_table_calls"]["mia_window_exposures"] == 1
+
+    left, right = Snapshot.open(baseline), Snapshot.open(alternate)
+    assert left.rows("quality_scores")
+    assert left.publication_id == right.publication_id
+    for ref in left.manifest["tables"]:
+        name = ref["name"]
+        assert sorted(map(canonical, left.rows(name))) == sorted(map(canonical, right.rows(name)))
+    assert (
+        pipeline.run(evidence.root, alternate, config=scoring, **options)["status"] == "UNCHANGED"
+    )

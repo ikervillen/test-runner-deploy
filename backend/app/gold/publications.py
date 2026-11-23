@@ -159,6 +159,7 @@ class Snapshot:
         max_rows: int = 250_000,
         file_pruning_predicate=None,
         on_scan=None,
+        on_decode=None,
         pushdown: bool = False,
     ) -> Iterator[pa.RecordBatch]:
         count = 0
@@ -178,6 +179,8 @@ class Snapshot:
             )
         )
         for batch in scanner.to_batches():
+            if on_decode is not None:
+                on_decode(batch.num_rows)
             # Arrow 23 cannot prune every statistics kind written by Delta MERGE.
             if expression is not None:
                 batch = batch.filter(expression)
