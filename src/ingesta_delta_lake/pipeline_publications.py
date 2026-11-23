@@ -162,7 +162,9 @@ def _publish_family(config, storage, *, lane, identity, family, captured_ids=())
             raise IntegrityError("Review publication exceeds its explicit row budget")
         from .pipeline_control import confirmed_control
 
-        cases, meta, extra = confirmed_control(cfg, db, settings, version, allow_empty=True)
+        cases, meta, extra = confirmed_control(
+            cfg, db, settings, version, allow_empty=True, live_registry=lane == "live"
+        )
         if (
             cfg.read_max_rows is not None
             and len(cases) + len(extra.get("composition", {})) > cfg.read_max_rows

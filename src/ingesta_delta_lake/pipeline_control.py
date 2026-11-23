@@ -31,7 +31,9 @@ def check_source_version(cfg, settings, version, message, *, dependency=True):
     raise IntegrityError(message)
 
 
-def confirmed_control(cfg, db, settings, version, *, expected=None, allow_empty=False):
+def confirmed_control(
+    cfg, db, settings, version, *, expected=None, allow_empty=False, live_registry=False
+):
     family = cfg.family
     cases = [
         {"issue_id": r[0], "reason": r[1], "status": r[2], "payload": json.loads(r[3])}
@@ -82,10 +84,19 @@ def confirmed_control(cfg, db, settings, version, *, expected=None, allow_empty=
             },
         }
     if family == "ASIGNACION_PRODUCCION_RAMAL":
+        where = (
+            ""
+            if live_registry
+            else "WHERE coalesce(json_extract(payload_json,'$.scope'),'full')='full' "
+        )
         latest = db.execute(
-            "SELECT payload_json FROM publications WHERE "
-            "coalesce(json_extract(payload_json,'$.scope'),'full')='full' "
-            "ORDER BY no DESC LIMIT 1"
+            "SELECT payload_json,delta_version FROM publications "
+            + where
+            + "ORDER BY no DESC LIMIT 1"
         ).fetchone()
+        if live_registry and latest and latest[1] != version:
+            raise IntegrityError(
+                "Live attribution registry differs from the confirmed Silver version"
+            )
         extra["association"] = json.loads(latest[0]) if latest else None
     return cases, meta, extra

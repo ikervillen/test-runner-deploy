@@ -372,16 +372,37 @@ def test_topology_configuration_changes_invalidate_previous_publication(config, 
     assert inspect(replace(config, line_code_by_origin=(("AV32", 99),)))["status"] == "STALE"
 
 
-def test_live_handover_keeps_prior_ledger_and_other_tandem_half(config, foundation):
+def test_live_handover_keeps_prior_ledger_and_other_tandem_half(
+    config, foundation, tmp_path, monkeypatch
+):
+    from ingesta_delta_lake import associations
+    from ingesta_delta_lake.association_storage import source_snapshot
+    from ingesta_delta_lake.common import digest
+    from ingesta_delta_lake.pipeline_publications import SilverSnapshot
+    from ingesta_delta_lake.pipeline_runtime import PipelineWorker
+
     run(config)
-    before = {r["source_id"]: r for r in ledger(config)}
+    old = json.loads(
+        sql(config, "SELECT payload_json FROM publications ORDER BY no DESC LIMIT 1")[0][0]
+    )
+    before = read_artifact(config, old["artifacts"]["ledger"])
+    storage = SimpleNamespace(silver=config.silver_root, exchange=tmp_path / "exchange")
+    published_before = publish_family(
+        config, storage, lane="live", identity="test", family=config.family
+    )
+    assert (
+        SilverSnapshot.open(storage).control(config.family)["extra"]["association"]["scope"]
+        == "full"
+    )
     old_catalog = search(replace(config, family="CATALOGO_PRODUCCIONES"), "2169/477")
     assert old_catalog["productions"][0]["fecha_fin_zf"] is None
 
     live = replace(
         config,
         pipeline_lane="live",
-        processing_window=("2026-11-23T08:00:00", "2026-11-23T08:10:00"),
+        processing_window=("2026-11-23T08:20:00", "2026-11-23T08:30:00"),
+        read_max_rows=2,
+        read_batch_rows=1,
     )
     with (foundation / "MP9_CAMBIO_MODELO.csv").open("a", encoding="utf-8") as stream:
         # The incoming ZF is emitted before the ZC root. MP9 accepts the linked pair.
@@ -390,17 +411,77 @@ def test_live_handover_keeps_prior_ledger_and_other_tandem_half(config, foundati
     with (foundation / "LISTA_RECH.csv").open("a", encoding="utf-8") as stream:
         stream.write("23/11/2026 8:30:00;35;1;13;91;1;0;3F;;\n")
         stream.write("23/11/2026 8:30:00;0;3;14;80;0;0;;;\n")
-    for family in ("MP9_CAMBIO_MODELO", "CATALOGO_PRODUCCIONES", "LISTA_RECH"):
+    counter = foundation / "CONT_ZC.csv"
+    with counter.open("a", encoding="utf-8") as stream:
+        stream.write("32;23/11/2026 8:30:00;100;100;100;100;0;180;0;100;100;0;0;80.00;80.00;0;1;\n")
+    for family in ("MP9_CAMBIO_MODELO", "CATALOGO_PRODUCCIONES", "LISTA_RECH", "CONT_ZC"):
         run(replace(live, family=family))
 
+    descriptor = {"schema_id": "fenix-archive-snapshot-v1", "tables": {}, "completed": {}}
+    archive = tmp_path / "archive.json"
+    archive.write_text(json.dumps({**descriptor, "publication_id": digest(descriptor)}))
+    archived = replace(live, archive_root=tmp_path, archive_manifest=archive)
+    with pytest.raises(IntegrityError, match="Combined Silver query exceeds"):
+        source_snapshot(archived, "LISTA_RECH")
+    selected, *_ = source_snapshot(
+        archived, "LISTA_RECH", observation_window=live.processing_window
+    )
+    assert len(selected) == 2
+    too_small = replace(archived, read_max_rows=1)
+    with pytest.raises(IntegrityError, match="LISTA_RECH.*2 scanned > 1"):
+        source_snapshot(too_small, "LISTA_RECH", observation_window=live.processing_window)
+
+    original = associations.assign
+
+    def fail_full(bundle, *args, **kwargs):
+        if bundle["sources"]["LISTA_RECH"]:
+            raise RuntimeError("full interrupted")
+        return original(bundle, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(associations, "assign", fail_full)
+        with pytest.raises(RuntimeError, match="full interrupted"):
+            run(live)
+
+    events = []
+    worker = SimpleNamespace(
+        lane="live",
+        storage=storage,
+        identity="test",
+        policy=None,
+        pipelines=None,
+        history_enabled=False,
+        event=events.append,
+    )
+    no_lots = SimpleNamespace(
+        record=lambda *args: None,
+        advance=lambda *args, **kwargs: None,
+        publish=lambda *args: None,
+    )
+    failure = {"status": "FAILED", "error": "full interrupted"}
+    PipelineWorker.record(worker, SimpleNamespace(lots=no_lots), live, failure, 1)
+    assert events[-1]["result"] == {"status": "FAILED", "error": "full interrupted"}
+    physical = SilverSnapshot.open(storage).control(live.family)["extra"]["association"]
+    assert physical["scope"] == "physical"
+    current = {
+        d["production"]
+        for d in physical["registry"].values()
+        if d["kind"] == "ZC_PRESENCE" and d["end"] is None
+    }
+    assert current == {pid(config, 2005), pid(config, 2021)}
+    prior = SilverSnapshot.open(storage, publication_id=published_before["publication_id"])
+    assert prior.control(live.family)["extra"]["association"]["scope"] == "full"
+
     published = run(live)
-    assert published["physical_publication"]["status"] in {"APPLIED", "PARTIAL"}
     rows = {r["source_id"]: r for r in ledger(live)}
-    assert {identity: rows[identity] for identity in before} == before
-    new = [r for identity, r in rows.items() if identity not in before]
+    assert read_artifact(config, old["artifacts"]["ledger"]) == before
+    new = [r for r in rows.values() if r["family"] == "LISTA_RECH"]
     assert {tuple(r["productions"]) for r in new} == {(pid(config, 2021),), (pid(config, 2005),)}
     assert all(r["status"] == "ASSIGNED" for r in new)
-    assert published["recomputed_source_rows"] == 2
+    zc = next(r for r in rows.values() if r["family"] == "CONT_ZC")
+    assert zc["status"] == "SHARED_MACHINE" and set(zc["productions"]) == current
+    assert all(physical["registry"][e]["kind"] == "ZC_PRESENCE" for e in zc["episode_ids"])
+    assert published["recomputed_source_rows"] == 3
 
     associations = inspect(live)["associations"]
     zf = [r for r in associations if r["zona"] == "ZF"]
@@ -413,10 +494,21 @@ def test_live_handover_keeps_prior_ledger_and_other_tandem_half(config, foundati
     }
     catalog_after = search(replace(live, family="CATALOGO_PRODUCCIONES"), "2169/477")
     assert catalog_after["productions"][0]["fecha_fin_zf"] is None
-    replayed = run(replace(live, processing_window=("2026-11-23T08:30:00", "2026-11-23T08:40:00")))
+    replayed = run(live)
     assert replayed["delta_version"] == published["delta_version"]
     assert replayed["recomputed_source_rows"] == 0
     assert ledger(live) == list(rows.values())
+    for minute in (40, 50):
+        cut = replace(
+            live,
+            processing_window=(
+                f"2026-11-23T08:{minute - 10}:00",
+                f"2026-11-23T08:{minute}:00",
+            ),
+        )
+        assert run(cut)["delta_version"] == published["delta_version"]
+        assert ledger(cut) == []
+    assert read_artifact(config, old["artifacts"]["ledger"]) == before
 
 
 def test_live_handover_resolves_seven_physical_slots_with_av22_and_av23_successors():

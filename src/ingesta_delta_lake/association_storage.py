@@ -8,8 +8,10 @@ from contextlib import closing
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pyarrow as pa
+import pyarrow.dataset as ds
 from deltalake import DeltaTable, write_deltalake
 from deltalake.transaction import CommitProperties
 
@@ -23,6 +25,7 @@ from .control import Control
 from .defects_storage import DefectsStore
 from .delta import DeltaStore
 from .mp9_storage import Mp9Store
+from .pipeline_rows import review_hash
 from .rejections_storage import RejectionsStore
 from .topology_storage import TopologyStore
 from .zc_storage import ZcStore
@@ -49,7 +52,57 @@ PHYSICAL_SOURCES = frozenset(
 )
 
 
-def source_snapshot(config, family, read=True, *, expected=None):
+OBSERVATION_SOURCES = frozenset({"LISTA_AR", "LISTA_DEFECTOS", "LISTA_RECH", "CONT_ZC"})
+
+
+def _live_observations(config, store, table, window):
+    """Validate the confirmed owner's observations for one cut, with open AR context."""
+    left, right = map(datetime.fromisoformat, window)
+    family = config.family
+    if family == "LISTA_AR":
+        ends = ds.field("FECHA_OFF")
+        selected = (ds.field("FECHA_ON") <= right) & (ends.is_null() | (ends > left))
+    else:
+        stamp = ds.field("FECHA")
+        selected = (stamp > left) & (stamp <= right)
+
+    dataset = table.to_pyarrow_dataset()
+    schema = store.contract.schema
+    if pa.schema(table.schema().to_arrow()) != schema:
+        raise IntegrityError(f"Esquema confirmado inesperado para {family}")
+    batches = []
+    scanned = 0
+    for batch in dataset.scanner(
+        filter=selected,
+        batch_size=config.read_batch_rows,
+        batch_readahead=1,
+        fragment_readahead=1,
+        use_threads=False,
+    ).to_batches():
+        scanned += batch.num_rows
+        if config.read_max_rows is not None and scanned > config.read_max_rows:
+            raise IntegrityError(
+                f"Live association row budget: {family} {window}, "
+                f"{scanned} scanned > {config.read_max_rows}"
+            )
+        batches.append(batch.cast(schema))
+    arrow = pa.Table.from_batches(batches, schema=schema)
+    view = SimpleNamespace(
+        version=table.version,
+        to_pyarrow_table=lambda: arrow,
+        to_pyarrow_dataset=lambda **_: ds.dataset(arrow),
+    )
+    _, rows = store.read(view)
+    rejected = {
+        value
+        for commit in table.history()
+        if commit["version"] <= table.version()
+        for value in json.loads(commit.get("ingesta_review_rejected_hashes", "[]"))
+    }
+    return [r for r in rows.values() if not rejected or review_hash(family, r) not in rejected]
+
+
+def source_snapshot(config, family, read=True, *, expected=None, observation_window=None):
     cfg = replace(config, family=family)
     if not cfg.control_path.exists():
         if cfg.table_path.exists():
@@ -72,7 +125,11 @@ def source_snapshot(config, family, read=True, *, expected=None):
             "SELECT COUNT(*) FROM batches WHERE state IN ('PREPARED','WRITING','UNKNOWN')"
         ).fetchone()[0]:
             raise DependencyPending(f"Recuperar primero {family}")
-        store = STORES[family](cfg, settings["control_id"])
+        scoped = family in OBSERVATION_SOURCES and observation_window is not None
+        # Retired history stays in its immutable publications. The operating cut uses
+        # the confirmed Live owner's Delta, never a combined archive/CDF reconstruction.
+        reader = replace(cfg, archive_root=None, archive_manifest=None) if scoped else cfg
+        store = STORES[family](reader, settings["control_id"])
         table = store.table()
         version = table.version() if table is not None else None
         from .pipeline_control import check_source_version, confirmed_control
@@ -99,7 +156,10 @@ def source_snapshot(config, family, read=True, *, expected=None):
                 table = DeltaTable(str(cfg.table_path), version=fixed)
                 version = fixed
         rows = []
-        if read:
+        if read and scoped:
+            if table is not None:
+                rows = _live_observations(cfg, store, table, observation_window)
+        elif read:
             _, data = store.read(table)
             if STORES[family] is DeltaStore:
                 rows = [
@@ -119,7 +179,7 @@ def source_snapshot(config, family, read=True, *, expected=None):
     return rows, cases, meta, extra
 
 
-def load_bundle(config, *, physical=False, manifest=None):
+def load_bundle(config, *, physical=False, manifest=None, observation_window=None):
     fixed_manifest = manifest
     sources, cases, manifest = {}, {}, {}
     extra = {}
@@ -130,7 +190,10 @@ def load_bundle(config, *, physical=False, manifest=None):
             sources[family], cases[family] = [], []
             continue
         rows, issues, meta, more = source_snapshot(
-            config, family, expected=fixed_manifest[family] if fixed_manifest else None
+            config,
+            family,
+            expected=fixed_manifest[family] if fixed_manifest else None,
+            observation_window=observation_window,
         )
         sources[family] = sorted(rows, key=lambda r: canonical(a.SOURCE_KEYS[family](r)))
         cases[family] = issues

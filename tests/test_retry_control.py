@@ -89,3 +89,23 @@ def test_live_derived_pause_is_revalidated_once_without_resetting_the_failure(co
             assert retry_control.ready(control)["status"] == "PAUSED_RETRY_EXHAUSTED"
             retry_control.failed(control, DependencyPending("source publishing"))
             assert retry_control.ready(control) is None
+
+
+def test_association_window_policy_requalifies_previous_live_budget_pause(config):
+    from ingesta_delta_lake.association_storage import AssociationControl
+
+    live = replace(config, family="ASIGNACION_PRODUCCION_RAMAL", pipeline_lane="live")
+    live.control_root.mkdir(parents=True, exist_ok=True)
+    with closing(AssociationControl(live)) as control:
+        error = IntegrityError("Combined Silver query exceeds its explicit row budget")
+        retry_control.failed(control, error)
+        with control.db:
+            control.db.execute(
+                "UPDATE settings SET value=? WHERE key='retry_revalidation_policy'",
+                (retry_control.LIVE_DERIVED_POLICY,),
+            )
+        assert retry_control.ready(control) is None
+        retry_control.failed(control, error)
+        assert retry_control.ready(control)["status"] == "PAUSED_RETRY_EXHAUSTED"
+        retry_control.succeeded(control)
+        assert retry_control.ready(control) is None

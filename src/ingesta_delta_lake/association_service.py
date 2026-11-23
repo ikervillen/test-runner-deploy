@@ -167,12 +167,29 @@ def _process(config, control, attempt, *, physical=False):
             floor = config.processing_window[0]
         elif not physical and config.runtime_root is not None:
             raise DependencyPending("Esperando el primer corte Live para publicar atribuciones")
+    observation_window = (
+        tuple(config.processing_window)
+        if config.pipeline_lane == "live" and not physical and config.processing_window
+        else None
+    )
+    if observation_window and floor and observation_window[0] < floor:
+        if observation_window[1] <= floor:
+            raise DependencyPending("El corte seleccionado precede al comienzo prospectivo Live")
+        observation_window = (floor, observation_window[1])
+    if (
+        config.pipeline_lane == "live"
+        and not physical
+        and config.runtime_root
+        and not observation_window
+    ):
+        raise DependencyPending("Esperando un corte Live confirmado para construir el ledger")
     lines = dict(config.line_by_origin)
     fingerprint = {
         "contract": a.CONTRACT,
         "scope": scope,
         "rule": a.RULE,
         "policy": PUBLICATION_POLICY,
+        **({"observation_window": list(observation_window)} if observation_window else {}),
         **({"live_handover": "mp9_topology_v1", "live_handover_from": floor} if live else {}),
         "ar_interpretation_rules": a.ar_interpretation_rules(),
         "transformer_version": __version__,
@@ -227,7 +244,12 @@ def _process(config, control, attempt, *, physical=False):
             if current_pub
             else {}
         )
-    bundle = load_bundle(config, physical=physical, manifest=fingerprint["manifest"])
+    bundle = load_bundle(
+        config,
+        physical=physical,
+        manifest=fingerprint["manifest"],
+        observation_window=observation_window,
+    )
     if fingerprint["manifest"] != bundle["manifest"]:
         raise DependencyPending("Las fuentes cambiaron durante la preparación de asociaciones")
     if live:
@@ -270,10 +292,17 @@ def _process(config, control, attempt, *, physical=False):
         for p in [*prior_cases, *issues]
         if not _can_resolve(p, registry, current_ids)
     } - {None}
-    frozen = _frozen_observations(config, control, bundle, floor) if floor and not physical else {}
+    # Earlier cuts remain in their own immutable ledgers. The bounded cut needs
+    # no prior ledger read; clamp the scope to the prospective activation.
+    frozen = (
+        _frozen_observations(config, control, bundle, floor)
+        if floor and not physical and not observation_window
+        else {}
+    )
     ledger = a.assign(bundle, registry, index, review_scopes, frozen=frozen)
     counts = a.diagnostics(ledger)
     bundle.update(
+        **({"observation_window": list(observation_window)} if observation_window else {}),
         registry=registry,
         decision_input=doc,
         effective_decisions=effective,
@@ -320,6 +349,7 @@ def _process(config, control, attempt, *, physical=False):
     ]
     publication = {
         "scope": scope,
+        **({"observation_window": list(observation_window)} if observation_window else {}),
         "observation_status": "NOT_EVALUATED" if physical else "EVALUATED",
         "artifacts": artifacts,
         "manifest": bundle["manifest"],

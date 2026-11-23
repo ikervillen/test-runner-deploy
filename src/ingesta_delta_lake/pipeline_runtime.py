@@ -319,7 +319,10 @@ class PipelineWorker:
             intake.defer(ids, result)
             self.event({"family": family, "result": result, "seconds": seconds})
             return
-        if result.get("status") != "FAILED" and not result.get("remaining_versions", 0):
+        if (
+            result.get("status") != "FAILED"
+            or (self.lane == "live" and family == "ASIGNACION_PRODUCCION_RAMAL")
+        ) and not result.get("remaining_versions", 0):
             try:
                 manifest = publish_family(
                     cfg,

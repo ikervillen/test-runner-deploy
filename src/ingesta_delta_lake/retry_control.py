@@ -18,6 +18,12 @@ LEGACY_DEPENDENCIES = {
 LIVE_DERIVED_POLICY = "live-production-continuity-v1"
 
 
+def revalidation_policy(config):
+    if config.family == "ASIGNACION_PRODUCCION_RAMAL":
+        return "live-association-window-v2"
+    return LIVE_DERIVED_POLICY
+
+
 def live_derived(config):
     return config.pipeline_lane == "live" and config.family in LEGACY_DEPENDENCIES
 
@@ -31,7 +37,7 @@ def ready(control):
         value["paused"]
         and value["error_type"] == "IntegrityError"
         and live_derived(control.config)
-        and control.setting("retry_revalidation_policy") != LIVE_DERIVED_POLICY
+        and control.setting("retry_revalidation_policy") != revalidation_policy(control.config)
     ):
         return None
     if (
@@ -81,7 +87,7 @@ def failed(control, error):
             control.db.execute(
                 "INSERT INTO settings VALUES('retry_revalidation_policy',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (LIVE_DERIVED_POLICY,),
+                (revalidation_policy(control.config),),
             )
         control.db.execute(
             "INSERT INTO settings VALUES('retry_state',?) "
