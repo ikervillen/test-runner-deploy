@@ -112,14 +112,23 @@ def _overlaps_fragment(name, item, window):
     return first <= right and last > left
 
 
-def save(root, document, tables, *, window_seconds=None, reuse=None):
+def save(root, document, tables, *, window_seconds=None, reuse=None, fact_refs=(), lineage_refs=()):
     """Persist all bytes before making this input eligible for a Gold publication."""
     root.mkdir(parents=True, exist_ok=True)
     document, tables = dict(document), dict(tables)
+    carried_lineage = list(lineage_refs)
     if "lineages" in document:
+        lineages = dict(document.pop("lineages"))
+        if document.get("fragment_lineage"):
+            from .fragment_delta import bootstrap_lineage
+
+            for name in sorted(OPERATIONS & lineages.keys()):
+                carried_lineage.extend(
+                    bootstrap_lineage(root, name, tables[name], lineages.pop(name), window_seconds)
+                )
         proofs = [
             {"family": family, "key": key, "proof": json.dumps(proof, sort_keys=True)}
-            for family, keys in document.pop("lineages").items()
+            for family, keys in lineages.items()
             for key, records in keys.items()
             for proof in records
         ]
@@ -129,10 +138,19 @@ def save(root, document, tables, *, window_seconds=None, reuse=None):
                 [("family", pa.string()), ("key", pa.string()), ("proof", pa.string())]
             ),
         )
-    refs = []
+    refs = list(fact_refs)
     for name, table in sorted(tables.items()):
         fragments = _fragments(name, table, window_seconds)
-        if not fragments:
+        if name == "__lineage" and carried_lineage:
+            descriptors = carried_lineage + [
+                {**_write_table(root, part), "partition": list(key)}
+                for key, part in fragments or ()
+            ]
+            ref = {
+                "parts": sorted(descriptors, key=lambda part: part["partition"]),
+                "rows": sum(item["rows"] for item in descriptors),
+            }
+        elif not fragments:
             ref = reuse.matching_file(name, table) if reuse else None
             if ref is None:
                 ref = _write_table(root, table)
@@ -150,7 +168,7 @@ def save(root, document, tables, *, window_seconds=None, reuse=None):
                 descriptors.append(item)
             ref = {"parts": descriptors, "rows": table.num_rows}
         refs.append({"name": name, **ref})
-    payload = {**document, "schema_id": SCHEMA, "tables": refs}
+    payload = {**document, "schema_id": SCHEMA, "tables": sorted(refs, key=lambda r: r["name"])}
     payload_bytes = canonical(payload)
     if len(payload_bytes) > MAX_MANIFEST_BYTES:
         raise IntegrityError("Gold input manifest exceeds its metadata budget")
@@ -232,12 +250,22 @@ class Evidence:
                 return {key: ref[key] for key in ("uri", "hash", "rows")}
         return None
 
-    def proofs(self, *, max_rows):
+    def proofs(self, *, max_rows, families=None):
         result = {}
-        for row in self.table("__lineage", max_rows=max_rows).to_pylist():
-            result.setdefault(row["family"], {}).setdefault(row["key"], []).append(
-                json.loads(row["proof"])
-            )
+        ref = next((r for r in self.document["tables"] if r["name"] == "__lineage"), None)
+        if ref and "parts" in ref and families is not None:
+            parts = [p for p in ref["parts"] if p["partition"][0] in families]
+            if sum(p["rows"] for p in parts) > max_rows:
+                raise IntegrityError("Gold lineage exceeds its explicit row budget")
+            batches = (self._read_part("__lineage", part) for part in parts)
+        else:
+            batches = iter((self.table("__lineage", max_rows=max_rows),))
+        for batch in batches:
+            for row in batch.to_pylist():
+                if families is None or row["family"] in families:
+                    result.setdefault(row["family"], {}).setdefault(row["key"], []).append(
+                        json.loads(row["proof"])
+                    )
         return result
 
     def batches(self, name, *, max_rows=None, expression=None, window=None, **_kwargs):

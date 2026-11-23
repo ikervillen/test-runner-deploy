@@ -15,15 +15,12 @@
     "format:check": "prettier --check src"
   },
   "dependencies": {
-    "plotly.js-basic-dist-min": "^2.35.3",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "react-plotly.js": "^2.6.0"
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.1.0",
-    "@types/plotly.js": "^2.12.29",
     "@types/react": "^18.2.48",
     "@types/react-dom": "^18.2.18",
     "@vitejs/plugin-react": "^4.2.1",

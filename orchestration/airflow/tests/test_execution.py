@@ -86,22 +86,20 @@ def test_run_invokes_the_cli_with_its_own_scheduled_moment(
 
 
 @pytest.mark.parametrize(
-    ("code", "attempts", "slot"),
+    ("code", "slot"),
     [
-        ("65", 1, SLOT + timedelta(minutes=10)),
-        ("75", 4, SLOT + timedelta(minutes=20)),
+        ("65", SLOT + timedelta(minutes=10)),
+        ("75", SLOT + timedelta(minutes=20)),
     ],
 )
-def test_data_errors_fail_at_once_and_busy_stores_retry(
-    dags, recorded, monkeypatch, code, attempts, slot
+def test_live_publish_fails_once_without_retrying_in_the_same_slot(
+    dags, recorded, monkeypatch, code, slot
 ):
-    task = dags["gold_publish"].get_task("publish")
-    monkeypatch.setattr(task, "retry_delay", timedelta(0))
-    monkeypatch.setattr(task, "retry_exponential_backoff", False)
+    # Live gives the next scheduled slot a turn; it deliberately has retries=0.
     monkeypatch.setenv("GOLD_STUB_EXIT", code)
     run = dags["gold_publish"].test(logical_date=slot, run_after=slot)
     assert run.get_task_instance("publish").state == "failed"
-    assert sum(c.startswith("publish ") for c in calls(recorded)) == attempts
+    assert sum(c.startswith("publish ") for c in calls(recorded)) == 1
 
 
 def test_a_fully_blocked_cutoff_still_publishes_after_the_wait(dags, recorded, monkeypatch):
