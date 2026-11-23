@@ -137,10 +137,10 @@ jobs:
         run: |
           python -m pip install uv==0.11.6
           uv run --locked --no-dev python -m scripts.smoke_independent_compose fenix-independent:validation .quality-context
-      - name: Prepare the approved Gold worker update
+      - name: Prepare the approved Live flow update
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == 'f769fc7a02d315b9ef7c7f4e90766e77d32b9c42' && github.event.head_commit.message == 'Deploy targeted Gold Live history reads' && github.run_attempt == '1'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == 'd38aa5cff916146378bfbd4e840f845000277c96' && github.event.head_commit.message == 'Deploy Silver Live production continuity' && github.run_attempt == '1'
         run: |
           set -euo pipefail
           mkdir -p bundle
