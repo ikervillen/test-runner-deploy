@@ -17,6 +17,7 @@ from .commit_protocol import application_transaction, delta_configuration, merge
 from .common import DependencyPending, IntegrityError, canonical, digest
 from .delta import DeltaStore
 from .mp9_storage import Mp9Store, load_models
+from .pipeline_control import check_source_version
 from .pipeline_publications import SilverSnapshot
 from .pipeline_rows import portable
 from .topology import FAMILIES, MACHINES, machine_for_period
@@ -49,8 +50,7 @@ def read_source(config):
         ).fetchone()[0]:
             raise DependencyPending("Recuperar MP9 antes de derivar su catálogo")
         version, records = Mp9Store(source, settings["control_id"]).read()
-        if settings.get("last_version", "None") != str(version):
-            raise IntegrityError("El snapshot MP9 no está confirmado")
+        check_source_version(source, settings, version, "El snapshot MP9 no está confirmado")
         cases = [
             {
                 "issue_id": r["issue_id"],
@@ -176,7 +176,7 @@ def verify_manifest(config, manifest):
 
 
 def load_sources(config, *, previous_history=None):
-    models, model_snapshot = load_models(config)
+    models, model_snapshot = load_models(config, derived=True)
     records, mp9_snapshot, cases = read_source(config)
     history = historical_mp9(config)
     if previous_history is not None and config.history_exchange is not None:
@@ -199,7 +199,7 @@ def load_sources(config, *, previous_history=None):
         cases.extend(conflicts)
     manifest = {"SIP_MODELO": model_snapshot, "MP9_CAMBIO_MODELO": mp9_snapshot}
     if config.topology_enabled:
-        machines, descriptor, machine_cases = topology_snapshot(config, MACHINES)
+        machines, descriptor, machine_cases = topology_snapshot(config, MACHINES, derived=True)
         manifest[MACHINES] = descriptor
         codes = dict(config.line_code_by_origin)
         for row in records.values():

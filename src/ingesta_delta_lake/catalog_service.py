@@ -38,12 +38,38 @@ def process(config, control, attempt):
     lines = dict(config.line_by_origin)
     if {r["origen_fenix"] for r in records.values()} - set(lines):
         raise ConfigurationError("Falta una correspondencia explícita de origen a línea")
-    if any(r["ID_MODELO"] not in models for r in records.values()):
-        raise IntegrityError("Un modelo MP9 aceptado ya no está en el diccionario")
+    missing_models = {}
+    for row in records.values():
+        if row["STATUS"] == 1 and row["ID_MODELO"] not in models:
+            identity = catalog.production_id(config.plant, row["origen_fenix"], row["ID"])
+            payload = {"origen_fenix": row["origen_fenix"], "ID": row["ID"], "candidate": row}
+            missing_models[identity] = {
+                "issue_id": digest(["catalog_model_missing", payload]),
+                "reason": "MODEL_DICTIONARY_PENDING",
+                "status": "PENDING",
+                "payload": payload,
+            }
+    cases = [*cases, *missing_models.values()]
     prior_observations = control.observations()
     projected, observations, issues, pending_roots = catalog.project(
         config.plant, lines, records, cases, previous, prior_observations
     )
+    for identity, case in missing_models.items():
+        if identity in previous:
+            projected[identity] = previous[identity]
+            observations[identity]["component_ids"] = prior_observations[identity]["component_ids"]
+        else:
+            row = case["payload"]["candidate"]
+            pending_roots.append(
+                {
+                    "id_produccion": identity,
+                    "origen_fenix": row["origen_fenix"],
+                    "id_zc_raiz": row["ID"],
+                    "published": False,
+                }
+            )
+            projected.pop(identity)
+            observations.pop(identity)
     for case in control.db.execute("SELECT payload_json FROM issues WHERE status!='RESOLVED'"):
         identity = json.loads(case[0])["id_produccion"]
         if identity in observations:

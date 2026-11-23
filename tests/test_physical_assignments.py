@@ -103,10 +103,10 @@ def test_physical_episodes_commit_even_if_observation_stage_fails(config, founda
 
     original = associations.assign
 
-    def fail_large_stage(bundle, *args):
+    def fail_large_stage(bundle, *args, **kwargs):
         if bundle["sources"]["LISTA_RECH"]:
             raise RuntimeError("Observation computation interrupted")
-        return original(bundle, *args)
+        return original(bundle, *args, **kwargs)
 
     with monkeypatch.context() as patch:
         patch.setattr(associations, "assign", fail_large_stage)
@@ -370,3 +370,158 @@ def test_topology_configuration_changes_invalidate_previous_publication(config, 
     run(config)
     assert inspect(replace(config, topology_enabled=False))["status"] == "STALE"
     assert inspect(replace(config, line_code_by_origin=(("AV32", 99),)))["status"] == "STALE"
+
+
+def test_live_handover_keeps_prior_ledger_and_other_tandem_half(config, foundation):
+    run(config)
+    before = {r["source_id"]: r for r in ledger(config)}
+    old_catalog = search(replace(config, family="CATALOGO_PRODUCCIONES"), "2169/477")
+    assert old_catalog["productions"][0]["fecha_fin_zf"] is None
+
+    live = replace(
+        config,
+        pipeline_lane="live",
+        processing_window=("2026-11-23T08:00:00", "2026-11-23T08:10:00"),
+    )
+    with (foundation / "MP9_CAMBIO_MODELO.csv").open("a", encoding="utf-8") as stream:
+        # The incoming ZF is emitted before the ZC root. MP9 accepts the linked pair.
+        stream.write("2022;1;23/11/2026 8:08:00;;10;1;2;2021;2;1;\n")
+        stream.write("2021;1;23/11/2026 6:21:00;;10;1;1;;2;1;\n")
+    with (foundation / "LISTA_RECH.csv").open("a", encoding="utf-8") as stream:
+        stream.write("23/11/2026 8:30:00;35;1;13;91;1;0;3F;;\n")
+        stream.write("23/11/2026 8:30:00;0;3;14;80;0;0;;;\n")
+    for family in ("MP9_CAMBIO_MODELO", "CATALOGO_PRODUCCIONES", "LISTA_RECH"):
+        run(replace(live, family=family))
+
+    published = run(live)
+    assert published["physical_publication"]["status"] in {"APPLIED", "PARTIAL"}
+    rows = {r["source_id"]: r for r in ledger(live)}
+    assert {identity: rows[identity] for identity in before} == before
+    new = [r for identity, r in rows.items() if identity not in before]
+    assert {tuple(r["productions"]) for r in new} == {(pid(config, 2021),), (pid(config, 2005),)}
+    assert all(r["status"] == "ASSIGNED" for r in new)
+    assert published["recomputed_source_rows"] == 2
+
+    associations = inspect(live)["associations"]
+    zf = [r for r in associations if r["zona"] == "ZF"]
+    assert {r["vigente_hasta"] for r in zf if r["id_produccion"] == pid(config, 2007)} == {
+        "2026-11-23T08:08:00"
+    }
+    assert {r["id_produccion"] for r in zf if r["vigente_hasta"] is None} == {
+        pid(config, 2005),
+        pid(config, 2021),
+    }
+    catalog_after = search(replace(live, family="CATALOGO_PRODUCCIONES"), "2169/477")
+    assert catalog_after["productions"][0]["fecha_fin_zf"] is None
+    replayed = run(replace(live, processing_window=("2026-11-23T08:30:00", "2026-11-23T08:40:00")))
+    assert replayed["delta_version"] == published["delta_version"]
+    assert replayed["recomputed_source_rows"] == 0
+    assert ledger(live) == list(rows.values())
+
+
+def test_live_handover_resolves_seven_physical_slots_with_av22_and_av23_successors():
+    from ingesta_delta_lake import associations as a
+    from ingesta_delta_lake import physical_assignments as physical
+    from ingesta_delta_lake import topology as t
+
+    plant = "AIALA"
+    slots = (
+        ("AV21", 4, 1, 1553),
+        ("AV22", 5, 1, 1310),
+        ("AV23", 6, 1, 1625),
+        ("AV31", 7, 1, 1617),
+        ("AV31", 8, 3, 1647),
+        ("AV32", 9, 3, 2025),
+        ("AV32", 10, 1, 2021),
+    )
+    codes = {origin: int(origin[2:]) for origin, _, _, _ in slots}
+    lines = {origin: origin for origin in codes}
+    machines, branches, catalog_rows, composition = [], [], [], {}
+    topology_start = "2020-01-01T00:00:00"
+
+    def add_production(origin, machine, root, start, *, zf_ok=1):
+        identity = catalog.production_id(plant, origin, root)
+        catalog_rows.append(
+            dict(
+                id_produccion=identity,
+                planta=plant,
+                origen_fenix=origin,
+                linea=origin,
+                ID_MAQUINA=machine,
+            )
+        )
+        composition[identity] = {
+            "coverage": "VALID",
+            "root": {"FECHA_ON": start, "FECHA_OFF": None},
+            "zf": [{"ID": root + 1, "FECHA_ON": start, "FECHA_OFF": None, "ZF_OK": zf_ok}],
+        }
+        return identity
+
+    for origin, machine, branch, root in slots:
+        machines.append(
+            dict(
+                id_maquina_fenix=machine,
+                codigo_linea_zc=codes[origin],
+                vigente_desde=topology_start,
+                vigente_hasta=None,
+            )
+        )
+        branches.append(
+            dict(
+                origen_fenix=origin,
+                id_linea_zf_fenix=machine,
+                codigo_ramal=branch,
+                id_maquina_fenix=machine,
+                vigente_desde=topology_start,
+                vigente_hasta=None,
+            )
+        )
+        add_production(origin, machine, root, "2026-11-12T08:00:00")
+
+    bundle = {
+        "live_handover": True,
+        "sources": {
+            t.MACHINES: machines,
+            t.BRANCHES: branches,
+            "CATALOGO_PRODUCCIONES": catalog_rows,
+            "SIP_MODELO": [],
+        },
+        "catalog_composition": composition,
+        "cases": {t.MACHINES: [], t.BRANCHES: []},
+    }
+    previous, issues = a.propose_registry(
+        physical.decisions(bundle, {}, codes, live=True), {}, bundle, plant, lines
+    )
+    assert not issues
+    av22 = add_production("AV22", 5, 1312, "2026-11-23T08:08:00")
+    av23 = add_production("AV23", 6, 1627, "2026-11-23T06:21:00")
+    catalog_rows.reverse()  # MP9 input order cannot change the selected successors.
+    decisions = physical.decisions(bundle, previous, codes, live=True)
+    registry, issues = a.propose_registry(decisions, previous, bundle, plant, lines)
+    assert not issues
+    for zone in ("ZC_PRESENCE", "ZF_ASSOCIATION"):
+        current = {
+            d["production"] for d in registry.values() if d["kind"] == zone and d["end"] is None
+        }
+        assert current == {
+            av22,
+            av23,
+            *(
+                catalog.production_id(plant, o, r)
+                for o, _, _, r in slots
+                if o not in {"AV22", "AV23"}
+            ),
+        }
+    assert all(entry["root"]["FECHA_OFF"] is None for entry in composition.values())
+    assert all(zf["FECHA_OFF"] is None for entry in composition.values() for zf in entry["zf"])
+
+    # A tied root on one tandem half is ambiguous. The other half can still advance.
+    add_production("AV32", 10, 2027, "2026-11-12T08:00:00")
+    peer = add_production("AV32", 9, 2029, "2026-11-23T08:10:00")
+    decisions = physical.decisions(bundle, registry, codes, live=True)
+    updated, issues = a.propose_registry(decisions, registry, bundle, plant, lines)
+    assert issues
+    assert any(d["production"] == peer and d["end"] is None for d in updated.values())
+    assert all(
+        d["production"] != catalog.production_id(plant, "AV32", 2027) for d in updated.values()
+    )

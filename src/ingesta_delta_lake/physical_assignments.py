@@ -1,10 +1,13 @@
-"""Vigencias declaradas ZF + topología vigente; sin reglas por nombres A/B."""
+"""Vigencias declaradas y relevos operativos sobre topología versionada."""
+
+from collections import defaultdict
 
 from . import topology as t
 from .common import digest
 
 ACTOR = "rule:declared_zf_topology_v2"
 ZC_ACTOR = "rule:declared_zc_topology_v1"
+HANDOVER = "Relevo operativo MP9 acreditado en la misma posición física"
 
 
 def zc_presence(bundle, previous, prod, composition, machine):
@@ -46,15 +49,57 @@ def zc_presence(bundle, previous, prod, composition, machine):
     return decision
 
 
-def decisions(bundle, previous, codes):
-    from .associations import source_id
+def live_handover(candidates, previous):
+    """Bound automatic open episodes only with a confirmed successor in the same slot."""
+    groups = defaultdict(list)
+    for decision, slot, source, reference in candidates:
+        groups[slot].append((decision, source, reference))
 
-    result = []
+    for items in groups.values():
+        items.sort(key=lambda item: item[0]["start"])
+        for index, (outgoing, source, _) in enumerate(items[:-1]):
+            if outgoing["end"] is not None or source["FECHA_OFF"] is not None:
+                continue
+            incoming, successor, reference = items[index + 1]
+            cut = incoming["start"]
+            if (
+                not outgoing["start"] < cut
+                or successor["FECHA_ON"] != cut
+                or incoming["production"] == outgoing["production"]
+                or (index > 0 and items[index - 1][0]["start"] == outgoing["start"])
+                or (index + 2 < len(items) and items[index + 2][0]["start"] == cut)
+                or (outgoing["kind"] == "ZF_ASSOCIATION" and successor["ZF_OK"] != 1)
+            ):
+                continue
+            outgoing["end"] = cut
+            outgoing["reason"] = HANDOVER
+            outgoing["evidence"] = [*outgoing["evidence"], reference]
+
+    for decision, _, _, _ in candidates:
+        old = previous.get(decision["id"])
+        if old and old["end"] is not None and old["reason"] == HANDOVER:
+            if decision["end"] is None or old["end"] <= decision["end"]:
+                # Replay or a disappearing successor cannot reopen an accredited episode.
+                decision.update(end=old["end"], reason=old["reason"], evidence=old["evidence"])
+        if old:
+            payload = {k: v for k, v in decision.items() if k not in {"revision", "previous_hash"}}
+            if all(old[k] == v for k, v in payload.items()):
+                decision.update(revision=old["revision"], previous_hash=old["previous_hash"])
+            else:
+                decision.update(revision=old["revision"] + 1, previous_hash=digest(old))
+
+
+def decisions(bundle, previous, codes, *, live=False):
+    from .associations import decision_coverage, source_id
+
+    result, candidates = [], []
     machines = bundle["sources"][t.MACHINES]
     branches = bundle["sources"][t.BRANCHES]
     for prod in bundle["sources"]["CATALOGO_PRODUCCIONES"]:
         composition = bundle["catalog_composition"].get(prod["id_produccion"], {})
-        if composition.get("coverage") != "VALID":
+        if not decision_coverage(bundle, prod["id_produccion"], "ZC_PRESENCE"):
+            continue
+        if not live and composition.get("coverage") != "VALID":
             continue
         for machine in machines:
             if (
@@ -63,13 +108,32 @@ def decisions(bundle, previous, codes):
             ):
                 continue
             presence = zc_presence(bundle, previous, prod, composition, machine)
+            machine_key = t.key(t.MACHINES, machine)
+            if live and t.affected(t.MACHINES, bundle["cases"][t.MACHINES], machine):
+                continue
             if presence is not None:
+                presence = dict(presence)
                 result.append(presence)
+                candidates.append(
+                    (
+                        presence,
+                        (prod["origen_fenix"], machine_key),
+                        composition["root"],
+                        {
+                            "family": "CATALOGO_PRODUCCIONES",
+                            "source_id": source_id("CATALOGO_PRODUCCIONES", prod),
+                        },
+                    )
+                )
+            if composition.get("coverage") != "VALID":
+                continue
             for branch in branches:
                 if (
                     branch["origen_fenix"] != prod["origen_fenix"]
                     or branch["id_maquina_fenix"] != prod["ID_MAQUINA"]
                 ):
+                    continue
+                if live and t.affected(t.BRANCHES, bundle["cases"][t.BRANCHES], branch):
                     continue
                 for cold in composition["zf"]:
                     start = max(cold["FECHA_ON"], machine["vigente_desde"], branch["vigente_desde"])
@@ -127,7 +191,21 @@ def decisions(bundle, previous, codes):
                             d = old
                         else:
                             d.update(revision=old["revision"] + 1, previous_hash=digest(old))
+                    d = dict(d)
                     result.append(d)
+                    candidates.append(
+                        (
+                            d,
+                            (prod["origen_fenix"], machine_key, t.key(t.BRANCHES, branch)),
+                            cold,
+                            {
+                                "family": "CATALOGO_PRODUCCIONES",
+                                "source_id": source_id("CATALOGO_PRODUCCIONES", prod),
+                            },
+                        )
+                    )
+    if live:
+        live_handover(candidates, previous)
     return result
 
 

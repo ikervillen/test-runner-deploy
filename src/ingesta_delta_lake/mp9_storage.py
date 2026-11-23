@@ -11,18 +11,20 @@ from deltalake.transaction import CommitProperties
 
 from . import __version__, mp9
 from .commit_protocol import application_transaction, delta_configuration, merge_counts_match
-from .common import IntegrityError, canonical
+from .common import DependencyPending, IntegrityError, canonical
 from .delta import DeltaStore
 from .modelos import content_hash as model_hash
+from .pipeline_control import check_source_version
 
 
-def load_models(config):
+def load_models(config, *, derived=False):
     config = replace(config, family="SIP_MODELO")
     if not config.control_path.exists():
         if config.table_path.exists():
             raise IntegrityError("Falta el control del diccionario de modelos existente")
         return {}, {"contract": config.contract.name, "version": None, "hash": model_hash({})}
     with closing(sqlite3.connect(f"{config.control_path.as_uri()}?mode=ro", uri=True)) as db:
+        db.execute("BEGIN")
         settings = dict(db.execute("SELECT key,value FROM settings"))
         expected = canonical(
             {
@@ -37,10 +39,16 @@ def load_models(config):
         if db.execute(
             "SELECT COUNT(*) FROM batches WHERE state IN ('PREPARED','WRITING','UNKNOWN')"
         ).fetchone()[0]:
-            raise IntegrityError("Recuperar primero las operaciones pendientes de SIP_MODELO")
+            error = DependencyPending if derived else IntegrityError
+            raise error("Recuperar primero las operaciones pendientes de SIP_MODELO")
         version, models = DeltaStore(config, settings["control_id"]).read()
-        if settings.get("last_version", "None") != str(version):
-            raise IntegrityError("El snapshot de modelos no está confirmado por su control")
+        check_source_version(
+            config,
+            settings,
+            version,
+            "El snapshot de modelos no está confirmado por su control",
+            dependency=derived,
+        )
     return models, {
         "contract": config.contract.name,
         "version": version,

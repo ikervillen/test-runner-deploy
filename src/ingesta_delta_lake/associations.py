@@ -328,7 +328,7 @@ def normalize_decision(raw, bundle, plant, lines):
             lines[d["origin"]],
         ):
             raise ValueError("Producción incompatible o no publicada")
-        if bundle["catalog_composition"].get(p["id_produccion"], {}).get("coverage") != "VALID":
+        if not decision_coverage(bundle, p["id_produccion"], d["kind"]):
             raise ValueError("Producción en revisión")
     evidence = d.get("evidence")
     if not isinstance(evidence, list) or not evidence:
@@ -356,6 +356,13 @@ def normalize_decision(raw, bundle, plant, lines):
         if reviewed or (family == "LISTA_AR" and ar_blocked(bundle, matched)):
             raise ValueError("Evidencia de una fuente en revisión")
     return d
+
+
+def decision_coverage(bundle, production, kind):
+    coverage = bundle["catalog_composition"].get(production, {}).get("coverage")
+    return coverage == "VALID" or (
+        bundle.get("live_handover") and kind == "ZC_PRESENCE" and coverage == "PENDING_ZF"
+    )
 
 
 def decision_scope(d):
@@ -393,6 +400,41 @@ def validate_registry(registry):
                     continue
                 bad[scope] = "Solapamiento de episodios o preparación incompatible"
     return bad
+
+
+def quarantine_live_zc(registry, previous, bundle):
+    """Keep ambiguity on one physical machine from rolling back its tandem peer."""
+    if not bundle.get("live_handover"):
+        return []
+
+    _, productions = production_context(bundle)
+    groups = defaultdict(list)
+    for d in registry.values():
+        if d["kind"] == "ZC_PRESENCE" and d["end"] is None:
+            production = productions.get(d["production"])
+            if production is not None:
+                groups[(d["origin"], production["ID_MAQUINA"])].append(d)
+    issues = []
+    for (origin, machine), group in groups.items():
+        if len({d["production"] for d in group}) < 2:
+            continue
+        accepted = {d["id"]: previous[d["id"]] for d in group if d["id"] in previous}
+        for d in group:
+            identity = d["id"]
+            if identity in accepted:
+                registry[identity] = accepted[identity]
+            else:
+                del registry[identity]
+        issues.append(
+            {
+                "reason": "OVERLAP_REVIEW",
+                "scope": decision_scope(group[0]),
+                "detail": f"Más de una producción ZC abierta en {origin}, máquina física {machine}",
+                "candidates": group,
+                "accepted": accepted,
+            }
+        )
+    return issues
 
 
 def propose_registry(raw_decisions, previous, bundle, plant, lines):
@@ -441,6 +483,7 @@ def propose_registry(raw_decisions, previous, bundle, plant, lines):
                 physical = raw.get("branch", raw.get("machine"))
                 if isinstance(physical, int) and not isinstance(physical, bool):
                     bad_scopes.add(decision_scope(raw))
+    issues.extend(quarantine_live_zc(registry, previous, bundle))
     conflicts = validate_registry(registry)
     for scope, reason in conflicts.items():
         bad_scopes.add(scope)
@@ -585,7 +628,7 @@ def candidates(bundle, ar_index):
     return sorted(groups.values(), key=lambda g: (g["origen_fenix"], g["ramal"], g["model_code"]))
 
 
-def assign(bundle, registry, ar_index, review_scopes=()):
+def assign(bundle, registry, ar_index, review_scopes=(), *, frozen=None):
     reviews = getattr(ar_index, "reviews", None)
     zf = defaultdict(list)
     zc = defaultdict(list)
@@ -593,8 +636,13 @@ def assign(bundle, registry, ar_index, review_scopes=()):
         (zf if d["kind"].startswith("ZF") else zc)[decision_scope(d)[::2]].append(d)
     models, prods = production_context(bundle)
     ledger = []
+    frozen = frozen or {}
     for family in ("LISTA_DEFECTOS", "LISTA_RECH", "LISTA_AR", "CONT_ZC"):
         for row in bundle["sources"][family]:
+            identity = source_id(family, row)
+            if identity in frozen:
+                ledger.append(frozen[identity])
+                continue
             targets = []
             episode_ids = []
             reason = ""
@@ -631,8 +679,7 @@ def assign(bundle, registry, ar_index, review_scopes=()):
                     d
                     for d in items
                     if "production" not in d
-                    or bundle["catalog_composition"].get(d["production"], {}).get("coverage")
-                    == "VALID"
+                    or decision_coverage(bundle, d["production"], d["kind"])
                 ]
                 if family == "CONT_ZC":
                     candidates_zc = sorted(
@@ -720,7 +767,7 @@ def assign(bundle, registry, ar_index, review_scopes=()):
             ledger.append(
                 {
                     "family": family,
-                    "source_id": source_id(family, row),
+                    "source_id": identity,
                     "key": SOURCE_KEYS[family](row),
                     "origin": row["origen_fenix"],
                     "status": status,
@@ -734,6 +781,8 @@ def assign(bundle, registry, ar_index, review_scopes=()):
     for entry in ledger:
         if entry["family"] != "LISTA_AR" or entry["status"] != "ASSIGNED":
             continue
+        if entry["source_id"] in frozen:
+            continue
         row = ar_rows[entry["source_id"]]
         exception = ar_end_overrun(bundle, row, entry["productions"][0])
         if exception is not None:
@@ -741,7 +790,7 @@ def assign(bundle, registry, ar_index, review_scopes=()):
     if bundle.get("topology_enabled"):
         from .ar_attribution import resolve
 
-        resolve(bundle, ledger, lambda row: ar_productions(bundle, row))
+        resolve(bundle, ledger, lambda row: ar_productions(bundle, row), frozen=frozen)
     return ledger
 
 

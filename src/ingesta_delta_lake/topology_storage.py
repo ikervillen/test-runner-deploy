@@ -13,9 +13,10 @@ from deltalake.transaction import CommitProperties
 from . import __version__
 from . import topology as t
 from .commit_protocol import application_transaction, delta_configuration, merge_counts_match
-from .common import IntegrityError, canonical, digest, now
+from .common import DependencyPending, IntegrityError, canonical, digest, now
 from .control import Control
 from .delta import DeltaStore
+from .pipeline_control import check_source_version
 
 
 class TopologyControl(Control):
@@ -220,7 +221,7 @@ class TopologyStore(DeltaStore):
                 raise IntegrityError("MERGE de topología distinto de lo preparado")
 
 
-def snapshot(config, family):
+def snapshot(config, family, *, derived=False):
     cfg = replace(config, family=family)
     if not cfg.control_path.exists():
         if cfg.table_path.exists():
@@ -245,10 +246,12 @@ def snapshot(config, family):
         if db.execute(
             "SELECT COUNT(*) FROM batches WHERE state IN ('PREPARED','WRITING','UNKNOWN')"
         ).fetchone()[0]:
-            raise IntegrityError("Recuperar topología antes de consumir")
+            error = DependencyPending if derived else IntegrityError
+            raise error("Recuperar topología antes de consumir")
         version, rows = TopologyStore(cfg, settings["control_id"]).read()
-        if settings.get("last_version", "None") != str(version):
-            raise IntegrityError("Topología sin confirmación")
+        check_source_version(
+            cfg, settings, version, "Topología sin confirmación", dependency=derived
+        )
         cases = [
             {"issue_id": r[0], "reason": r[1], "status": r[2], "payload": json.loads(r[3])}
             for r in db.execute(

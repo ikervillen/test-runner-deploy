@@ -1,8 +1,34 @@
 """Shared accepted-control projection, exported only by its owning writer."""
 
 import json
+import sqlite3
+from contextlib import closing
 
-from .common import IntegrityError, digest
+from .common import DependencyPending, IntegrityError, digest
+
+
+def check_source_version(cfg, settings, version, message, *, dependency=True):
+    pinned = settings.get("last_version", "None")
+    if pinned == str(version):
+        return
+    # A commit can appear in Delta after the SQLite reader acquired its snapshot.
+    # Only classify it as transient if the same owner can explain the advance.
+    if dependency and version is not None and (pinned == "None" or version > int(pinned)):
+        with closing(sqlite3.connect(cfg.control_path.as_uri() + "?mode=ro", uri=True)) as db:
+            db.execute("BEGIN")
+            current = dict(
+                db.execute(
+                    "SELECT key,value FROM settings WHERE key IN ('last_version','control_id')"
+                )
+            )
+            if current.get("control_id") == settings.get("control_id") and (
+                current.get("last_version") == str(version)
+                or db.execute(
+                    "SELECT 1 FROM batches WHERE state IN ('PREPARED','WRITING','UNKNOWN') LIMIT 1"
+                ).fetchone()
+            ):
+                raise DependencyPending(f"{cfg.family} avanzó durante la lectura de su control")
+    raise IntegrityError(message)
 
 
 def confirmed_control(cfg, db, settings, version, *, expected=None, allow_empty=False):
@@ -40,7 +66,9 @@ def confirmed_control(cfg, db, settings, version, *, expected=None, allow_empty=
             (pinned,) if pinned else (),
         ).fetchone()
         if publication is None:
-            raise IntegrityError("Construir el catálogo antes de asociar")
+            if pinned or version is not None:
+                raise IntegrityError("Falta la publicación confirmada del catálogo")
+            raise DependencyPending("Construir el catálogo antes de asociar")
         meta["publication_id"] = publication[0]
         extra = {
             "manifest": json.loads(publication[1]),

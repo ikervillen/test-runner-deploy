@@ -17,7 +17,7 @@ from .association_storage import (
     source_snapshot,
     verify_artifacts,
 )
-from .common import ConfigurationError, IntegrityError, canonical, digest
+from .common import ConfigurationError, DependencyPending, IntegrityError, canonical, digest
 from .service import _apply
 
 PUBLICATION_POLICY = "streamed-publication-v5"
@@ -48,6 +48,18 @@ def _can_resolve(payload, registry, current_ids):
     else:
         variants = payload["candidates"]
         old = payload["accepted"]
+        scope = tuple(payload["scope"])
+        accepted = {
+            identity: row for identity, row in registry.items() if a.decision_scope(row) == scope
+        }
+        # The incoming proposal can be accepted verbatim once the outgoing interval changes.
+        if scope not in a.validate_registry(accepted) and all(
+            (identity := a.decision_identity(candidate)) in current_ids
+            and identity in accepted
+            and accepted[identity]["revision"] >= candidate["revision"]
+            for candidate in variants
+        ):
+            return True
     changed = [c for c in variants if old.get(a.decision_identity(c)) != c]
     if not changed:
         return False
@@ -98,6 +110,35 @@ def process(config, control, attempt):
     return result
 
 
+def _frozen_observations(config, control, bundle, floor):
+    existing = control.latest("full")
+    prior = {}
+    if existing:
+        publication = json.loads(existing["payload_json"])
+        prior = {
+            r["source_id"]: r for r in read_artifact(config, publication["artifacts"]["ledger"])
+        }
+    frozen = {}
+    for family in ("LISTA_DEFECTOS", "LISTA_RECH", "LISTA_AR", "CONT_ZC"):
+        for row in bundle["sources"][family]:
+            end = row["FECHA_OFF"] if family == "LISTA_AR" else row["FECHA"]
+            if end is None or end > floor:
+                continue
+            identity = a.source_id(family, row)
+            frozen[identity] = prior.get(identity) or {
+                "family": family,
+                "source_id": identity,
+                "key": a.SOURCE_KEYS[family](row),
+                "origin": row["origen_fenix"],
+                "status": "PENDING_ASSOCIATION",
+                "productions": [],
+                "episode_ids": [],
+                "reason": "Observación anterior al inicio de la nueva política Live",
+                "rule": a.RULE,
+            }
+    return frozen
+
+
 def _process(config, control, attempt, *, physical=False):
     store = AssociationStore(config, control.control_id)
     recovered = []
@@ -119,12 +160,20 @@ def _process(config, control, attempt, *, physical=False):
     current_publication = control.latest()
     current_pub = json.loads(current_publication["payload_json"]) if current_publication else None
     doc = decisions(config)
+    live = config.pipeline_lane == "live" and config.topology_enabled
+    floor = control.setting("live_handover_from") if live else None
+    if live and floor is None:
+        if config.processing_window:
+            floor = config.processing_window[0]
+        elif not physical and config.runtime_root is not None:
+            raise DependencyPending("Esperando el primer corte Live para publicar atribuciones")
     lines = dict(config.line_by_origin)
     fingerprint = {
         "contract": a.CONTRACT,
         "scope": scope,
         "rule": a.RULE,
         "policy": PUBLICATION_POLICY,
+        **({"live_handover": "mp9_topology_v1", "live_handover_from": floor} if live else {}),
         "ar_interpretation_rules": a.ar_interpretation_rules(),
         "transformer_version": __version__,
         "timestamp_policy": config.timestamp_policy,
@@ -180,7 +229,12 @@ def _process(config, control, attempt, *, physical=False):
         )
     bundle = load_bundle(config, physical=physical, manifest=fingerprint["manifest"])
     if fingerprint["manifest"] != bundle["manifest"]:
-        raise IntegrityError("Las fuentes cambiaron durante la preparación de asociaciones")
+        raise DependencyPending("Las fuentes cambiaron durante la preparación de asociaciones")
+    if live:
+        bundle["live_handover"] = True
+        if floor is not None and control.setting("live_handover_from") is None:
+            with control.db:
+                control.db.execute("INSERT INTO settings VALUES('live_handover_from',?)", (floor,))
     effective = list(doc["decisions"])
     if physical:
         effective = [
@@ -193,7 +247,10 @@ def _process(config, control, attempt, *, physical=False):
         ]
     if config.topology_enabled:
         automatic = physical_assignments.decisions(
-            bundle, old_registry, dict(config.line_code_by_origin)
+            bundle,
+            old_registry,
+            dict(config.line_code_by_origin),
+            live=config.pipeline_lane == "live",
         )
         manual_ids = {a.decision_identity(d) for d in effective}
         effective = [d for d in automatic if d["id"] not in manual_ids] + effective
@@ -213,7 +270,8 @@ def _process(config, control, attempt, *, physical=False):
         for p in [*prior_cases, *issues]
         if not _can_resolve(p, registry, current_ids)
     } - {None}
-    ledger = a.assign(bundle, registry, index, review_scopes)
+    frozen = _frozen_observations(config, control, bundle, floor) if floor and not physical else {}
+    ledger = a.assign(bundle, registry, index, review_scopes, frozen=frozen)
     counts = a.diagnostics(ledger)
     bundle.update(
         registry=registry,
@@ -272,7 +330,7 @@ def _process(config, control, attempt, *, physical=False):
         "pending_rows": pending,
         "open_reviews": len(remaining),
         "changes": changes,
-        "recomputed_source_rows": len(ledger),
+        "recomputed_source_rows": len(ledger) - len(frozen),
         "rule": a.RULE,
         "registry": registry,
         "registry_hash": digest(registry),
@@ -319,6 +377,7 @@ def _process(config, control, attempt, *, physical=False):
         "open_reviews": len(remaining),
         "publication_scope": scope,
         "observation_status": publication["observation_status"],
+        "recomputed_source_rows": publication["recomputed_source_rows"],
         "source_manifest": bundle["manifest"],
     }
 

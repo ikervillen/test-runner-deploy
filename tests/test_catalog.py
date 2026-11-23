@@ -456,3 +456,25 @@ def test_prepared_source_hash_mismatch_blocks_recovery(config, source, monkeypat
     with pytest.raises(IntegrityError, match="snapshot"):
         run(config)
     assert not config.table_path.exists()
+
+
+def test_missing_model_is_local_until_dictionary_is_available(config, source, monkeypatch):
+    from ingesta_delta_lake import catalog_service
+
+    with source.open("a", encoding="utf-8") as stream:
+        stream.write(line(3, model=800, on="02/10/2026 06:00:00"))
+        stream.write(line(4, model=800, on="02/10/2026 07:00:00", zone=2, rel=3))
+    run(replace(config, family="MP9_CAMBIO_MODELO"))
+    real_load = catalog_service.load_sources
+
+    def missing_model(*args, **kwargs):
+        models, records, manifest, cases = real_load(*args, **kwargs)
+        return {k: v for k, v in models.items() if k != 800}, records, manifest, cases
+
+    with monkeypatch.context() as patch:
+        patch.setattr(catalog_service, "load_sources", missing_model)
+        result = run(replace(config, pipeline_lane="live"))
+    assert result["status"] == "PARTIAL"
+    assert set(rows(config)) == {catalog.production_id(config.plant, "AV21", 1)}
+    assert run(replace(config, pipeline_lane="live"))["status"] == "APPLIED"
+    assert len(rows(config)) == 2

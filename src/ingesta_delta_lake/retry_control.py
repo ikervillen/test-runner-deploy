@@ -13,11 +13,27 @@ LEGACY_DEPENDENCIES = {
 }
 
 
+# Revalidate pre-existing Live pauses once after the dependency and handover policy changes.
+# An integrity failure under this policy remains paused with its original error recorded.
+LIVE_DERIVED_POLICY = "live-production-continuity-v1"
+
+
+def live_derived(config):
+    return config.pipeline_lane == "live" and config.family in LEGACY_DEPENDENCIES
+
+
 def ready(control):
     value = json.loads(control.setting("retry_state") or "null")
     if not value:
         return None
     family = control.config.family
+    if (
+        value["paused"]
+        and value["error_type"] == "IntegrityError"
+        and live_derived(control.config)
+        and control.setting("retry_revalidation_policy") != LIVE_DERIVED_POLICY
+    ):
+        return None
     if (
         value["paused"]
         and value["error_type"] == "IntegrityError"
@@ -61,6 +77,12 @@ def failed(control, error):
         "updated_at": now(),
     }
     with control.db:
+        if live_derived(control.config):
+            control.db.execute(
+                "INSERT INTO settings VALUES('retry_revalidation_policy',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (LIVE_DERIVED_POLICY,),
+            )
         control.db.execute(
             "INSERT INTO settings VALUES('retry_state',?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

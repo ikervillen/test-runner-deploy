@@ -52,7 +52,9 @@ PHYSICAL_SOURCES = frozenset(
 def source_snapshot(config, family, read=True, *, expected=None):
     cfg = replace(config, family=family)
     if not cfg.control_path.exists():
-        raise IntegrityError(f"Falta fuente aceptada {family}")
+        if cfg.table_path.exists():
+            raise IntegrityError(f"Falta control para la fuente existente {family}")
+        raise DependencyPending(f"Esperando la primera confirmación de {family}")
     with closing(sqlite3.connect(cfg.control_path.as_uri() + "?mode=ro", uri=True)) as db:
         db.execute("BEGIN")
         settings = dict(db.execute("SELECT key,value FROM settings"))
@@ -69,23 +71,24 @@ def source_snapshot(config, family, read=True, *, expected=None):
         if db.execute(
             "SELECT COUNT(*) FROM batches WHERE state IN ('PREPARED','WRITING','UNKNOWN')"
         ).fetchone()[0]:
-            raise IntegrityError(f"Recuperar primero {family}")
+            raise DependencyPending(f"Recuperar primero {family}")
         store = STORES[family](cfg, settings["control_id"])
         table = store.table()
         version = table.version() if table is not None else None
-        if settings.get("last_version", "None") != str(version):
-            raise IntegrityError("Fuente sin confirmación")
-        from .pipeline_control import confirmed_control
+        from .pipeline_control import check_source_version, confirmed_control
 
+        check_source_version(cfg, settings, version, "Fuente sin confirmación")
         cases, meta, extra = confirmed_control(cfg, db, settings, version, expected=expected)
         if expected is not None:
-            if expected["control_id"] != settings["control_id"] or expected[
-                "quality_hash"
-            ] != digest(cases):
-                raise IntegrityError("Cambió el control o la revisión del snapshot fijado")
+            if expected["control_id"] != settings["control_id"]:
+                raise IntegrityError("Cambió el control del snapshot fijado")
+            if expected["quality_hash"] != digest(cases):
+                raise DependencyPending(f"Cambió la revisión del snapshot de {family}")
             fixed = expected["version"]
             if fixed != version:
-                if fixed is None or version is None or fixed > version:
+                if fixed is None and version is not None:
+                    raise DependencyPending(f"Se confirmó la primera versión de {family}")
+                if version is None or fixed > version:
                     raise IntegrityError("Versión fijada no confirmada")
                 if not db.execute(
                     "SELECT 1 FROM batches WHERE delta_version=? "
@@ -150,7 +153,7 @@ def load_bundle(config, *, physical=False, manifest=None):
     if extra["diagnostics"].get("topology_enabled", False) != config.topology_enabled or extra[
         "diagnostics"
     ].get("line_codes", {}) != dict(config.line_code_by_origin):
-        raise IntegrityError("Actualizar catálogo: cambió la política de topología")
+        raise DependencyPending("Actualizar catálogo: cambió la política de topología")
     if cases["SIP_MODELO"]:
         for obs in extra["composition"].values():
             obs["coverage"] = "REVIEW"

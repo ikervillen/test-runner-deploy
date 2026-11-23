@@ -63,3 +63,29 @@ def test_retry_wait_is_not_a_new_attempt_and_expiry_allows_retry(config, source,
         assert control.db.execute("SELECT count(*) FROM attempts").fetchone()[0] == count
         monkeypatch.setattr(retry_control.time, "time", lambda: waiting["next_input_scan_at"] + 1)
         assert retry_control.ready(control) is None
+
+
+def test_live_derived_pause_is_revalidated_once_without_resetting_the_failure(config):
+    from ingesta_delta_lake.association_storage import AssociationControl
+
+    for family, factory in (
+        ("CATALOGO_PRODUCCIONES", CatalogControl),
+        ("ASIGNACION_PRODUCCION_RAMAL", AssociationControl),
+    ):
+        old = replace(config, family=family)
+        old.control_root.mkdir(parents=True, exist_ok=True)
+        with closing(factory(old)) as control:
+            attempt = control.start_attempt()
+            error = IntegrityError("legacy dependency race")
+            retry_control.failed(control, error)
+            control.finish_attempt(attempt, {"status": "FAILED", "error": str(error)})
+            assert retry_control.ready(control)["status"] == "PAUSED_RETRY_EXHAUSTED"
+
+        live = replace(old, pipeline_lane="live")
+        with closing(factory(live)) as control:
+            assert retry_control.ready(control) is None
+            assert control.db.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 1
+            retry_control.failed(control, IntegrityError("control mismatch"))
+            assert retry_control.ready(control)["status"] == "PAUSED_RETRY_EXHAUSTED"
+            retry_control.failed(control, DependencyPending("source publishing"))
+            assert retry_control.ready(control) is None

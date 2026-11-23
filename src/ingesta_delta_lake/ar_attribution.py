@@ -13,7 +13,7 @@ from . import lista_ar
 EVENT_FIELDS = tuple(f for f in lista_ar.KEY_FIELDS if f not in {"FECHA_ON", "STATUS"})
 
 
-def resolve(bundle, ledger, candidates):
+def resolve(bundle, ledger, candidates, *, frozen=()):
     from .associations import source_id
 
     ar_entries = {r["source_id"]: r for r in ledger if r["family"] == "LISTA_AR"}
@@ -22,7 +22,11 @@ def resolve(bundle, ledger, candidates):
     for row in bundle["sources"]["LISTA_AR"]:
         identity = source_id("LISTA_AR", row)
         entry = ar_entries[identity]
-        if entry["status"] not in {"ASSIGNED", "AMBIGUOUS_PRODUCTION"} or row["FECHA_OFF"] is None:
+        if (
+            identity in frozen
+            or entry["status"] not in {"ASSIGNED", "AMBIGUOUS_PRODUCTION"}
+            or row["FECHA_OFF"] is None
+        ):
             continue
         context = (row["origen_fenix"], row["MOLDE"], row["CAVIDAD"])
         if row["MOLDE"] <= 0 or row["CAVIDAD"] in (None, "99Z"):

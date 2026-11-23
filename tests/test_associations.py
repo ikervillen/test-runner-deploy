@@ -13,7 +13,7 @@ from ingesta_delta_lake.association_storage import (
     load_bundle,
     read_artifact,
 )
-from ingesta_delta_lake.common import IngestaError, IntegrityError, digest
+from ingesta_delta_lake.common import DependencyPending, IngestaError, IntegrityError, digest
 from ingesta_delta_lake.service import run
 
 
@@ -111,6 +111,19 @@ def test_confirmed_snapshot_remains_readable_after_new_source_commit(config, fou
     fixed, _, actual, _ = source_snapshot(config, "LISTA_RECH", expected=descriptor)
     assert fixed == before and actual == descriptor
     assert len(source_snapshot(config, "LISTA_RECH")[0]) == len(before) + 1
+    from ingesta_delta_lake.pipeline_control import check_source_version
+
+    source_cfg = replace(config, family="LISTA_RECH")
+    stale_settings = {
+        "control_id": descriptor["control_id"],
+        "last_version": str(descriptor["version"]),
+    }
+    version = descriptor["version"] + 1
+    with pytest.raises(DependencyPending, match="avanzó"):
+        check_source_version(source_cfg, stale_settings, version, "unconfirmed")
+    with pytest.raises(IntegrityError, match="unconfirmed") as failure:
+        check_source_version(source_cfg, stale_settings, version + 1, "unconfirmed")
+    assert not isinstance(failure.value, DependencyPending)
     with pytest.raises(IntegrityError, match="control"):
         source_snapshot(config, "LISTA_RECH", expected={**descriptor, "control_id": "another"})
 
@@ -773,3 +786,14 @@ def test_cli_build_inspect_and_direct_ingest_guard(config, foundation, monkeypat
         cli.main(["associations", "inspect", "--config", "test.toml", "--production", pid(10)]) == 2
     )
     assert json.loads(capsys.readouterr().out)["selection"]["productions"] == [pid(10)]
+
+
+def test_quality_revision_race_is_pending_but_control_replacement_is_an_error(config, foundation):
+    from ingesta_delta_lake.association_storage import source_snapshot
+
+    _, _, pin, _ = source_snapshot(config, "LISTA_RECH")
+    with pytest.raises(DependencyPending, match="revisión"):
+        source_snapshot(config, "LISTA_RECH", expected={**pin, "quality_hash": "old"})
+    with pytest.raises(IntegrityError, match="control") as failure:
+        source_snapshot(config, "LISTA_RECH", expected={**pin, "control_id": "other"})
+    assert not isinstance(failure.value, DependencyPending)
