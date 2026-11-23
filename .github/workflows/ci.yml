@@ -13,15 +13,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check out the confirmed native Fenix contracts
+        uses: actions/checkout@v4
+        with:
+          ref: f769fc7a02d315b9ef7c7f4e90766e77d32b9c42
+          path: .fenix-contracts
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v5
         with:
           version: "0.11.6"
-      - run: uv sync --locked --dev --extra gold --python 3.11
+      - run: uv sync --locked --dev --extra gold --python 3.12
       - run: uv run ruff check backend orchestration
       - run: uv run ruff format --check backend orchestration
       # Scope and strictness live in [tool.mypy] (pyproject.toml); no path overrides here.
       - run: uv run mypy
-      - run: uv run --extra gold pytest backend/tests -q --junitxml=test-results.xml --cov-report=xml
+      - run: >
+          uv run --locked --python 3.12 --extra gold --with-editable ./.fenix-contracts
+          pytest backend/tests -q --junitxml=test-results.xml --cov-report=xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:
