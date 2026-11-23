@@ -136,3 +136,30 @@ def test_silver_cdf_applies_correction_and_new_row(tmp_path):
     table.delete()
     with pytest.raises(FullReadRequired):
         materialize(snapshot, previous, {}, family, ref(), schema.names, budget=10)
+
+
+def test_large_manifest_reopens_and_republishes_without_moving_an_invalid_pointer(
+    tmp_path, monkeypatch
+):
+    from app.gold import evidence
+    from app.gold.common import IntegrityError, read_json
+    from app.gold.publications import independent_dependencies
+
+    root = tmp_path / "inputs"
+    published = tmp_path / "published"
+    document = {"lane": "live", "metadata": "x" * 4_001_060}
+    snapshot = save(root, document, {})
+    path = root / f"{snapshot.publication_id}.json"
+
+    with pytest.raises(IntegrityError, match="JSON metadata budget exceeded"):
+        read_json(path)
+    assert Evidence.open(root).publication_id == snapshot.publication_id
+    assert save(root, document, {}).publication_id == snapshot.publication_id
+    for _ in range(2):
+        dependencies = independent_dependencies(published, snapshot)
+        assert dependencies[0]["evidence_id"] == snapshot.publication_id
+
+    monkeypatch.setattr(evidence, "MAX_MANIFEST_BYTES", path.stat().st_size)
+    with pytest.raises(IntegrityError, match="Gold input manifest exceeds"):
+        save(root, {**document, "extra": True}, {})
+    assert Evidence.open(root).publication_id == snapshot.publication_id

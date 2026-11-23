@@ -1227,7 +1227,7 @@ def independent_dependencies(root, snapshot, *, telemetry=None):
         or snapshot.document.get("schema_id") != "quality-independent-input-v1"
     ):
         return []
-    from .evidence import SCHEMA, Evidence, evidence_files
+    from .evidence import MAX_MANIFEST_BYTES, SCHEMA, Evidence, evidence_files
     from .evidence_storage import publish_reference
 
     target = root / "evidence"
@@ -1256,7 +1256,11 @@ def independent_dependencies(root, snapshot, *, telemetry=None):
                 telemetry["new_physical_bytes"] = (
                     None if size is None else telemetry["new_physical_bytes"] + size
                 )
-    immutable_json(target / f"{snapshot.publication_id}.json", snapshot.document)
+    immutable_json(
+        target / f"{snapshot.publication_id}.json",
+        snapshot.document,
+        max_bytes=MAX_MANIFEST_BYTES,
+    )
     copied = Evidence.open(target, snapshot.publication_id)
     if copied.document["schema_id"] != SCHEMA:
         raise IntegrityError("Gold copied evidence schema differs")

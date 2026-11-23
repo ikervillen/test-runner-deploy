@@ -87,9 +87,9 @@ def atomic_json(path: Path, value: dict) -> None:
         raise
 
 
-def immutable_json(path: Path, value: dict) -> None:
+def immutable_json(path: Path, value: dict, *, max_bytes: int = 4_000_000) -> None:
     if path.exists():
-        if read_json(path) != json.loads(canonical(value)):
+        if read_json(path, max_bytes=max_bytes) != json.loads(canonical(value)):
             raise IntegrityError("An immutable artifact already has different contents")
         return
     atomic_json(path, value)

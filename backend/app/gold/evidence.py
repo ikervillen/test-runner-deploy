@@ -11,10 +11,19 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from .common import IntegrityError, atomic_json, canonical, digest, read_json, within
+from .common import (
+    IntegrityError,
+    atomic_json,
+    canonical,
+    digest,
+    immutable_json,
+    read_json,
+    within,
+)
 from .producer import assignment_tables
 
 SCHEMA = "quality-independent-input-v1"
+MAX_MANIFEST_BYTES = 16_000_000
 
 
 OPERATIONS = {"LISTA_DEFECTOS", "LISTA_RECH", "CONT_ZC", "LISTA_AR"}
@@ -142,12 +151,15 @@ def save(root, document, tables, *, window_seconds=None, reuse=None):
             ref = {"parts": descriptors, "rows": table.num_rows}
         refs.append({"name": name, **ref})
     payload = {**document, "schema_id": SCHEMA, "tables": refs}
-    identity = digest(payload)
-    from .common import immutable_json
-
-    immutable_json(root / f"{identity}.json", payload)
+    payload_bytes = canonical(payload)
+    if len(payload_bytes) > MAX_MANIFEST_BYTES:
+        raise IntegrityError("Gold input manifest exceeds its metadata budget")
+    identity = hashlib.sha256(payload_bytes).hexdigest()
+    path = root / f"{identity}.json"
+    immutable_json(path, payload, max_bytes=MAX_MANIFEST_BYTES)
+    evidence = Evidence.open(root, identity)
     atomic_json(root / "current.json", {"publication_id": identity})
-    return Evidence.open(root, identity)
+    return evidence
 
 
 class Evidence:
@@ -173,7 +185,7 @@ class Evidence:
             or any(c not in "0123456789abcdef" for c in identity)
         ):
             raise IntegrityError("Invalid Gold evidence identifier")
-        document = read_json(root / f"{identity}.json")
+        document = read_json(root / f"{identity}.json", max_bytes=MAX_MANIFEST_BYTES)
         if document.get("schema_id") != SCHEMA or digest(document) != identity:
             raise IntegrityError("Gold evidence hash differs")
         return cls(root, identity, document)
