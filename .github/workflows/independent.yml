@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  GOLD_CONTEXT_COMMIT: 3daeab62a7ced8ef53c78d6f7bc70029bd8ca289
+  GOLD_CONTEXT_COMMIT: 25cbb7e95ffb25ce5ca2c13d1c4ae8402cd3468f
   GOLD_SOURCE_COMMIT: ad88dc3d0bdedfbc4da3de06da74e3801b9b64f7
 
 jobs:
@@ -140,7 +140,7 @@ jobs:
       - name: Prepare the approved Gold worker update
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == 'd0b83d2f1ff3e56ab9dd35128960e7914dc82622' && github.event.head_commit.message == 'Deploy Gold Live manifest recovery' && github.run_attempt == '1'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '96cfe941024425a088d0ce909d89b40dca37700f' && github.event.head_commit.message == 'Deploy Gold Live score timing' && github.run_attempt == '1'
         run: |
           set -euo pipefail
           mkdir -p bundle
