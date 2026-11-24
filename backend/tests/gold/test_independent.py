@@ -958,6 +958,7 @@ def test_fragment_cdf_gold_matches_reference_for_same_silver_cut(tmp_path, nativ
     )
     previous = Evidence.open(input_root)
     native_snapshot = type("Source", (), {"table": lambda self, _: delta})()
+    native_snapshot.manifest = {"publication_id": "scope-proof", "tables": {family: ref(1)}}
     started = perf_counter()
     reference_rows, proofs, n = materialize(
         native_snapshot, previous, original_proofs, family, ref(1), schema.names, budget=1000
@@ -1040,8 +1041,41 @@ def test_fragment_cdf_gold_matches_reference_for_same_silver_cut(tmp_path, nativ
         name = ref_row["name"]
         assert sorted(map(canonical, left.rows(name))) == sorted(map(canonical, right.rows(name)))
 
+    from app.gold import scoped_reconciliation
 
-def test_live_export_can_carry_more_logical_rows_than_its_work_budget(independent, native):
+    rebuilt, rebuilt_lineage, metrics = scoped_reconciliation.run(
+        tmp_path / "reconcile",
+        previous,
+        native_snapshot,
+        family,
+        schema,
+        origins=tuple({r["origen_fenix"] for r in reference_rows}),
+        seconds=600,
+        budget=64,
+        batch_size=8,
+    )
+    recovered = save(
+        input_root,
+        {**published_doc, "lineages": {k: p for k, p in original_proofs.items() if k != family}},
+        candidate_tables,
+        window_seconds=600,
+        fact_refs=[rebuilt],
+        lineage_refs=rebuilt_lineage,
+    )
+    assert metrics["peak_rows"] <= 64 < rebuilt["rows"]
+    assert recovered.proofs(max_rows=100000) == baseline.proofs(max_rows=100000)
+    reconciled = output(recovered, tmp_path / "reconciled")
+    assert len(reconciled.manifest["tables"]) == 36
+    for ref_row in left.manifest["tables"]:
+        name = ref_row["name"]
+        assert sorted(map(canonical, left.rows(name))) == sorted(
+            map(canonical, reconciled.rows(name))
+        )
+
+
+def test_live_export_can_carry_more_logical_rows_than_its_work_budget(
+    independent, native, monkeypatch
+):
     from dataclasses import replace
     from datetime import datetime, timedelta
     from time import perf_counter
@@ -1106,3 +1140,24 @@ def test_live_export_can_carry_more_logical_rows_than_its_work_budget(independen
         == 300
     )
     assert export(small, "live", cfg).publication_id == updated.publication_id
+
+    from app.gold import fragment_delta
+    from app.gold.silver_incremental import FullReadRequired
+
+    actual_update = fragment_delta.update
+
+    def missing_cdf(snapshot, previous, family, *args, **kwargs):
+        if family == "CONT_ZC":
+            raise FullReadRequired
+        return actual_update(snapshot, previous, family, *args, **kwargs)
+
+    source.write_text(inputs([start + timedelta(minutes=3010)]))
+    publish()
+    monkeypatch.setattr(fragment_delta, "update", missing_cdf)
+    recovered = export(small, "live", cfg)
+    assert recovered.table("CONT_ZC", max_rows=1000).num_rows == 302
+    stats = recovered.document["silver_read"]
+    assert stats["reconciliation"]["CONT_ZC"]["peak_rows"] <= small.policy.read_max_rows
+    assert stats["full_read_families"] == []
+    assert len(recovered.proofs(max_rows=1000)["CONT_ZC"]) == 302
+    assert export(small, "live", cfg).publication_id == recovered.publication_id

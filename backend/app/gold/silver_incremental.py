@@ -44,6 +44,8 @@ def read_changes(snapshot, family, before, after, columns, budget, *, locate=Non
         ):
             count += batch.num_rows
             if count > budget:
+                if locate is not None:
+                    raise FullReadRequired
                 raise IntegrityError("Live Silver changes exceed their explicit row budget")
             for event in batch.to_pylist():
                 kind = event["_change_type"]

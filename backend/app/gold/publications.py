@@ -1238,7 +1238,12 @@ def independent_dependencies(root, snapshot, *, telemetry=None):
     seen = set()
     if telemetry is not None:
         telemetry.update(
-            new_links=0, existing_links=0, new_copies=0, existing_copies=0, new_physical_bytes=0
+            new_links=0,
+            existing_links=0,
+            new_copies=0,
+            existing_copies=0,
+            new_physical_bytes=0,
+            accredited_subtrees=0,
         )
 
     def copy(item):
@@ -1272,6 +1277,8 @@ def independent_dependencies(root, snapshot, *, telemetry=None):
             if read_json(marker) != ref:
                 raise IntegrityError("Gold fragment accreditation differs")
             checked_file(target, ref)
+            if telemetry is not None:
+                telemetry["accredited_subtrees"] += 1
             return
         page = snapshot.index.page(ref)
         for child in page.get("children", {}).values():
