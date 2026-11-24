@@ -17,6 +17,18 @@ const details: Record<string, string> = {
   zc_score_details: "Rendimiento ZC",
 };
 
+// Mesa de control: columns and order of the approved hourly table.
+const components = [
+  ["MIA", "MIA", "mia_score_details"],
+  ["Critico", "Crít.", "aql_score_details"],
+  ["Grave", "Grav.", "aql_score_details"],
+  ["Mayor", "May.", "aql_score_details"],
+  ["Menor", "Men.", "aql_score_details"],
+  ["Leve", "Lev.", "aql_score_details"],
+  ["DAR", "DAR", "dar_score_details"],
+  ["ZC", "ZC", "zc_score_details"],
+] as const;
+
 const number = new Intl.NumberFormat("es-ES", { maximumFractionDigits: 4 });
 const stamp = (value: string) => value.slice(11, 16);
 const positions = [
@@ -164,6 +176,7 @@ export function LiveView() {
   const [chosen, setChosen] = useState<{
     row: LiveResult;
     publication: string;
+    component?: string;
   } | null>(null);
   const [detail, setDetail] = useState<Record<
     string,
@@ -178,6 +191,16 @@ export function LiveView() {
         const data = await api.getLiveScores(controller.signal);
         if (!controller.signal.aborted) {
           setView(data);
+          setChosen((current) => {
+            if (!current || current.publication === data.publication_id)
+              return current;
+            const row = data.hours
+              .flatMap((hour) => hour.results)
+              .find((row) => row.result_id === current.row.result_id);
+            return row
+              ? { ...current, row, publication: data.publication_id }
+              : null;
+          });
           setError(false);
         }
       } catch {
@@ -257,18 +280,19 @@ export function LiveView() {
                   (row) => row.line === line && row.machine === machine,
                 ),
           );
-          const last =
-            rows
-              .slice()
-              .reverse()
-              .find((entries) => entries.length > 0) ?? [];
-          const headline =
-            last.length === 1 && last[0].total_penalty !== null
-              ? last[0]
-              : null;
-          const select = (row: LiveResult) => {
+          const headline = rows
+            .slice()
+            .reverse()
+            .flatMap((entries) =>
+              entries
+                .filter((row) => row.total_penalty !== null)
+                .sort((a, b) =>
+                  (b.cutoff ?? b.start).localeCompare(a.cutoff ?? a.start),
+                ),
+            )[0];
+          const select = (row: LiveResult, component?: string) => {
             if (row.result_id)
-              setChosen({ row, publication: view.publication_id });
+              setChosen({ row, publication: view.publication_id, component });
           };
           return (
             <section
@@ -291,9 +315,16 @@ export function LiveView() {
                     Penalización total publicada:{" "}
                   </span>
                   {headline ? number.format(headline.total_penalty!) : "—"}
+                  {headline && (
+                    <span className="sr-only">
+                      {" "}
+                      · {classification(headline)[0]} ·{" "}
+                      {stamp(headline.cutoff ?? headline.start)}
+                    </span>
+                  )}
                 </p>
               </div>
-              <div className="grid items-start gap-4 lg:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)_minmax(0,1.1fr)]">
+              <div className="grid items-start gap-4 lg:grid-cols-[minmax(0,1.6fr)_minmax(0,0.76fr)_minmax(408px,1.1fr)]">
                 <div>
                   <h3 className="text-sm font-medium">Evolución por turnos</h3>
                   <div className="mt-2 grid h-[206px] place-items-center border border-[#dce4e0] bg-[#f7f9f8] px-3 text-center text-sm text-[#53645d]">
@@ -315,67 +346,125 @@ export function LiveView() {
                   />
                 </div>
                 <div className="overflow-x-auto">
-                  <table className="w-full text-left text-sm tabular-nums">
+                  <table className="w-full min-w-[408px] text-left text-sm tabular-nums">
                     <caption className="sr-only">
                       Desglose horario de {label}
                     </caption>
                     <thead>
                       <tr className="text-[#53645d]">
-                        <th scope="col">Hora</th>
-                        <th scope="col">Clasificación</th>
-                        <th scope="col" className="text-right">
+                        <th scope="col" className="px-1 text-xs font-medium">
+                          Hora
+                        </th>
+                        {components.map(([code, title]) => (
+                          <th
+                            key={code}
+                            scope="col"
+                            className="px-1 text-right text-xs font-medium"
+                          >
+                            {title}
+                          </th>
+                        ))}
+                        <th
+                          scope="col"
+                          className="border-l border-[#dce4e0] px-1 text-right text-xs font-medium"
+                        >
                           Total
                         </th>
                       </tr>
                     </thead>
                     <tbody>
-                      {view.hours.map((hour, i) =>
-                        rows[i].length ? (
-                          rows[i].map((row) => {
+                      {view.hours.map((hour, i) => {
+                        const entries = rows[i];
+                        if (!entries.length)
+                          return (
+                            <tr
+                              key={hour.start}
+                              className={`h-[26px] border-t border-[#dce4e0] ${hour.state === "open" ? "bg-[#eaf2f6]" : ""}`}
+                            >
+                              <th
+                                scope="row"
+                                className="px-1 font-normal"
+                                title={hour.start}
+                              >
+                                {stamp(hour.end)}
+                                <span className="block text-[11px] leading-tight text-[#53645d]">
+                                  {labels[hour.state] ?? "Sin producción"}
+                                </span>
+                              </th>
+                              {components.map(([code]) => (
+                                <td
+                                  key={code}
+                                  className="px-1 text-right text-[#53645d]"
+                                >
+                                  —
+                                </td>
+                              ))}
+                              <td className="border-l border-[#dce4e0] px-1 text-right text-[#53645d]">
+                                —
+                              </td>
+                            </tr>
+                          );
+                        return entries
+                          .slice()
+                          .sort((a, b) => a.start.localeCompare(b.start))
+                          .map((row) => {
                             const selected =
                               chosen?.publication === view.publication_id &&
                               chosen.row.result_id !== null &&
                               chosen.row.result_id === row.result_id;
                             const [status, color] = classification(row);
+                            const state = labels[row.state];
                             return (
                               <tr
-                                key={hour.start + row.production}
-                                className={
-                                  selected
-                                    ? "border-t border-[#dce4e0] bg-[#eaf2ef]"
-                                    : "border-t border-[#dce4e0]"
-                                }
+                                key={row.production + row.start}
+                                className={`h-[26px] border-t border-[#dce4e0] ${selected ? "bg-[#eaf2ef]" : ""}`}
                               >
                                 <th
                                   scope="row"
-                                  className="py-1 pr-2 font-normal"
-                                  title={hour.start}
-                                >
-                                  {stamp(hour.end)}
-                                </th>
-                                <td
-                                  className="py-1 pr-2"
+                                  className="px-1 font-normal"
                                   title={row.reason ?? row.production}
                                 >
-                                  {row.state === "partial"
-                                    ? "Parcial"
-                                    : row.total_penalty === null
-                                      ? (labels[row.state] ?? row.state)
-                                      : status}
-                                  {rows[i].length > 1 && (
-                                    <span className="block text-xs text-[#53645d]">
+                                  {stamp(hour.end)}
+                                  {entries.length > 1 && (
+                                    <span className="block text-[11px] leading-tight text-[#53645d]">
                                       {row.production.slice(
                                         row.production.lastIndexOf(":") + 1,
-                                      )}
+                                      )}{" "}
+                                      · {stamp(row.start)}–
+                                      {stamp(row.cutoff ?? hour.end)}
                                     </span>
                                   )}
-                                </td>
-                                <td className="py-1 text-right">
+                                  {state && (
+                                    <span className="block text-[11px] leading-tight text-[#53645d]">
+                                      {state}
+                                    </span>
+                                  )}
+                                </th>
+                                {components.map(([code, title, detail]) => {
+                                  const value = row.contributions?.[code];
+                                  return (
+                                    <td key={code} className="px-1 text-right">
+                                      {value === undefined || !row.result_id ? (
+                                        "—"
+                                      ) : (
+                                        <button
+                                          type="button"
+                                          className="hover:underline focus-visible:underline"
+                                          aria-label={`Detalle ${title} · ${label} · ${stamp(hour.end)} · ${number.format(value)}`}
+                                          onClick={() => select(row, detail)}
+                                        >
+                                          {number.format(value)}
+                                        </button>
+                                      )}
+                                    </td>
+                                  );
+                                })}
+                                <td className="border-l border-[#dce4e0] px-1 text-right">
                                   {row.result_id &&
                                   row.total_penalty !== null ? (
                                     <button
                                       type="button"
-                                      className="font-semibold underline-offset-4 hover:underline focus-visible:underline"
+                                      className="font-semibold hover:underline focus-visible:underline"
                                       aria-pressed={selected}
                                       aria-label={`Ver desglose de ${label} · ${stamp(hour.end)} · ${number.format(row.total_penalty)} · ${status}`}
                                       style={{ color }}
@@ -389,158 +478,73 @@ export function LiveView() {
                                 </td>
                               </tr>
                             );
-                          })
-                        ) : (
-                          <tr
-                            key={hour.start}
-                            className={
-                              hour.state === "open"
-                                ? "border-t bg-[#eaf2f6]"
-                                : "border-t border-[#dce4e0]"
-                            }
-                          >
-                            <th
-                              scope="row"
-                              className="py-1 pr-2 font-normal"
-                              title={hour.start}
-                            >
-                              {stamp(hour.end)}
-                            </th>
-                            <td className="py-1 pr-2 text-[#53645d]">
-                              {labels[hour.state] ?? "Sin resultado"}
-                            </td>
-                            <td className="py-1 text-right">—</td>
-                          </tr>
-                        ),
-                      )}
+                          });
+                      })}
                     </tbody>
                   </table>
                 </div>
               </div>
-              {chosen?.row.line === line &&
-                chosen.row.machine === machine &&
-                detail?.quality_score_components && (
-                  <div
-                    className="mt-2 overflow-x-auto"
-                    aria-label="Contribuciones de la hora seleccionada"
-                  >
-                    <table className="w-full text-sm tabular-nums">
-                      <caption className="text-left font-medium">
-                        Desglose de las{" "}
-                        {chosen.row.cutoff && stamp(chosen.row.cutoff)}
-                      </caption>
-                      <thead>
-                        <tr>
-                          {[
-                            "MIA",
-                            "Crítico",
-                            "Grave",
-                            "Mayor",
-                            "Menor",
-                            "Leve",
-                            "DAR",
-                            "ZC",
-                            "Total",
-                          ].map((name) => (
-                            <th
-                              key={name}
-                              scope="col"
-                              className="px-2 text-right"
-                            >
-                              {name}
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <tr>
-                          {[
-                            "mia",
-                            "critico",
-                            "grave",
-                            "mayor",
-                            "menor",
-                            "leve",
-                            "dar",
-                            "zc",
-                          ].map((name) => {
-                            const entry = detail.quality_score_components.find(
-                              (item) =>
-                                String(item.componente)
-                                  .normalize("NFD")
-                                  .replace(/[\u0300-\u036f]/g, "")
-                                  .toLowerCase() === name,
-                            );
-                            return (
-                              <td key={name} className="px-2 text-right">
-                                {typeof entry?.contribucion === "number"
-                                  ? number.format(entry.contribucion)
-                                  : "—"}
-                              </td>
-                            );
-                          })}
-                          <td className="px-2 text-right font-semibold">
-                            {chosen.row.total_penalty === null
-                              ? "—"
-                              : number.format(chosen.row.total_penalty)}
-                          </td>
-                        </tr>
-                      </tbody>
-                    </table>
+              {chosen?.row.line === line && chosen.row.machine === machine && (
+                <section className="rounded-lg border bg-white p-4">
+                  <div className="flex justify-between">
+                    <h2 className="font-semibold">
+                      {chosen.row.production} · {stamp(chosen.row.start)}–
+                      {chosen.row.cutoff && stamp(chosen.row.cutoff)}
+                    </h2>
+                    <button type="button" onClick={() => setChosen(null)}>
+                      Cerrar detalle
+                    </button>
                   </div>
-                )}
+                  <p>
+                    Score normalizado{" "}
+                    {chosen.row.normalized_score === null
+                      ? "—"
+                      : number.format(chosen.row.normalized_score)}
+                  </p>
+                  {detailError && (
+                    <p role="alert">
+                      Detalle no disponible para esta publicación.
+                    </p>
+                  )}
+                  {!detail && !detailError && (
+                    <p role="status">Cargando detalle…</p>
+                  )}
+                  {detail &&
+                    Object.entries(detail).map(([name, rows]) => (
+                      <details
+                        className="mt-2 border-t pt-2"
+                        key={`${name}:${chosen.component}`}
+                        open={chosen.component === name || undefined}
+                      >
+                        <summary>{details[name] ?? name}</summary>
+                        {rows.length ? (
+                          <ul className="space-y-1 text-sm">
+                            {rows.map((row) => (
+                              <li key={JSON.stringify(row)}>
+                                {Object.entries(row)
+                                  .filter(
+                                    ([field, value]) =>
+                                      field !== "id_resultado" &&
+                                      value !== null,
+                                  )
+                                  .map(
+                                    ([field, value]) =>
+                                      `${field.replace(/_/g, " ")} ${typeof value === "number" ? number.format(value) : String(value)}`,
+                                  )
+                                  .join(" · ")}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <p>Sin detalles publicados.</p>
+                        )}
+                      </details>
+                    ))}
+                </section>
+              )}
             </section>
           );
         })}
-      {chosen && (
-        <section className="rounded-lg border bg-white p-4">
-          <div className="flex justify-between">
-            <h2 className="font-semibold">
-              {chosen.row.production} · {stamp(chosen.row.start)}–
-              {chosen.row.cutoff && stamp(chosen.row.cutoff)}
-            </h2>
-            <button type="button" onClick={() => setChosen(null)}>
-              Cerrar detalle
-            </button>
-          </div>
-          <p>
-            Score normalizado{" "}
-            {chosen.row.normalized_score === null
-              ? "—"
-              : number.format(chosen.row.normalized_score)}
-          </p>
-          {detailError && (
-            <p role="alert">Detalle no disponible para esta publicación.</p>
-          )}
-          {!detail && !detailError && <p role="status">Cargando detalle…</p>}
-          {detail &&
-            Object.entries(detail).map(([name, rows]) => (
-              <details className="mt-2 border-t pt-2" key={name}>
-                <summary>{details[name] ?? name}</summary>
-                {rows.length ? (
-                  <ul className="space-y-1 text-sm">
-                    {rows.map((row) => (
-                      <li key={JSON.stringify(row)}>
-                        {Object.entries(row)
-                          .filter(
-                            ([field, value]) =>
-                              field !== "id_resultado" && value !== null,
-                          )
-                          .map(
-                            ([field, value]) =>
-                              `${field.replace(/_/g, " ")} ${typeof value === "number" ? number.format(value) : String(value)}`,
-                          )
-                          .join(" · ")}
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p>Sin detalles publicados.</p>
-                )}
-              </details>
-            ))}
-        </section>
-      )}
     </main>
   );
 }

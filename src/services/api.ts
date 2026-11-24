@@ -37,6 +37,7 @@ export type LiveResult = {
   total_penalty: number | null;
   normalized_score: number | null;
   classification: string | null;
+  contributions: Partial<Record<string, number>>;
 };
 
 export type LiveScores = {

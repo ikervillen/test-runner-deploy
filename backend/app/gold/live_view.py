@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pyarrow.dataset as ds
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.domain.errors import ApplicationError
 
@@ -25,6 +25,7 @@ class Result(BaseModel):
     total_penalty: float | None = None
     normalized_score: float | None = None
     classification: str | None = None
+    contributions: dict[str, float] = Field(default_factory=dict)
 
 
 class Hour(BaseModel):
@@ -72,7 +73,7 @@ def live_scores(settings, cache, *, moment=None):
     return view.model_copy(update={"stale": (now - view.published_at).total_seconds() > 1200})
 
 
-def _project(q, open_hour, now):
+def _project(q, open_hour, now, *, include_contributions=True):
     start = open_hour - timedelta(hours=7)
     field = ds.field
     horizon = (field("inicio") >= start) & (field("fin") <= open_hour)
@@ -153,6 +154,25 @@ def _project(q, open_hour, now):
     hours.append(
         Hour(start=open_hour, end=open_hour + timedelta(hours=1), state="open", results=[])
     )
+    if include_contributions:
+        results = {
+            row.result_id: row
+            for hour in hours
+            for row in hour.results
+            if row.result_id is not None
+        }
+        if results:
+            result_ids = sorted(results)
+            components = _rows(
+                q,
+                "quality_score_components",
+                field("id_resultado").cast("string").isin(result_ids),
+                [("id_resultado", "in", result_ids)],
+            )
+            for component in components:
+                results[component["id_resultado"]].contributions[component["componente"]] = (
+                    component["contribucion"]
+                )
     published_at = datetime.fromisoformat(q.snapshot.manifest["created_at"])
     return LiveScores(
         publication_id=q.snapshot.publication_id,
@@ -172,6 +192,7 @@ def detail(settings, publication, result):
             tzinfo=None, minute=0, second=0, microsecond=0
         ),
         datetime.now(UTC),
+        include_contributions=False,
     )
     if not any(row.result_id == result for hour in live.hours for row in hour.results):
         raise ApplicationError(

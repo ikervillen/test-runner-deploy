@@ -211,3 +211,50 @@ def test_closed_details_keep_their_original_catalog_in_baseline_and_scenario(gol
     response = client.post("/api/customer-score/query", json=scenario)
     assert response.status_code == 200, response.text
     assert response.json()["productions"][0]["dar"]["breakdown"][0]["codes"] == [53]
+
+
+def test_live_bulk_reads_weighted_contributions_from_the_pinned_delta(gold_api, monkeypatch):
+    from datetime import UTC, timedelta
+    from math import isclose
+    from types import SimpleNamespace
+
+    from app.gold.live_view import _project
+    from app.gold.publications import Snapshot
+
+    _, root = gold_api
+    snapshot = Snapshot.open(root, require_gold_contract=True)
+    horizon = snapshot.rows("quality_scores")
+    score = next(r for r in horizon if r["tipo_ventana"] == "HOUR" and r["fin"] <= CUTOFF)
+    target = max(CUTOFF, score["fin"])
+    calls = []
+    original = snapshot.rows
+
+    def record(name, **kwargs):
+        calls.append((name, kwargs))
+        return original(name, **kwargs)
+
+    monkeypatch.delenv("FENIX_LIVE_T0", raising=False)
+    now = (target + timedelta(minutes=5)).replace(tzinfo=UTC)
+    result = _project(
+        SimpleNamespace(
+            snapshot=SimpleNamespace(
+                rows=record, manifest=snapshot.manifest, publication_id=snapshot.publication_id
+            ),
+            max_rows=10000,
+            record_scan=lambda *_: None,
+        ),
+        target,
+        now,
+    )
+    results = [r for hour in result.hours[:-1] for r in hour.results if r.result_id]
+    assert results and result.hours[-1].results == []
+    queries = [kwargs for name, kwargs in calls if name == "quality_score_components"]
+    assert len(queries) == 1
+    ids = sorted(r.result_id for r in results)
+    assert queries[0]["file_pruning_predicate"] == [("id_resultado", "in", ids)]
+    components = original("quality_score_components")
+    for row in results:
+        source = [c for c in components if c["id_resultado"] == row.result_id]
+        assert row.contributions == {c["componente"]: c["contribucion"] for c in source}
+        assert any(c["contribucion"] != c["score"] for c in source)
+        assert isclose(sum(row.contributions.values()), row.total_penalty, abs_tol=0.0001)
