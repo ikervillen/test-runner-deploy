@@ -172,7 +172,7 @@ def update(snapshot, previous, family, after, schema, *, budget, seconds):
         if refs[family]["rows"]:
             raise FullReadRequired
         return refs[family], [], 0
-    if "parts" not in refs[family] and refs[family]["rows"]:
+    if not {"parts", "parts_root"} & refs[family].keys() and refs[family]["rows"]:
         raise FullReadRequired
 
     by_partition = defaultdict(dict)
@@ -190,20 +190,42 @@ def update(snapshot, previous, family, after, schema, *, budget, seconds):
     for identity, value in changes.items():
         by_partition[positions[identity]][identity] = value
 
-    facts = {tuple(part["partition"]): part for part in refs[family].get("parts", [])}
+    fact_ref, lineage_ref = refs[family], refs["__lineage"]
+    indexed_facts = "parts_root" in fact_ref
+    indexed_lineage = "family_roots" in lineage_ref
+    fact_changes, lineage_changes = {}, {}
+    facts = {tuple(part["partition"]): part for part in fact_ref.get("parts", [])}
     lineage = {
-        tuple(part["partition"][1:]): part
-        for part in refs["__lineage"].get("parts", [])
+        tuple(part["partition"]): part
+        for part in lineage_ref.get("parts", [])
         if part["partition"][0] == family
     }
+    lineage_root = lineage_ref.get("family_roots", {}).get(family)
+
+    def lineage_result(root):
+        return (
+            [{"family_index": family, "root": root}] if indexed_lineage else list(lineage.values())
+        )
+
     scanned = 0
     if not by_partition:
-        return refs[family], list(lineage.values()), count
+        return fact_ref, lineage_result(lineage_root), count
     previous.read_stats[family]["changed_keys"] += len(changes)
     previous.read_stats[family]["rebuilt_partitions"] += len(by_partition)
     for key, edits in sorted(by_partition.items()):
-        old_fact = facts.pop(key, None)
-        old_lineage = lineage.pop(key, None)
+        lineage_key = (family, *key)
+        old_fact = (
+            previous.index.find(fact_ref["parts_root"], key)
+            if indexed_facts
+            else facts.pop(key, None)
+        )
+        old_lineage = (
+            previous.index.find(lineage_root, lineage_key)
+            if indexed_lineage
+            else lineage.pop(lineage_key, None)
+        )
+        fact_changes[key] = None
+        lineage_changes[lineage_key] = None
         scanned += sum(p["rows"] for p in (old_fact, old_lineage) if p)
         if count + scanned > budget:
             raise IntegrityError("Affected Gold fragments exceed their reconciliation budget")
@@ -232,14 +254,26 @@ def update(snapshot, previous, family, after, schema, *, budget, seconds):
             raise FullReadRequired
         if rows:
             table = pa.Table.from_pylist(list(rows.values()), schema=schema)
-            facts[key] = {
+            fact_changes[key] = {
                 **_write_table(previous.root, table),
                 "partition": list(key),
                 "time_bounds": _fragment_bounds(family, table),
             }
             if (part := _lineage_part(previous.root, family, key, proofs)) is not None:
-                lineage[key] = part
+                lineage_changes[lineage_key] = part
 
+    if indexed_lineage:
+        lineage_root = previous.index.updated(lineage_root, lineage_changes)
+    else:
+        lineage.update({key: value for key, value in lineage_changes.items() if value})
+    if indexed_facts:
+        node = previous.index.updated(fact_ref["parts_root"], fact_changes)
+        return (
+            dict(name=family, parts_root=node, rows=node["rows"] if node else 0),
+            (lineage_result(lineage_root)),
+            count,
+        )
+    facts.update({key: value for key, value in fact_changes.items() if value})
     descriptors = [item for _, item in sorted(facts.items())]
     row_count = sum(item["rows"] for item in descriptors)
     ref = (
@@ -250,4 +284,4 @@ def update(snapshot, previous, family, after, schema, *, budget, seconds):
             **_write_table(previous.root, pa.Table.from_pylist([], schema=schema)),
         }
     )
-    return ref, list(lineage.values()), count
+    return ref, lineage_result(lineage_root), count

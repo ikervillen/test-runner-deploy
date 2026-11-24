@@ -1240,25 +1240,58 @@ def independent_dependencies(root, snapshot, *, telemetry=None):
         telemetry.update(
             new_links=0, existing_links=0, new_copies=0, existing_copies=0, new_physical_bytes=0
         )
+
+    def copy(item):
+        uri = item["uri"]
+        if uri in seen:
+            return
+        seen.add(uri)
+        kind = publish_reference(snapshot.root, target, item)
+        if telemetry is None:
+            return
+        if kind.endswith("_link"):
+            telemetry[f"{kind}s"] += 1
+        else:
+            telemetry[f"{kind.removesuffix('_copy')}_copies"] += 1
+        if kind == "new_copy" and telemetry["new_physical_bytes"] is not None:
+            try:
+                size = allocated_bytes(target / uri)
+            except OSError:
+                size = None
+            telemetry["new_physical_bytes"] = (
+                None if size is None else telemetry["new_physical_bytes"] + size
+            )
+
+    def copy_tree(ref):
+        from ingesta_delta_lake.association_cas import sync
+
+        from .evidence import checked_file
+
+        marker = within(target, f"index/ack/{ref['hash']}.json")
+        if marker.exists():
+            if read_json(marker) != ref:
+                raise IntegrityError("Gold fragment accreditation differs")
+            checked_file(target, ref)
+            return
+        page = snapshot.index.page(ref)
+        for child in page.get("children", {}).values():
+            copy_tree(child)
+        for part in page.get("parts", []):
+            copy(part)
+        copy(ref)
+        immutable_json(marker, ref)
+        sync(marker.parent)
+        sync(marker.parent.parent)
+
     for ref in snapshot.document["tables"]:
-        for item in evidence_files(ref):
-            uri = item["uri"]
-            kind = publish_reference(snapshot.root, target, item)
-            if telemetry is None or uri in seen:
-                continue
-            seen.add(uri)
-            if kind.endswith("_link"):
-                telemetry[f"{kind}s"] += 1
-            else:
-                telemetry[f"{kind.removesuffix('_copy')}_copies"] += 1
-            if kind == "new_copy" and telemetry["new_physical_bytes"] is not None:
-                try:
-                    size = allocated_bytes(target / uri)
-                except OSError:
-                    size = None
-                telemetry["new_physical_bytes"] = (
-                    None if size is None else telemetry["new_physical_bytes"] + size
-                )
+        if "parts_root" in ref or "family_roots" in ref:
+            roots = [ref["parts_root"]] if "parts_root" in ref else ref["family_roots"].values()
+            for node in roots:
+                if node:
+                    copy_tree(node)
+        else:
+            for item in evidence_files(ref):
+                copy(item)
     for ref in snapshot.wire_document["tables"]:
         for page in ref.get("parts_pages", []):
             publish_reference(snapshot.root, target, page)
