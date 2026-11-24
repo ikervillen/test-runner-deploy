@@ -4,11 +4,11 @@ import json
 import sqlite3
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from contextlib import closing
 from dataclasses import replace
 
-from . import __version__
+from . import __version__, rech_plan
 from . import lista_defectos as defects
 from .common import (
     ConfigurationError,
@@ -50,17 +50,6 @@ def slot_commits(snapshots):
         yield groups[slot]
     if loose:
         yield loose
-
-
-def recovery_batches(batch, *, bounded):
-    if bounded and sum(snapshot.size for snapshot in batch) > MAX_FILE_BYTES:
-        origins = defaultdict(list)
-        for snapshot in batch:
-            origins[snapshot.origin].append(snapshot)
-        # Business identities and inspection signatures never cross origins.
-        yield from origins.values()
-    else:
-        yield batch
 
 
 def reconcile_pending(config, control, store_class):
@@ -195,10 +184,7 @@ def process(
         phases = [(False, [[]])]
     bounded_rech = control.compact and config.family == "LISTA_RECH"
     for is_live, selected in phases:
-        batches = (
-            piece for batch in selected for piece in recovery_batches(batch, bounded=bounded_rech)
-        )
-        for batch in batches:
+        for batch in selected:
             if result is not None and (
                 (stop_requested is not None and stop_requested())
                 or (lane == "history" and config.intake_path is None and history_yields())
@@ -206,16 +192,16 @@ def process(
                 stopped = True
                 break
             started = time.monotonic()
-            result = process_batch(
-                config,
-                control,
-                attempt,
-                snapshots=batch,
-                model=model,
-                store_class=store_class,
-                operation_kind=operation_kind,
-            )
+            kwargs = dict(model=model, store_class=store_class, operation_kind=operation_kind)
+            plan = None
+            if bounded_rech and sum(s.size for s in batch) > rech_plan.PLAN_THRESHOLD:
+                plan = rech_plan.InspectionPlan(control, model, batch)
+                result = process_inspection_plan(config, control, attempt, batch, plan, kwargs)
+            else:
+                result = process_batch(config, control, attempt, snapshots=batch, **kwargs)
             control.acknowledge_inputs(result["batch_id"], batch)
+            if plan is not None:
+                plan.discard()
             if is_live:
                 control.set_live_slot(bronze_now)
             recovered.extend(result["recovered_operations"])
@@ -271,6 +257,47 @@ def process(
     }
 
 
+def process_inspection_plan(config, control, attempt, snapshots, plan, kwargs):
+    plan.stage(snapshots, config.encoding)
+    cursor, recorded = plan.state()
+    prior = json.loads(recorded) if recorded else None
+    totals = prior["totals"] if prior else {}
+    stats = (
+        "rows_read",
+        "normalized_rows",
+        "invalid_rows",
+        "consolidated_repetitions",
+        "new_entries",
+        "matched_entries",
+        "conflicts",
+        "counter_revisions",
+        "inspection_conflicts",
+        "inserted_this_attempt",
+    )
+    result = prior["result"] if prior else None
+    while True:
+        keys = plan.next_unit(cursor)
+        if not keys and result is not None:
+            control.advance_observed_until(plan.observed())
+            break
+        result = process_batch(
+            config,
+            control,
+            attempt,
+            snapshots=snapshots,
+            parsed_unit=plan.load(keys),
+            plan_scope=(plan.identity, cursor),
+            **kwargs,
+        )
+        for name in stats:
+            totals[name] = totals.get(name, 0) + result[name]
+        cursor = keys[-1] if keys else cursor
+        plan.checkpoint(cursor, {"totals": totals, "result": result})
+    if result["complete"] and totals["inserted_this_attempt"]:
+        result["status"] = "APPLIED"
+    return {**result, **totals, "attempt_id": attempt}
+
+
 def process_batch(
     config,
     control,
@@ -280,6 +307,8 @@ def process_batch(
     model=defects,
     store_class=DefectsStore,
     operation_kind="lista_defectos_insert_v2",
+    parsed_unit=None,
+    plan_scope=None,
 ):
     store = store_class(config, control.control_id)
     recovered, recovery_count = reconcile_pending(config, control, store_class)
@@ -300,6 +329,7 @@ def process_batch(
                 config.archive_context,
                 control.setting("last_version"),
                 inputs,
+                plan_scope,
                 cases,
             ]
         )
@@ -309,11 +339,13 @@ def process_batch(
         raise PreparedArtifactTooLarge(
             "Prepared artifact exceeds recovery budget (unchanged input)"
         )
-    parsed = model.parse(snapshots, config.encoding)
+    parsed = parsed_unit if parsed_unit is not None else model.parse(snapshots, config.encoding)
     from .review_adapters import filter_rejected
 
     filter_rejected(control, parsed)
-    scope = scope_for(parsed, model, exact_periods=bounded_rech)
+    scope = scope_for(
+        parsed, model, exact_periods=bounded_rech, inspection_signatures=plan_scope is not None
+    )
     store.set_scope(scope)
     before_files = files(store.table())
     from .pipeline_retired import logical_rows
@@ -341,6 +373,7 @@ def process_batch(
             version,
             inputs,
             digest(control.cases()),
+            *([plan_scope] if plan_scope else []),
         ]
     )
     stats = {
@@ -376,6 +409,8 @@ def process_batch(
         "read_scope": scope,
         "inspection_holds": group_holds(cases),
     }
+    if plan_scope is not None:
+        prepared["inspection_plan"] = list(plan_scope)
     if bounded_rech:
         prepared["before_files_hash"] = digest(before_files)
         prepared["inspection_groups_from_confirmed_rows"] = True
