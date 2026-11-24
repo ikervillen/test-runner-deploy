@@ -135,7 +135,10 @@ def test_auxiliary_cursor_without_scoring_changes_does_not_export(independent, m
         lambda *a, **k: (tables, cursor + 3, (version[0], cursor + 3)),
     )
     revised = independent_inputs.export(plan, "live", cfg)
-    assert revised.document["silver_read"]["full_read_families"] == ["CONT_ZC"]
+    stats = revised.document["silver_read"]
+    assert stats["full_read_families"] == []
+    assert set(stats["reconciliation"]) == {"CONT_ZC"}
+    assert stats["reconciliation"]["CONT_ZC"]["examined"] == 0
     assert revised.document["silver_read"]["incremental"] is True
 
 
