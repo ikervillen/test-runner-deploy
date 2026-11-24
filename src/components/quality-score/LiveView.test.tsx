@@ -33,12 +33,25 @@ it("shows zero for a closed result, excludes the open score and pins detail", as
       },
     ],
   });
-  const detail = vi.spyOn(api, "getLiveDetail").mockResolvedValue({});
+  const detail = vi.spyOn(api, "getLiveDetail").mockResolvedValue({
+    quality_score_components: [{ componente: "mia", contribucion: 0 }],
+  });
   render(<LiveView />);
-  const result = await screen.findByRole("button", { name: /0 GOOD/ });
+  const result = await screen.findByRole("button", {
+    name: /AV31A.*15:00.*0.*Bueno/,
+  });
+  expect(
+    screen.getAllByRole("img", { name: /Evolución horaria/ }),
+  ).toHaveLength(7);
+  expect(screen.getAllByText("Histórico no disponible")).toHaveLength(7);
+  expect(document.querySelectorAll("circle[data-result]")).toHaveLength(1);
+  expect(screen.getAllByText("En curso")).toHaveLength(7);
   expect(screen.queryByText(/999/)).not.toBeInTheDocument();
   fireEvent.click(result);
   expect(await screen.findByText(/Score normalizado 0/)).toBeInTheDocument();
+  expect(
+    await screen.findByRole("table", { name: /Desglose de las 15:00/ }),
+  ).toBeInTheDocument();
   expect(detail).toHaveBeenCalledWith("publication", "result");
   vi.restoreAllMocks();
 });
