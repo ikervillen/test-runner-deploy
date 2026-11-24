@@ -202,6 +202,34 @@ def configure_live_only(compose, site):
     return compose
 
 
+def configure_fresh_live(compose, revision, start):
+    import re
+
+    from ingesta_delta_lake.live_epoch import _parse
+
+    _parse(start)
+    if not re.fullmatch("[0-9a-f]{40}", revision):
+        raise ValueError("Fresh Live requires a full revision")
+    services = compose["services"]
+    for name in ("ingesta-live", "gold-live", "backend", "initialize"):
+        service = services[name]
+        service["volumes"] = [
+            m for m in service["volumes"] if not m.get("source", "").startswith("history-")
+        ]
+        if name != "initialize":
+            service.setdefault("environment", {})["FENIX_LIVE_T0"] = start
+    # Keep the historical service definitions intact, under their disabled profile.
+    for name, volume in compose["volumes"].items():
+        if name.startswith("live-"):
+            volume["name"] = f"{compose['name']}-{revision[:12]}-{name}"
+    initializer = services["initialize"]
+    initializer["command"] = [
+        *initializer["command"][:4],
+        *[m["target"] for m in initializer["volumes"]],
+    ]
+    return compose
+
+
 def render(site, pipelines, *, with_history=False):
     validate(site, pipelines)
     config_root = site["configuration_target"]

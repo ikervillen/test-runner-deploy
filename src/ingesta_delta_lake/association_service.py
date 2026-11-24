@@ -163,7 +163,12 @@ def _process(config, control, attempt, *, physical=False):
     live = config.pipeline_lane == "live" and config.topology_enabled
     floor = control.setting("live_handover_from") if live else None
     if live and floor is None:
-        if config.processing_window:
+        from .live_epoch import epoch
+
+        t0 = epoch()
+        if t0:
+            floor = t0.isoformat()
+        elif config.processing_window:
             floor = config.processing_window[0]
         elif not physical and config.runtime_root is not None:
             raise DependencyPending("Esperando el primer corte Live para publicar atribuciones")

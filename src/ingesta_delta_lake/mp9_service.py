@@ -36,6 +36,10 @@ def process(config, control, attempt):
         raise IntegrityError("El snapshot MP9 no coincide con su control")
     snapshots = capture_inputs(config, control, attempt)
     parsed = mp9.parse(snapshots, config.encoding)
+    from .live_epoch import epoch, retain_mp9_context
+
+    if floor := epoch():
+        retain_mp9_context(parsed, existing, floor.isoformat())
     input_variants = len(parsed.entries)
     descriptors = [s.descriptor() for s in snapshots]
     restored = 0

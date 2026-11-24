@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  GOLD_CONTEXT_COMMIT: e7ffc040b05496d08175c450e2482b70e9ec98f8
+  GOLD_CONTEXT_COMMIT: 5459a02c7ab2843f5b7a47be16051ed99caf139f
   GOLD_SOURCE_COMMIT: ad88dc3d0bdedfbc4da3de06da74e3801b9b64f7
 
 jobs:
@@ -140,7 +140,7 @@ jobs:
       - name: Prepare the approved Live flow update
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '3aa9e5dbba6619b1590e2bfac66ccc67c9232809' && github.event.head_commit.message == 'Deploy CONT_ZC with stable Windows capture paths' && github.run_attempt == '1'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '4082a69ffaca350debae421804fc9098642f8af5' && github.event.head_commit.message == 'Deploy fresh incremental Fenix Live generation' && github.run_attempt == '1'
         run: |
           set -euo pipefail
           mkdir -p bundle
@@ -229,7 +229,7 @@ jobs:
         run: |
           $bundle = Join-Path $env:RUNNER_TEMP "fenix-image-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           try {
-            ./scripts/update_independent_workers.ps1 -LiveFlowOnly -Bundle $bundle `
+            ./scripts/update_independent_workers.ps1 -LiveFlowOnly -FreshLive -Bundle $bundle `
               -Image $env:IMAGE -Revision $env:GITHUB_SHA -GoldRevision $env:GOLD_CONTEXT_COMMIT
           } finally {
             Remove-Item -LiteralPath (Join-Path $bundle 'image.tar.gz'), (Join-Path $bundle 'image.json') -ErrorAction SilentlyContinue

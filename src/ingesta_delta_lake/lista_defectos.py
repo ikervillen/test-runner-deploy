@@ -10,6 +10,7 @@ from pathlib import Path
 import pyarrow as pa
 
 from .common import IntegrityError, blank_input, canonical, digest, note_observed_time, parse_int64
+from .live_epoch import before_epoch, epoch
 from .mp9 import timestamp
 
 CONTRACT = "lista_defectos_v2"
@@ -79,6 +80,7 @@ class Parsed:
 
 def parse(snapshots, encoding):
     result = Parsed()
+    floor = epoch()
     for snap in {(s.origin, s.sha256): s for s in snapshots}.values():
         data = Path(snap.bronze_path).read_bytes()
         if hashlib.sha256(data).hexdigest() != snap.sha256:
@@ -109,6 +111,8 @@ def parse(snapshots, encoding):
         try:
             for raw_row in reader:
                 if not raw_row:
+                    continue
+                if before_epoch(raw_row, 0, floor):
                     continue
                 result.rows_read += 1
                 row = raw_row[:-1] if len(raw_row) == 19 and raw_row[-1] == "" else raw_row

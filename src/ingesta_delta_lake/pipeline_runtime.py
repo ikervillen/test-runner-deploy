@@ -19,6 +19,7 @@ from .catalog_storage import historical_mp9
 from .common import IntegrityError, canonical, digest, now
 from .config import load_config
 from .contracts import CONTRACTS
+from .live_epoch import BOOTSTRAP, epoch
 from .pipeline_archive import Archive
 from .pipeline_archive_queue import ArchiveQueue
 from .pipeline_handoff import BronzeHandoff
@@ -33,11 +34,30 @@ from .sources import SILVER_EXPORTS
 from .workers import PHASES, run_phase
 
 
+def prospective(lanes, policy, t0):
+    bootstrap, operational = {}, []
+    for item in (*lanes["live"], *lanes["history"]):
+        if item.family in BOOTSTRAP:
+            key = (item.origin, item.family)
+            previous = bootstrap.get(key)
+            if previous is None or (item.producer_time or "", item.path.name) > (
+                previous.producer_time or "",
+                previous.path.name,
+            ):
+                bootstrap[key] = item
+        elif item.producer_time and "T" in item.producer_time and item.clock >= t0:
+            operational.append(item)
+    window = policy.source_window(max(c.clock for c in operational)) if operational else None
+    context = [replace(c, producer_time=None) for c in bootstrap.values()]
+    return context, {"live": operational, "history": []}, window
+
+
 class PipelineWorker:
     def __init__(self, pipelines, lane, source, *, stop=None):
         self.pipelines, self.lane = pipelines, lane
         self.storage, self.policy = pipelines.lane(lane), pipelines.policy
         self.parallel = getattr(self.policy, f"{lane}_workers")
+        self.t0 = epoch() if lane == "live" else None
         self.history_enabled = os.environ.get("FENIX_HISTORY_ENABLED") != "0"
         self.source = replace(
             source,
@@ -66,8 +86,8 @@ class PipelineWorker:
             reviews_only=False,
             publication_root=self.storage.exchange,
             retirement_job=None,
-            history_exchange=pipelines.history.exchange if lane == "live" else None,
-            history_silver=pipelines.history.silver if lane == "live" else None,
+            history_exchange=pipelines.history.exchange if lane == "live" and not self.t0 else None,
+            history_silver=pipelines.history.silver if lane == "live" and not self.t0 else None,
         )
         self.source.validate()
         self.stop = stop if stop is not None else threading.Event()
@@ -77,6 +97,7 @@ class PipelineWorker:
                 source.plant,
                 [(origin, str(folder)) for origin, folder in source.sources],
                 {family: c.name for family, c in CONTRACTS.items()},
+                *([self.t0.isoformat()] if self.t0 else []),
             ]
         )
         self.status_path = self.storage.checkpoint / "worker.json"
@@ -125,9 +146,19 @@ class PipelineWorker:
         lanes, window, failures = discover_lanes(
             self.source.sources, self.policy, cache=self.discovery_cache
         )
+        bootstrap = []
+        if self.t0:
+            bootstrap, lanes, window = prospective(lanes, self.policy, self.t0)
         discovery_seconds = round(time.monotonic() - began_discovery, 3)
         stamp = datetime.now(UTC)
         intake.set("lot_policy", canonical(asdict(self.policy)))
+        if self.t0:
+            floor = self.t0.isoformat()
+            existing_floor = intake.setting("initial_frontier")
+            if existing_floor is None:
+                intake.set("initial_frontier", floor)
+            elif existing_floor != floor:
+                raise IntegrityError("Live frontier differs from its configured T0")
         frontier = intake.lots.frontier(self.pipelines, window)
         intake.lots.advance(
             self.pipelines, stamp, active_ids=active_ids, archive_enabled=self.history_enabled
@@ -140,6 +171,7 @@ class PipelineWorker:
         candidates = intake.lots.owned_candidates(
             [*lanes["live"], *earlier], self.policy, window, frontier
         )
+        candidates.extend(bootstrap)
         if self.lane == "live":
             intake.lots.publish(self.storage)
         for failure in failures:
@@ -262,7 +294,7 @@ class PipelineWorker:
         )
 
     def refresh_archive(self):
-        if self.lane != "live":
+        if self.lane != "live" or self.t0:
             return
         historical = self.pipelines.history
         root = historical.exchange / "archive"

@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Revision,
     [Parameter(Mandatory = $true)][string]$GoldRevision,
     [switch]$LiveFlowOnly,
+    [switch]$FreshLive,
     [switch]$GoldOnly,
     [switch]$IncludeGoldHistory,
     [switch]$IncludeBackend,
@@ -19,6 +20,7 @@ $site = Get-Content -LiteralPath $sitePath -Raw | ConvertFrom-Json
 $context = if ($hasSite) { $site.docker_context } else { $env:FENIX_DOCKER_CONTEXT }
 if (-not $context) { throw 'No se ha configurado el contexto Docker.' }
 $project = $profile.project
+if ($FreshLive -and -not $LiveFlowOnly) { throw 'FreshLive requiere LiveFlowOnly.' }
 if ($LiveFlowOnly) {
     if ($GoldOnly -or $IncludeGoldHistory -or $IncludeBackend -or $Immediate) {
         throw 'LiveFlowOnly configura el flujo completo y detiene History con drenaje.'
@@ -128,6 +130,9 @@ $compose = Get-Content -LiteralPath $activeFile -Raw | ConvertFrom-Json
 if ($compose.name -cne $project) { throw 'El Compose activo pertenece a otro proyecto.' }
 Write-Output "Compose base: $activeFile"
 $tag = "fenix-independent:sha-$Revision"
+if ($FreshLive -and @($services | Where-Object { -not $workers[$_] }).Count) {
+    throw 'La generación limpia requiere un Compose anterior verificable para rollback.'
+}
 $initializeGold = $false
 $initializer = $null
 if ($LiveFlowOnly) {
@@ -211,17 +216,26 @@ if ($loaded.Id -cne $proof.image_id -or
 
 if ($LiveFlowOnly) {
     $hostInfo = ((Invoke-Docker info --format '{{json .}}') -join '') | ConvertFrom-Json
-    $payload = @{ compose = $compose; host = $hostInfo } | ConvertTo-Json -Depth 40 -Compress
+    $t0 = $null
+    if ($FreshLive) {
+        $zone = [TimeZoneInfo]::FindSystemTimeZoneById('Romance Standard Time')
+        $clock = [TimeZoneInfo]::ConvertTime([DateTimeOffset]::UtcNow, $zone).DateTime
+        $t0 = $clock.Date.AddMinutes(([math]::Floor($clock.TimeOfDay.TotalMinutes / 10) + 1) * 10).ToString('yyyy-MM-ddTHH:mm:ss')
+    }
+    $payload = @{ compose = $compose; host = $hostInfo; start = $t0; revision = $Revision } | ConvertTo-Json -Depth 40 -Compress
     $transform = @'
 import json, sys
 from pathlib import Path
-from deployment.independent import configure_live_only, read, validate_host
+from deployment.independent import configure_fresh_live, configure_live_only, read, validate_host
 
 # Windows PowerShell can send a UTF-8 BOM to a native process.
 data = json.load(sys.stdin.buffer)
 profile = read(Path('/opt/app/deployment/independent.example.json'))
 validate_host(profile, data['host'])
-print(json.dumps(configure_live_only(data['compose'], profile)))
+compose = configure_live_only(data['compose'], profile)
+if data['start']:
+    compose = configure_fresh_live(compose, data['revision'], data['start'])
+print(json.dumps(compose))
 '@
     $OutputEncoding = [Text.UTF8Encoding]::new($false)
     $configured = $payload | docker --context $context run --rm -i --pull never --network none --read-only `
@@ -235,7 +249,23 @@ $candidate = Join-Path $activeDirectory "compose.$($Revision.Substring(0, 12)).j
 [IO.File]::WriteAllText($candidate, ($compose | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
 Invoke-Docker compose -p $project -f $candidate config --quiet
 if ($LiveFlowOnly) {
-    if ($initializeGold) {
+    if ($FreshLive) {
+        $volumes = @{}
+        $existingVolumes = @(Invoke-Docker volume ls --format '{{.Name}}')
+        foreach ($property in $compose.volumes.PSObject.Properties) {
+            if ($property.Name -notlike 'live-*') { continue }
+            if ($property.Value.name -cin $existingVolumes) { throw "La generación ya existe: $($property.Value.name)" }
+            $volumes[$property.Name] = $property.Value
+        }
+        if ($volumes.Count -ne 6) { throw 'Se requieren seis volúmenes Live nuevos.' }
+        $bootstrap = $compose.services.initialize
+        $bootstrap.image = $tag
+        $initialization = @{name=$project; services=@{initialize=$bootstrap}; volumes=$volumes}
+        $initFile = "$candidate.initialize.json"
+        [IO.File]::WriteAllText($initFile, ($initialization | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+        Invoke-Docker compose -p $project -f $initFile run --rm --no-deps --pull never initialize
+        Write-Output "T0 industrial: $t0 | rollback: $activeFile"
+    } elseif ($initializeGold) {
         $initializer.image = $tag
         $initializer.command = @('--uid', [string]$profile.uid, '--gid', [string]$profile.gid, $goldMount[0].target)
         $initializer.volumes = @($goldMount[0])
@@ -260,8 +290,31 @@ if ($LiveFlowOnly) {
             --filter "label=com.docker.compose.service=$service" --format '{{.ID}}')
         if ($running.Count) { throw "No se ha detenido $service." }
     }
-    Invoke-Docker compose -p $project -f $candidate up -d --no-deps --no-build --pull never `
-        --timeout ([int]$site.drain_seconds) @services
+    try {
+        Invoke-Docker compose -p $project -f $candidate up -d --no-deps --no-build --pull never `
+            --timeout ([int]$site.drain_seconds) @services
+        if ($FreshLive) {
+            foreach ($service in $services) {
+                $newWorker = Get-Worker $service
+                if ($newWorker.Image -cne $proof.image_id -or
+                    $newWorker.Config.Env -cnotcontains "FENIX_LIVE_T0=$t0") {
+                    throw "Imagen o T0 inesperado en $service."
+                }
+                foreach ($mount in @($compose.services.$service.volumes | Where-Object type -eq 'volume')) {
+                    $name = $compose.volumes.($mount.source).name
+                    if (-not @($newWorker.Mounts | Where-Object { $_.Name -ceq $name -and $_.Destination -ceq $mount.target }).Count) {
+                        throw "Montaje inesperado en $service/$($mount.target)."
+                    }
+                }
+            }
+        }
+    } catch {
+        if ($FreshLive) {
+            Invoke-Docker compose -p $project -f $activeFile up -d --no-deps --no-build --pull never `
+                --timeout ([int]$site.drain_seconds) @services
+        }
+        throw
+    }
 } elseif ($Immediate) {
     $order = if ($IncludeBackend) { @('backend', 'gold-history', 'gold-live') } else { $services }
     foreach ($service in $order) {
