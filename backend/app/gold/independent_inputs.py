@@ -93,7 +93,7 @@ def export(pipelines, lane, config):
     own = SilverSnapshot.open(storage)
     from ingesta_delta_lake.common import IntegrityError as NativeIntegrityError
 
-    from .common import atomic_json, immutable_json, read_json
+    from .common import atomic_json, immutable_json, live_epoch, read_json
     from .evidence import Evidence
 
     reconciliation_root = storage.gold / "checkpoint" / "reconciliation"
@@ -118,7 +118,7 @@ def export(pipelines, lane, config):
             )
             if archive.manifest["publication_id"] != active["archive"]:
                 raise IntegrityError("Frozen archive reference differs")
-    else:
+    elif not (lane == "live" and live_epoch()):
         try:
             archive = ArchiveSnapshot(pipelines.history)
             atomic_json(cached_archive, archive.manifest)
@@ -139,6 +139,8 @@ def export(pipelines, lane, config):
             "publication_id"
         ]
     except (OSError, ValueError, KeyError):
+        historical_gold = None
+    if lane == "live" and live_epoch():
         historical_gold = None
     if active is not None:
         historical_gold = active["history"]
