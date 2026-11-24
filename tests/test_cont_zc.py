@@ -665,11 +665,17 @@ def test_live_scoped_zc_matches_full_reads_across_cuts_and_recovers_commit(
     with closing(ZcControl(cfg)) as control:
         assert not control.pending()
         store = ZcStore(cfg, control.control_id)
+        store.reuse_version = True
         result = zc_service._commit_batch(
             cfg, control, control.start_attempt(), store, [late], [], 0, scoped=True
         )
         assert result["delta_version"] == 4
         assert store.timings["rows_read"] == 3
+        assert store.timings["delta_opens"] > 0
+        assert store.timings["delta_open_seconds"] > 0
+        assert store.timings["transaction_log_seconds"] > 0
+        assert store.timings["parquet_scan_and_decode_seconds"] > 0
+        assert store.timings["arrow_to_python_seconds"] > 0
         assert result["yield_summary_scope"] == "affected_minutes"
         _, corrected = ZcStore(
             replace(cfg, archive_root=None, archive_manifest=None), control.control_id

@@ -1,6 +1,7 @@
 """Pinned accepted archive context for validation after physical live retirement."""
 
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -77,16 +78,20 @@ class AcceptedScanner:
     def to_batches(self):
         view = self.dataset.view
         family, schema = view.store.config.family, view.schema
-        archive = AcceptedArchive(view)
+        measure = getattr(view.store, "measure", lambda _: nullcontext())
+        with measure("archive_metadata"):
+            archive = AcceptedArchive(view)
         snapshot = None
         if view.local is not None:
 
             def batches(_family, *, batch_size, expression=None):
-                yield from (
-                    view.local.to_pyarrow_dataset(**self.dataset.options)
-                    .scanner(filter=expression, batch_size=batch_size, use_threads=False)
-                    .to_batches()
-                )
+                with measure("local_file_enumeration"):
+                    dataset = view.local.to_pyarrow_dataset(**self.dataset.options)
+                with measure("local_parquet_scan_and_decode"):
+                    scanner = dataset.scanner(
+                        filter=expression, batch_size=batch_size, use_threads=False
+                    )
+                    yield from scanner.to_batches()
 
             snapshot = SimpleNamespace(
                 manifest={
@@ -97,7 +102,7 @@ class AcceptedScanner:
                             "rejected_hashes": sorted(
                                 {
                                     value
-                                    for commit in view.local.history()
+                                    for commit in view.store.transaction_history(view.local)
                                     if commit["version"] <= view.local.version()
                                     for value in json.loads(
                                         commit.get("ingesta_review_rejected_hashes", "[]")
@@ -109,6 +114,7 @@ class AcceptedScanner:
                 },
                 table=lambda _: view.local,
                 batches=batches,
+                transaction_history=lambda: view.store.transaction_history(view.local),
             )
         combined = SilverView(archive=archive, **{view.context["lane"]: snapshot})
         result = combined.rows(
@@ -117,6 +123,7 @@ class AcceptedScanner:
             batch_size=self.batch_size,
             expression=self.expression,
             cdf_predicate=getattr(view.store, "cdf_predicate", None),
+            measure=measure,
         )
         if result.conflicts:
             raise IntegrityError("Accepted archive context has unresolved cross-lane conflicts")

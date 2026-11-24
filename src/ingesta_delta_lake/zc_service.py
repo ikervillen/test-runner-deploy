@@ -31,6 +31,7 @@ from .zc_storage import ZcStore
 
 def process(config, control, attempt, *, lane="all"):
     store = ZcStore(config, control.control_id)
+    store.reuse_version = lane == "live" and config.change_data_feed
     recovered, recovered_count = [], 0
     for pending in control.pending():
         count = len(control.prepared(pending)["inserts"])
