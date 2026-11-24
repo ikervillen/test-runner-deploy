@@ -138,3 +138,85 @@ def test_resolved_review_restores_cached_base_without_rewriting_delta(mia):
     result = run(mia)
     assert result["resolved_inspection_total"] == 96 and result["unresolved_groups"] == 0
     assert DeltaTable(str(mia.table_path)).version() == 0
+
+
+def test_compact_rech_recovers_inspection_groups_from_the_verified_commit(config, monkeypatch):
+    from ingesta_delta_lake.common import IngestaError
+    from ingesta_delta_lake.rejections_storage import RejectionsControl
+
+    config = replace(
+        config, family="LISTA_RECH", control_format=3, timestamp_policy="local_naive_test_v1"
+    )
+    source = config.sources[0][1] / "LISTA_RECH.csv"
+    source.write_text(csv_row(config.family, 0), encoding="utf-8")
+    run(config)
+    source.write_text(csv_row(config.family, 20), encoding="utf-8")
+
+    def fail_confirmation(*args, **kwargs):
+        raise OSError("simulated interruption after Delta commit")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(RejectionsControl, "confirm", fail_confirmation)
+        with pytest.raises(IngestaError, match="simulated interruption"):
+            run(config)
+    assert DeltaTable(str(config.table_path)).version() == 1
+    control = RejectionsControl(config)
+    try:
+        plan = control.prepared(control.pending()[0])
+        assert plan["inspection_groups_from_confirmed_rows"]
+        assert "inspection_groups" not in plan and "before_files" not in plan
+        assert plan["before_files_hash"]
+    finally:
+        control.close()
+
+    result = run(config)
+    assert result["recovered_operations"]
+    assert result["resolved_inspection_total"] == 192
+    assert result["published_rows"] == result["resolved_groups"] == 2
+    assert DeltaTable(str(config.table_path)).version() == 1
+
+
+def test_compact_rech_skips_identical_oversized_preparation(config, monkeypatch):
+    from ingesta_delta_lake import compact_control, lista_rech
+
+    config = replace(
+        config, family="LISTA_RECH", control_format=3, timestamp_policy="local_naive_test_v1"
+    )
+    source = config.sources[0][1] / "LISTA_RECH.csv"
+    source.write_text(csv_row(config.family, 0), encoding="utf-8")
+    parse = lista_rech.parse
+    attempts = []
+
+    def count_parse(snapshots, encoding):
+        attempts.append(len(snapshots))
+        return parse(snapshots, encoding)
+
+    monkeypatch.setattr(lista_rech, "parse", count_parse)
+    with monkeypatch.context() as patch:
+        patch.setattr(compact_control, "MAX_DOCUMENT", 20)
+        with pytest.raises(compact_control.PreparedArtifactTooLarge, match="recovery budget"):
+            run(config)
+        assert attempts == [1]
+        with pytest.raises(compact_control.PreparedArtifactTooLarge, match="unchanged input"):
+            run(config)
+        assert attempts == [1]
+    source.write_text(csv_row(config.family, 10), encoding="utf-8")
+    assert run(config)["resolved_inspection_total"] == 192
+    assert attempts == [1, 2]
+
+
+
+def test_original_recovery_budget_rejects_duplicated_preparation(tmp_path):
+    from ingesta_delta_lake import compact_control
+
+    # Exercise the real uncompressed budget with highly compressible input.
+    # Sharing the test strings keeps the fixture small in memory.
+    repeated = ["x" * (1024 * 1024)] * 129
+    with pytest.raises(compact_control.PreparedArtifactTooLarge, match="recovery budget"):
+        compact_control.publish(tmp_path, {"inserts": repeated, "inspection_groups": repeated})
+    assert not list(tmp_path.iterdir())
+
+    reference = compact_control.publish(
+        tmp_path, {"inserts": repeated, "inspection_groups_from_confirmed_rows": True}
+    )
+    assert 128 * 1024 * 1024 < reference["bytes"] < compact_control.MAX_DOCUMENT

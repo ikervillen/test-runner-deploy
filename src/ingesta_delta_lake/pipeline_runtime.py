@@ -417,11 +417,18 @@ class PipelineWorker:
                 with closing(
                     sqlite3.connect(cfg.control_path.as_uri() + "?mode=ro", uri=True, timeout=0)
                 ) as db:
+                    from .retry_control import may_revalidate
+
                     row = db.execute(
                         "SELECT value FROM settings WHERE key='retry_state'"
                     ).fetchone()
-                state = json.loads(row[0]) if row else None
-                if state is None or (not state["paused"] and state["next_at"] <= time.time()):
+                    state = json.loads(row[0]) if row else None
+                    released = may_revalidate(cfg, db, state)
+                if (
+                    released
+                    or state is None
+                    or (not state["paused"] and state["next_at"] <= time.time())
+                ):
                     intake.release(family, "WAITING_RETRY")
             except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
                 self.event(
@@ -554,20 +561,22 @@ class PipelineWorker:
                         dirty.add(family)
                         dirty_since.setdefault(family, time.monotonic())
                         retry_at[family] = time.monotonic() + self.policy.poll_seconds
-                    elif result.get("status") in {
-                        "APPLIED",
-                        "NO_CHANGE",
-                        "PARTIAL",
-                        "BLOCKED",
-                        "REVIEWS_CHECKED",
-                        "RETIRED",
-                    } and (
-                        cfg.intake_ids
-                        or cfg.reviews_only
-                        or result.get("status") in {"APPLIED", "RETIRED"}
-                        or (
-                            family == "CATALOGO_PRODUCCIONES"
-                            and not result.get("publication_error")
+                    elif (
+                        result.get("status")
+                        in {
+                            "APPLIED",
+                            "NO_CHANGE",
+                            "PARTIAL",
+                            "BLOCKED",
+                            "REVIEWS_CHECKED",
+                            "RETIRED",
+                        }
+                        and not result.get("publication_error")
+                        and (
+                            cfg.intake_ids
+                            or cfg.reviews_only
+                            or result.get("status") in {"APPLIED", "RETIRED"}
+                            or family in {"CATALOGO_PRODUCCIONES", "LISTA_RECH"}
                         )
                     ):
                         for dependent in families[families.index(family) + 1 :]:

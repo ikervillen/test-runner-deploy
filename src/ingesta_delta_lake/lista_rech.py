@@ -227,21 +227,22 @@ def decide(parsed, existing, held_keys=(), held_signatures=(), held_groups=()):
 
 
 def inspection_groups(rows, issues):
+    from .mia_scope import group_holds
+
+    return groups_from_holds(rows, group_holds(issues))
+
+
+def groups_from_holds(rows, holds):
     by_signature = indexes(rows.values())[1]
-    affected = {tuple(i["group"]) for i in issues if "group" in i}
-    unknown_origins = set()
-    for issue in issues:
-        if "group" not in issue:
-            refs = issue.get("evidence", {})
-            refs = refs if isinstance(refs, list) else [refs]
-            unknown_origins.update(r.get("origin") for r in refs)
+    affected, unknown_origins = map(set, holds)
     result = []
     for s, records in sorted(by_signature.items(), key=lambda item: canonical(item[0])):
         values = sorted({r["INSPECC"] for r in records})
-        resolved = len(records) == 1 and s not in affected and s[0] not in unknown_origins
+        group_id = digest(s)
+        resolved = len(records) == 1 and group_id not in affected and s[0] not in unknown_origins
         result.append(
             {
-                "group_id": digest(s),
+                "group_id": group_id,
                 "group": s,
                 "status": "RESOLVED" if resolved else "REVIEW",
                 "INSPECC": values[0] if resolved else None,

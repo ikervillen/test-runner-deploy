@@ -50,6 +50,13 @@ def _apply(
             store.set_scope(previous_zc_scope)
 
 
+def _confirm_prepared(control, batch_id, version, prepared, rows):
+    if prepared.get("inspection_groups_from_confirmed_rows"):
+        control.confirm(batch_id, version, confirmed_rows=rows)
+    else:
+        control.confirm(batch_id, version)
+
+
 def _apply_pinned(config, control, store, batch):
     prepared = control.prepared(batch)
     store.read_context = prepared.get("archive_context")
@@ -89,7 +96,7 @@ def _apply_pinned(config, control, store, batch):
             verify_files(table, prepared, after=True)
         elif scoped_zc:
             store.verify_commit(table, table.version(), prepared)
-        control.confirm(batch["batch_id"], version)
+        _confirm_prepared(control, batch["batch_id"], version, prepared, rows)
         return version, False
     if version != prepared["before_version"] or content_hash(rows) != prepared["before_hash"]:
         raise IntegrityError(
@@ -97,10 +104,10 @@ def _apply_pinned(config, control, store, batch):
         )
     if scoped_mia:
         verify_files(table, prepared, after=False)
-    del rows  # Do not retain a second historical snapshot during append/confirmation.
     if not prepared["inserts"] and not prepared.get("updates"):
-        control.confirm(batch["batch_id"], version)
+        _confirm_prepared(control, batch["batch_id"], version, prepared, rows)
         return version, False
+    del rows  # Do not retain a second historical snapshot during append/confirmation.
     control.mark(batch["batch_id"], "WRITING")
     try:
         if config.family in {
@@ -128,7 +135,7 @@ def _apply_pinned(config, control, store, batch):
             verify_files(table, prepared, after=True)
         elif scoped_zc:
             store.verify_commit(table, table.version(), prepared)
-        control.confirm(batch["batch_id"], after_version)
+        _confirm_prepared(control, batch["batch_id"], after_version, prepared, after)
         return after_version, True
     except Exception as exc:
         # También se usa UNKNOWN si el cliente lanza después de confirmar Delta.
