@@ -10,6 +10,7 @@ permissions:
   contents: read
 
 env:
+  FRONTEND_CONTEXT_COMMIT: 19f581077307e83ffc1ee9535c9d575206ff7b38
   GOLD_CONTEXT_COMMIT: d1f27e83f6c6d04fc01bc05430a488e6bc7e393a
   GOLD_SOURCE_COMMIT: ad88dc3d0bdedfbc4da3de06da74e3801b9b64f7
 
@@ -137,15 +138,23 @@ jobs:
         run: |
           python -m pip install uv==0.11.6
           uv run --locked --no-dev python -m scripts.smoke_independent_compose fenix-independent:validation .quality-context
-      - name: Prepare the approved Live flow update
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '6883a7a198fae3fee521fb71bea7a9c5536ce140' && github.event.head_commit.message == 'Deploy the approved Fenix Live control room' && github.run_attempt == '1'
+        with:
+          ref: ${{ env.FRONTEND_CONTEXT_COMMIT }}
+          path: .frontend-context
+          persist-credentials: false
+      - name: Prepare the approved frontend update
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '49e948e1579c304484dda22ed84c6f9ce078e28f' && github.event.head_commit.message == 'Deploy official hourly Fenix Live application' && github.run_attempt == '1'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '6883a7a198fae3fee521fb71bea7a9c5536ce140' && github.event.head_commit.message == 'Deploy the approved Fenix Live control room' && github.run_attempt == '1'
         run: |
           set -euo pipefail
           mkdir -p bundle
           docker tag fenix-independent:validation "fenix-independent:sha-$GITHUB_SHA"
-          docker build --file .quality-context/Dockerfile.frontend --tag "fenix-quality:sha-$GITHUB_SHA" .quality-context
+          npm --prefix .frontend-context ci
+          npm --prefix .frontend-context test
+          docker build --file .frontend-context/Dockerfile.frontend --tag "fenix-quality:sha-$GITHUB_SHA" .frontend-context
           docker run --rm --network none --add-host backend:127.0.0.1 \
             --read-only --tmpfs /etc/nginx/conf.d --tmpfs /var/cache/nginx --tmpfs /var/run \
             -e BACKEND_PORT=8011 -e NGINX_ENVSUBST_TEMPLATE_DIR=/opt/fenix/templates \
@@ -226,7 +235,7 @@ jobs:
           pattern: live-image-*
           path: ${{ runner.temp }}/fenix-image-${{ github.run_id }}-${{ github.run_attempt }}
           merge-multiple: true
-      - name: Deploy the application and Gold on the existing Live generation
+      - name: Deploy the frontend on the existing Live generation
         shell: powershell
         env:
           FENIX_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
@@ -235,7 +244,7 @@ jobs:
         run: |
           $bundle = Join-Path $env:RUNNER_TEMP "fenix-image-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           try {
-            ./scripts/update_independent_workers.ps1 -ApplicationLive -Bundle $bundle `
+            ./scripts/update_independent_workers.ps1 -FrontendOnly -Bundle $bundle `
               -Image $env:IMAGE -Revision $env:GITHUB_SHA -GoldRevision $env:GOLD_CONTEXT_COMMIT
           } finally {
             Remove-Item -LiteralPath (Join-Path $bundle 'image.tar.gz'), (Join-Path $bundle 'image.json') -ErrorAction SilentlyContinue

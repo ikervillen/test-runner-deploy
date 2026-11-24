@@ -6,6 +6,7 @@ param(
     [switch]$LiveFlowOnly,
     [switch]$FreshLive,
     [switch]$ApplicationLive,
+    [switch]$FrontendOnly,
     [switch]$GoldOnly,
     [switch]$IncludeGoldHistory,
     [switch]$IncludeBackend,
@@ -22,7 +23,12 @@ $context = if ($hasSite) { $site.docker_context } else { $env:FENIX_DOCKER_CONTE
 if (-not $context) { throw 'No se ha configurado el contexto Docker.' }
 $project = $profile.project
 if ($FreshLive -and -not $LiveFlowOnly) { throw 'FreshLive requiere LiveFlowOnly.' }
-if ($ApplicationLive) {
+if ($FrontendOnly) {
+    if ($ApplicationLive -or $LiveFlowOnly -or $GoldOnly -or $IncludeGoldHistory -or $IncludeBackend -or $Immediate) {
+        throw 'FrontendOnly actualiza exclusivamente el frontend.'
+    }
+    $services = @('frontend')
+} elseif ($ApplicationLive) {
     if ($LiveFlowOnly -or $GoldOnly -or $IncludeGoldHistory -or $IncludeBackend -or $Immediate) {
         throw 'ApplicationLive conserva la generación Live existente.'
     }
@@ -168,6 +174,7 @@ if ($LiveFlowOnly) {
     }
 }
 foreach ($service in $services) {
+    if ($FrontendOnly) { break }
     $definition = $compose.services.$service
     if (-not $definition) { throw "El Compose activo no contiene $service." }
     $namedMounts = @($definition.volumes | Where-Object { $_.type -eq 'volume' })
@@ -218,6 +225,38 @@ if ($loaded.Id -cne $proof.image_id -or
     $loaded.Config.Labels.'org.opencontainers.image.revision' -cne $Revision -or
     $loaded.Config.Labels.'es.fenix.ingesta.gold.revision' -cne $GoldRevision) {
     throw 'Docker ha cargado una imagen distinta de la revisión aprobada.'
+}
+
+if ($FrontendOnly) {
+    $frontend = $compose.services.frontend
+    if (-not $frontend.image -or -not $compose.services.backend) {
+        throw 'Falta el frontend o el backend en el Compose activo.'
+    }
+    $oldId = (Invoke-Docker image inspect $frontend.image --format '{{.Id}}') -join ''
+    if ($workers.frontend.Image -cne $oldId) {
+        throw 'La imagen del frontend activo difiere de su Compose.'
+    }
+    $frontendTag = "fenix-quality:sha-$Revision"
+    $frontendId = (Invoke-Docker image inspect $frontendTag --format '{{.Id}}') -join ''
+    if ($frontendId -cne $proof.frontend_id -or $frontendId -cnotmatch '^sha256:[a-f0-9]{64}$') {
+        throw 'La imagen del frontend no coincide con el artefacto aprobado.'
+    }
+    $frontend.image = $frontendTag
+    $candidate = Join-Path (Split-Path -Parent $activeFile) "compose.$($Revision.Substring(0, 12)).json"
+    [IO.File]::WriteAllText($candidate, ($compose | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+    Invoke-Docker compose -p $project -f $candidate config --quiet
+    try {
+        Invoke-Docker compose -p $project -f $candidate up -d --no-deps --no-build --pull never `
+            --wait --wait-timeout 90 frontend
+        if ((Get-Worker 'frontend').Image -cne $frontendId) {
+            throw 'La imagen frontend activa difiere.'
+        }
+    } catch {
+        Invoke-Docker compose -p $project -f $activeFile up -d --no-deps --no-build --pull never frontend
+        throw
+    }
+    Write-Output "Frontend activo: $frontendTag | rollback: $activeFile"
+    return
 }
 
 if ($LiveFlowOnly) {
