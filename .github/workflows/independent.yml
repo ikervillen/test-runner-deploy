@@ -11,7 +11,7 @@ permissions:
 
 env:
   FRONTEND_CONTEXT_COMMIT: 19f581077307e83ffc1ee9535c9d575206ff7b38
-  GOLD_CONTEXT_COMMIT: dbf9182bff25f8fb73e0c1a378dc0d1928deb112
+  GOLD_CONTEXT_COMMIT: 4bbbfd9495d31410966f612cf343b38a14e4594f
   GOLD_SOURCE_COMMIT: ad88dc3d0bdedfbc4da3de06da74e3801b9b64f7
 
 jobs:
@@ -141,7 +141,7 @@ jobs:
       - name: Prepare the approved Gold Live AR update
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == 'd35e5e0380e49c7cb4d8e87fa32bf5ac4872639c' && github.event.head_commit.message == 'Deploy Gold Live AR catalog and hourly revisions' && github.run_attempt == '1'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '849d2efe0ad9869af52c0c16c7e579c5fb9dcb2c' && github.event.head_commit.message == 'Deploy Gold Live AR catalog and hourly revisions' && github.run_attempt == '1'
         run: |
           set -euo pipefail
           mkdir -p bundle
