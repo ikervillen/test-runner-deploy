@@ -1274,6 +1274,27 @@ def build(
     )
     if current_slot_seconds is not None:
         hour_plan = lanes.current_slot(prods, cutoff, current_slot_seconds)
+        if isinstance(snapshot, Evidence):
+            closed = set(snapshot.document.get("closed_hours", []))
+            hour_plan = [
+                c
+                for c in hour_plan
+                if Window(c.production_id, "HOUR", c.start, c.end, c.cutoff).identity not in closed
+            ]
+        current_keys = {(chunk.production_id, chunk.start) for chunk in hour_plan}
+        if isinstance(snapshot, Evidence):
+            for identity, left, right, accredited in snapshot.document.get("retry_closures", []):
+                start = datetime.fromisoformat(left)
+                if (identity, start) not in current_keys:
+                    hour_plan.append(
+                        lanes.HourChunk(
+                            identity,
+                            start,
+                            datetime.fromisoformat(right),
+                            datetime.fromisoformat(accredited),
+                        )
+                    )
+                    current_keys.add((identity, start))
     recorded = list(checked)
     if hour_plan:
         recorded.extend(_hour_key(chunk.production_id, chunk.start) for chunk in hour_plan or [])
@@ -1322,7 +1343,11 @@ def build(
                 link_rules,
                 only_ids=chosen,
                 spans=spans,
-                current_window=(lanes.hour_holding(cutoff)[0], cutoff)
+                current_window=(
+                    sorted({(c.read_from or c.start, c.cutoff) for c in hour_plan or []})
+                    if isinstance(snapshot, Evidence) and snapshot.document.get("retry_closures")
+                    else (lanes.hour_holding(cutoff)[0], cutoff)
+                )
                 if current_slot_seconds is not None
                 else None,
             )

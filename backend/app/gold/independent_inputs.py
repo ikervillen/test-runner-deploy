@@ -441,6 +441,7 @@ def export(pipelines, lane, config):
         "coverage": coverage,
     }
     window = None
+    scopes = None
     if lane == "live":
         full_families = OPERATIONS - incremental_families
         retained = bool(
@@ -462,6 +463,30 @@ def export(pipelines, lane, config):
         horizon = _source_horizon(coverage)
         if horizon:
             window = (hour_holding(horizon)[0], horizon)
+            published = storage.gold / "published"
+            if (published / "current.json").exists():
+                from .live_hours import retry_closures
+                from .publications import Snapshot
+
+                visible = Snapshot.open(published, require_gold_contract=True)
+                doc["closed_hours"] = []
+                doc["retry_closures"] = retry_closures(
+                    visible,
+                    coverage,
+                    horizon,
+                    policy.read_max_rows,
+                    closed=doc["closed_hours"],
+                )
+                if doc["retry_closures"]:
+                    scopes = [
+                        window,
+                        *sorted(
+                            {
+                                (datetime.fromisoformat(start), datetime.fromisoformat(target))
+                                for _, start, _, target in doc["retry_closures"]
+                            }
+                        ),
+                    ]
         if incremental:
             # Attribution consumes only the active window; the immutable manifest keeps
             # the full logical facts. Read through the original cache for untouched parts.
@@ -471,7 +496,9 @@ def export(pipelines, lane, config):
                 view.index = previous.index
                 tables[family] = (
                     pa.Table.from_batches(
-                        view.batches(family, max_rows=policy.read_max_rows, window=window),
+                        view.batches(
+                            family, max_rows=policy.read_max_rows, window=scopes or window
+                        ),
                         schema=CONTRACTS[family].schema,
                     )
                     if window
@@ -513,7 +540,7 @@ def export(pipelines, lane, config):
             "reused_catalogues": reused_catalogues,
             "previous_evidence_reads": dict(previous.read_stats) if previous else {},
         }
-    tables.update(attribution(doc, tables, window=window))
+    tables.update(attribution(doc, tables, window=scopes or window))
     tables.update(auxiliary_tables)
     doc["bronze_cursor"] = cursor
     doc["source_vector"] = vector

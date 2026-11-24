@@ -1164,3 +1164,82 @@ def test_live_export_can_carry_more_logical_rows_than_its_work_budget(
     assert stats["full_read_families"] == []
     assert len(recovered.proofs(max_rows=1000)["CONT_ZC"]) == 302
     assert export(small, "live", cfg).publication_id == recovered.publication_id
+
+
+def test_late_coverage_publishes_previous_closed_hour_in_real_delta(tmp_path, native):
+    from datetime import timedelta
+
+    from app.gold.common import read_json
+    from app.gold.live_hours import retry_closures
+    from app.gold.pipeline import run
+    from app.gold.publications import Snapshot
+
+    from .test_pipeline import CUTOFF, bundle
+
+    closing = CUTOFF - timedelta(hours=1)
+    later = closing + timedelta(minutes=10)
+    source = industrial_evidence(
+        tmp_path / "source",
+        "live",
+        recent=True,
+        native=native,
+        horizon=later,
+        window_seconds=600,
+    )
+    metadata = {k: v for k, v in source.document.items() if k not in {"tables", "schema_id"}}
+    tables = {
+        r["name"]: source.table(r["name"], max_rows=100000) for r in source.document["tables"]
+    }
+    coverage = metadata["coverage"]
+    late = [
+        {**r, "covered_until": (closing - timedelta(minutes=10)).isoformat()}
+        if r["source"] == "CONT_ZC"
+        else r
+        for r in coverage
+    ]
+    initial = save(source.root, {**metadata, "coverage": late}, tables, window_seconds=600)
+    published = tmp_path / "output"
+    options = dict(
+        bundle=bundle(),
+        config=read_json(Path(__file__).parents[3] / "config/customer_score.json"),
+        environment="test",
+        plant="AV",
+        lane="live",
+        current_slot_seconds=600,
+        mia_reference_mode="live",
+    )
+    assert (
+        run(initial.root, published, confirmed_input=initial, cutoff=closing, **options)["status"]
+        == "PUBLISHED"
+    )
+    before = Snapshot.open(published)
+    assert not [r for r in before.rows("quality_scores") if r["corte"] == closing]
+    retry = retry_closures(before, coverage, later, 100000)
+    assert retry and all(item[3] == closing.isoformat() for item in retry)
+    after = save(source.root, {**metadata, "retry_closures": retry}, tables, window_seconds=600)
+    assert (
+        run(after.root, published, confirmed_input=after, cutoff=later, **options)["status"]
+        == "PUBLISHED"
+    )
+    visible = Snapshot.open(published)
+    assert [r for r in visible.rows("quality_scores") if r["corte"] == closing]
+    assert not retry_closures(visible, coverage, later, 100000)
+    settled = {
+        row["id_resultado"]: row
+        for row in visible.rows("quality_scores")
+        if row["corte"] == closing
+    }
+    next_cut = later + timedelta(minutes=10)
+    advanced = save(source.root, {**metadata, "retry_closures": []}, tables, window_seconds=600)
+    assert (
+        run(advanced.root, published, confirmed_input=advanced, cutoff=next_cut, **options)[
+            "status"
+        ]
+        == "PUBLISHED"
+    )
+    final = Snapshot.open(published)
+    assert {
+        row["id_resultado"]: row
+        for row in final.rows("quality_scores")
+        if row["id_resultado"] in settled
+    } == settled
