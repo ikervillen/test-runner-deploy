@@ -1259,9 +1259,12 @@ def independent_dependencies(root, snapshot, *, telemetry=None):
                 telemetry["new_physical_bytes"] = (
                     None if size is None else telemetry["new_physical_bytes"] + size
                 )
+    for ref in snapshot.wire_document["tables"]:
+        for page in ref.get("parts_pages", []):
+            publish_reference(snapshot.root, target, page)
     immutable_json(
         target / f"{snapshot.publication_id}.json",
-        snapshot.document,
+        snapshot.wire_document,
         max_bytes=MAX_MANIFEST_BYTES,
     )
     copied = Evidence.open(target, snapshot.publication_id)
