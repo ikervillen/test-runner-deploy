@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory = $true)][string]$GoldRevision,
     [switch]$LiveFlowOnly,
     [switch]$FreshLive,
+    [switch]$ApplicationLive,
     [switch]$GoldOnly,
     [switch]$IncludeGoldHistory,
     [switch]$IncludeBackend,
@@ -21,7 +22,12 @@ $context = if ($hasSite) { $site.docker_context } else { $env:FENIX_DOCKER_CONTE
 if (-not $context) { throw 'No se ha configurado el contexto Docker.' }
 $project = $profile.project
 if ($FreshLive -and -not $LiveFlowOnly) { throw 'FreshLive requiere LiveFlowOnly.' }
-if ($LiveFlowOnly) {
+if ($ApplicationLive) {
+    if ($LiveFlowOnly -or $GoldOnly -or $IncludeGoldHistory -or $IncludeBackend -or $Immediate) {
+        throw 'ApplicationLive conserva la generación Live existente.'
+    }
+    $services = @('gold-live', 'backend')
+} elseif ($LiveFlowOnly) {
     if ($GoldOnly -or $IncludeGoldHistory -or $IncludeBackend -or $Immediate) {
         throw 'LiveFlowOnly configura el flujo completo y detiene History con drenaje.'
     }
@@ -244,6 +250,68 @@ print(json.dumps(compose))
     $compose = ($configured -join '') | ConvertFrom-Json
 }
 
+if ($ApplicationLive) {
+    foreach ($service in @('ingesta-history', 'gold-history')) {
+        $running = @(Invoke-Docker ps --filter "label=com.docker.compose.project=$project" `
+            --filter "label=com.docker.compose.service=$service" --format '{{.ID}}')
+        if ($running.Count) { throw "History debe estar detenido: $service." }
+    }
+    $t0 = @($workers['gold-live'].Config.Env | Where-Object { $_ -clike 'FENIX_LIVE_T0=*' })
+    if ($t0.Count -ne 1 -or $workers['backend'].Config.Env -cnotcontains $t0[0]) {
+        throw 'Gold y el backend deben pertenecer a la misma generación Live.'
+    }
+    $frontendTag = "fenix-quality:sha-$Revision"
+    $frontendId = (Invoke-Docker image inspect $frontendTag --format '{{.Id}}') -join ''
+    if ($frontendId -cne $proof.frontend_id -or $frontendId -cnotmatch '^sha256:[a-f0-9]{64}$') {
+        throw 'La imagen del frontend no coincide con el artefacto aprobado.'
+    }
+    $backend = $compose.services.backend
+    if ($backend.environment.APP_GOLD_HISTORY_ENABLED -cne 'false') {
+        throw 'El backend debe tener History desactivado.'
+    }
+    if (@($backend.volumes | Where-Object {
+        -not $_.read_only -or ($_.type -eq 'volume' -and $_.source -cne 'live-gold') -or
+        ($_.type -eq 'bind' -and $_.target -cne $profile.configuration_target)
+    }).Count) {
+        throw 'El backend debe montar exclusivamente Gold Live en lectura.'
+    }
+    $hadFrontend = $null -ne $compose.services.PSObject.Properties['frontend']
+    if ($hadFrontend) {
+        $ports = @($compose.services.frontend.ports)
+    } else {
+        $ports = @($backend.ports | ForEach-Object {
+            if ($_ -isnot [string] -or $_ -notmatch '^.+:\d+:\d+$') {
+                throw 'El puerto del backend debe tener una dirección de enlace explícita.'
+            }
+            $_ -replace ':\d+$', ':8080'
+        })
+    }
+    if ($ports.Count -ne 1 -or $ports[0] -notmatch '^127\.0\.0\.1:\d+:8080$') {
+        throw 'El frontend requiere el enlace local que utiliza el proxy de confianza.'
+    }
+    $backend.PSObject.Properties.Remove('ports')
+    $portIndex = [Array]::IndexOf(@($backend.command), '--port')
+    if ($portIndex -lt 0 -or $backend.command[$portIndex+1] -notmatch '^\d{1,5}$') {
+        throw 'No se pudo acreditar el puerto interno del backend.'
+    }
+    $backendPort = [int]$backend.command[$portIndex+1]
+    if ($backendPort -lt 1 -or $backendPort -gt 65535) { throw 'Puerto interno inválido.' }
+    $health = "import urllib.request; urllib.request.urlopen('http://127.0.0.1:$backendPort/api/health', timeout=2)"
+    $backend.healthcheck = @{
+        test=@('CMD','python','-c',$health)
+        interval='15s'; timeout='5s'; retries=3
+    }
+    $frontend = @{
+        image=$frontendTag; ports=$ports; restart='unless-stopped'; read_only=$true
+        cpus=0.5; mem_limit='256m'; pids_limit=64
+        environment=@{BACKEND_PORT=[string]$backendPort; NGINX_ENVSUBST_TEMPLATE_DIR='/opt/fenix/templates'}
+        tmpfs=@('/var/cache/nginx:size=32m,nosuid,nodev', '/var/run:size=8m,nosuid,nodev', '/etc/nginx/conf.d:size=1m,nosuid,nodev')
+        healthcheck=@{test=@('CMD-SHELL','wget -q -O /dev/null http://127.0.0.1:8080/'); interval='15s'; timeout='3s'; retries=3}
+        logging=@{driver='local'; options=@{'max-size'='10m'; 'max-file'='3'}}
+    }
+    $compose.services | Add-Member -NotePropertyName 'frontend' -NotePropertyValue $frontend -Force
+}
+
 $activeDirectory = Split-Path -Parent $activeFile
 $candidate = Join-Path $activeDirectory "compose.$($Revision.Substring(0, 12)).json"
 [IO.File]::WriteAllText($candidate, ($compose | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
@@ -315,6 +383,50 @@ if ($LiveFlowOnly) {
         }
         throw
     }
+} elseif ($ApplicationLive) {
+    $writerCutover = $false
+    $writerStopped = $false
+    try {
+        Invoke-Docker compose -p $project -f $candidate up -d --no-deps --no-build --pull never `
+            --wait --wait-timeout 90 backend frontend
+        $writerStopped = $true
+        Invoke-Docker compose -p $project -f $activeFile stop --timeout ([int]$site.drain_seconds) gold-live
+        $goldMount = @($compose.services.'gold-live'.volumes | Where-Object source -ceq 'live-gold')
+        if ($goldMount.Count -ne 1) { throw 'El montaje Gold no está acreditado.' }
+        $preflight = 'from pathlib import Path; import json, sys; root = Path(sys.argv[1]) / ''published'' / ''operations''; assert all(json.loads(p.read_text())[''state''] == ''ACKNOWLEDGED'' for p in root.glob(''*.json'')), ''Gold still has an unfinished publication'''
+        Invoke-Docker compose -p $project -f $candidate run --rm --no-deps --pull never `
+            --entrypoint python gold-live -B -c $preflight $goldMount[0].target
+        $writerCutover = $true
+        Invoke-Docker compose -p $project -f $candidate up -d --no-deps --no-build --pull never `
+            --timeout ([int]$site.drain_seconds) gold-live
+        foreach ($service in $services) {
+            $actual = Get-Worker $service
+            if ($actual.Image -cne $proof.image_id -or $actual.Config.Env -cnotcontains $t0[0]) {
+                throw "La actualización no conserva la imagen aprobada y T0 en $service."
+            }
+            $oldMounts = @($workers[$service].Mounts | Where-Object Type -eq 'volume' |
+                ForEach-Object { "$($_.Name):$($_.Destination)" } | Sort-Object)
+            $newMounts = @($actual.Mounts | Where-Object Type -eq 'volume' |
+                ForEach-Object { "$($_.Name):$($_.Destination)" } | Sort-Object)
+            if (($oldMounts -join ';') -cne ($newMounts -join ';')) {
+                throw "Se modificaron los montajes de $service."
+            }
+        }
+        $activeFrontend = Get-Worker 'frontend'
+        if ($activeFrontend.Image -cne $frontendId) { throw 'La imagen frontend activa difiere.' }
+        Write-Output "Aplicación disponible en el puerto publicado: $($ports[0]) | $($t0[0]) | rollback: $activeFile"
+    } catch {
+        Invoke-Docker compose -p $project -f $candidate stop frontend
+        $restore = @('backend')
+        if ($writerCutover) {
+            Write-Warning 'Gold conserva una revisión capaz de recuperar sus propias operaciones.'
+        } elseif ($writerStopped) {
+            $restore += 'gold-live'
+        }
+        if ($hadFrontend) { $restore += 'frontend' }
+        Invoke-Docker compose -p $project -f $activeFile up -d --no-deps --no-build --pull never @restore
+        throw
+    }
 } elseif ($Immediate) {
     $order = if ($IncludeBackend) { @('backend', 'gold-history', 'gold-live') } else { $services }
     foreach ($service in $order) {
@@ -342,7 +454,7 @@ foreach ($service in $services) {
     Write-Output "${service} | $($worker.Id.Substring(0, 12)) | $tag"
 }
 Invoke-Docker compose -p $project -f $candidate ps --all
-if (-not $Immediate -and -not $LiveFlowOnly) {
+if (-not $Immediate -and -not $LiveFlowOnly -and -not $ApplicationLive) {
     "FENIX_VERIFY_CONTEXT=$context", "FENIX_VERIFY_PROJECT=$project", "FENIX_VERIFY_SINCE=$started", `
         "FENIX_VERIFY_PENDING=$originalPending" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 }
