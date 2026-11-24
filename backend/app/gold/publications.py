@@ -159,6 +159,7 @@ class Snapshot:
         max_rows: int = 250_000,
         file_pruning_predicate=None,
         on_scan=None,
+        on_decode=None,
         pushdown: bool = False,
     ) -> Iterator[pa.RecordBatch]:
         count = 0
@@ -178,6 +179,8 @@ class Snapshot:
             )
         )
         for batch in scanner.to_batches():
+            if on_decode is not None:
+                on_decode(batch.num_rows)
             # Arrow 23 cannot prune every statistics kind written by Delta MERGE.
             if expression is not None:
                 batch = batch.filter(expression)
@@ -608,9 +611,16 @@ class Publisher:
                 f"Dependent tables must be recalculated together: {sorted(omitted)}"
             )
         previous_scores = {}
-        if previous and any(r["name"] == "quality_scores" for r in previous["tables"]):
+        if previous and "quality_scores" in prior_names and (fact_bounds is None or result_ids):
+            import pyarrow.dataset as ds
+
+            select = list(result_ids) if fact_bounds is not None and result_ids else None
             previous_scores = {
-                r["id_resultado"]: r for r in Snapshot(self.root, previous).rows("quality_scores")
+                r["id_resultado"]: r
+                for r in Snapshot(self.root, previous).rows(
+                    "quality_scores",
+                    expression=ds.field("id_resultado").isin(select) if select else None,
+                )
             }
 
         def prepared(name):
@@ -908,7 +918,7 @@ class Publisher:
     ):
         from .contracts import CONTRACT_VERSION, CONTRACTS, contract_id, ordered, validate
 
-        if getattr(rows, "spilled", None):
+        if getattr(rows, "spilled", None) or (fact_bounds is not None and hasattr(rows, "spilled")):
             if scopes:
                 raise IntegrityError("A spilled publication has no partial replacement scope")
             return self._publish_stream(
@@ -1235,30 +1245,73 @@ def independent_dependencies(root, snapshot, *, telemetry=None):
     seen = set()
     if telemetry is not None:
         telemetry.update(
-            new_links=0, existing_links=0, new_copies=0, existing_copies=0, new_physical_bytes=0
+            new_links=0,
+            existing_links=0,
+            new_copies=0,
+            existing_copies=0,
+            new_physical_bytes=0,
+            accredited_subtrees=0,
         )
+
+    def copy(item):
+        uri = item["uri"]
+        if uri in seen:
+            return
+        seen.add(uri)
+        kind = publish_reference(snapshot.root, target, item)
+        if telemetry is None:
+            return
+        if kind.endswith("_link"):
+            telemetry[f"{kind}s"] += 1
+        else:
+            telemetry[f"{kind.removesuffix('_copy')}_copies"] += 1
+        if kind == "new_copy" and telemetry["new_physical_bytes"] is not None:
+            try:
+                size = allocated_bytes(target / uri)
+            except OSError:
+                size = None
+            telemetry["new_physical_bytes"] = (
+                None if size is None else telemetry["new_physical_bytes"] + size
+            )
+
+    def copy_tree(ref):
+        from ingesta_delta_lake.association_cas import sync
+
+        from .evidence import checked_file
+
+        marker = within(target, f"index/ack/{ref['hash']}.json")
+        if marker.exists():
+            if read_json(marker) != ref:
+                raise IntegrityError("Gold fragment accreditation differs")
+            checked_file(target, ref)
+            if telemetry is not None:
+                telemetry["accredited_subtrees"] += 1
+            return
+        page = snapshot.index.page(ref)
+        for child in page.get("children", {}).values():
+            copy_tree(child)
+        for part in page.get("parts", []):
+            copy(part)
+        copy(ref)
+        immutable_json(marker, ref)
+        sync(marker.parent)
+        sync(marker.parent.parent)
+
     for ref in snapshot.document["tables"]:
-        for item in evidence_files(ref):
-            uri = item["uri"]
-            kind = publish_reference(snapshot.root, target, item)
-            if telemetry is None or uri in seen:
-                continue
-            seen.add(uri)
-            if kind.endswith("_link"):
-                telemetry[f"{kind}s"] += 1
-            else:
-                telemetry[f"{kind.removesuffix('_copy')}_copies"] += 1
-            if kind == "new_copy" and telemetry["new_physical_bytes"] is not None:
-                try:
-                    size = allocated_bytes(target / uri)
-                except OSError:
-                    size = None
-                telemetry["new_physical_bytes"] = (
-                    None if size is None else telemetry["new_physical_bytes"] + size
-                )
+        if "parts_root" in ref or "family_roots" in ref:
+            roots = [ref["parts_root"]] if "parts_root" in ref else ref["family_roots"].values()
+            for node in roots:
+                if node:
+                    copy_tree(node)
+        else:
+            for item in evidence_files(ref):
+                copy(item)
+    for ref in snapshot.wire_document["tables"]:
+        for page in ref.get("parts_pages", []):
+            publish_reference(snapshot.root, target, page)
     immutable_json(
         target / f"{snapshot.publication_id}.json",
-        snapshot.document,
+        snapshot.wire_document,
         max_bytes=MAX_MANIFEST_BYTES,
     )
     copied = Evidence.open(target, snapshot.publication_id)

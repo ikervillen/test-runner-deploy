@@ -85,7 +85,9 @@ class Worker:
         return identity
 
     def historical_reference(self):
-        if self.lane != "live":
+        from .common import live_epoch
+
+        if self.lane != "live" or live_epoch():
             return None
         root = self.pipelines.history.gold / "published"
         cache = self.root / "checkpoint" / "history-reference.json"

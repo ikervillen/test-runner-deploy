@@ -6,6 +6,7 @@ import hashlib
 import json
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
+from itertools import groupby, islice
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -20,6 +21,7 @@ from .common import (
     read_json,
     within,
 )
+from .fragment_index import FragmentIndex
 from .producer import assignment_tables
 
 SCHEMA = "quality-independent-input-v1"
@@ -112,14 +114,89 @@ def _overlaps_fragment(name, item, window):
     return first <= right and last > left
 
 
-def save(root, document, tables, *, window_seconds=None, reuse=None):
+PARTS_PER_PAGE = 128
+PAGE_LIMIT = 256_000
+
+
+def _pack_parts(root, ref, seconds):
+    parts = ref.get("parts", [])
+    if len(parts) <= PARTS_PER_PAGE:
+        return ref
+
+    def bucket(part):
+        *prefix, slot = part["partition"]
+        return (*prefix, (slot * seconds) // 86_400)
+
+    pages = []
+    for _, compatible in groupby(parts, key=bucket):
+        while chunk := list(islice(compatible, PARTS_PER_PAGE)):
+            payload = {"parts": chunk}
+            identity = digest(payload)
+            uri = f"index/{identity}.json"
+            path = within(root, uri)
+            path.parent.mkdir(exist_ok=True)
+            if not path.exists():
+                immutable_json(path, payload, max_bytes=PAGE_LIMIT)
+            pages.append({"uri": uri, "hash": identity})
+    return {**{k: v for k, v in ref.items() if k != "parts"}, "parts_pages": pages}
+
+
+def _index_ref(index, ref):
+    parts = ref.get("parts", [])
+    if ref["name"] == "__lineage":
+        families = dict(ref.get("family_roots", {}))
+        grouped = defaultdict(dict)
+        for part in parts:
+            partition = tuple(part["partition"])
+            grouped[partition[0]][partition] = part
+        for family, edits in grouped.items():
+            families[family] = index.updated(families.get(family), edits)
+        return {
+            "name": "__lineage",
+            "family_roots": families,
+            "rows": sum(node["rows"] for node in families.values() if node),
+        }
+    root = index.updated(None, {tuple(part["partition"]): part for part in parts})
+    return {"name": ref["name"], "parts_root": root, "rows": ref["rows"]}
+
+
+def _unpack_parts(root, ref):
+    if "parts_pages" not in ref:
+        return ref
+    parts = []
+    for page in ref["parts_pages"]:
+        block = read_json(within(root, page["uri"]), max_bytes=PAGE_LIMIT)
+        if digest(block) != page["hash"] or not 1 <= len(block["parts"]) <= PARTS_PER_PAGE:
+            raise IntegrityError("Gold evidence descriptor page differs")
+        parts.extend(block["parts"])
+    if sum(p["rows"] for p in parts) != ref["rows"]:
+        raise IntegrityError("Gold evidence descriptor count differs")
+    return {**{k: v for k, v in ref.items() if k != "parts_pages"}, "parts": parts}
+
+
+def save(root, document, tables, *, window_seconds=None, reuse=None, fact_refs=(), lineage_refs=()):
     """Persist all bytes before making this input eligible for a Gold publication."""
     root.mkdir(parents=True, exist_ok=True)
     document, tables = dict(document), dict(tables)
+    carried_lineage = []
+    lineage_roots = {}
+    for ref in lineage_refs:
+        if "family_index" in ref:
+            lineage_roots[ref["family_index"]] = ref["root"]
+        else:
+            carried_lineage.append(ref)
     if "lineages" in document:
+        lineages = dict(document.pop("lineages"))
+        if document.get("fragment_lineage"):
+            from .fragment_delta import bootstrap_lineage
+
+            for name in sorted(OPERATIONS & lineages.keys()):
+                carried_lineage.extend(
+                    bootstrap_lineage(root, name, tables[name], lineages.pop(name), window_seconds)
+                )
         proofs = [
             {"family": family, "key": key, "proof": json.dumps(proof, sort_keys=True)}
-            for family, keys in document.pop("lineages").items()
+            for family, keys in lineages.items()
             for key, records in keys.items()
             for proof in records
         ]
@@ -129,10 +206,20 @@ def save(root, document, tables, *, window_seconds=None, reuse=None):
                 [("family", pa.string()), ("key", pa.string()), ("proof", pa.string())]
             ),
         )
-    refs = []
+    refs = list(fact_refs)
     for name, table in sorted(tables.items()):
         fragments = _fragments(name, table, window_seconds)
-        if not fragments:
+        if name == "__lineage" and (carried_lineage or lineage_roots):
+            descriptors = carried_lineage + [
+                {**_write_table(root, part), "partition": list(key)}
+                for key, part in fragments or ()
+            ]
+            ref = {
+                **({"family_roots": lineage_roots} if lineage_roots else {}),
+                "parts": sorted(descriptors, key=lambda part: part["partition"]),
+                "rows": sum(item["rows"] for item in descriptors),
+            }
+        elif not fragments:
             ref = reuse.matching_file(name, table) if reuse else None
             if ref is None:
                 ref = _write_table(root, table)
@@ -150,7 +237,19 @@ def save(root, document, tables, *, window_seconds=None, reuse=None):
                 descriptors.append(item)
             ref = {"parts": descriptors, "rows": table.num_rows}
         refs.append({"name": name, **ref})
-    payload = {**document, "schema_id": SCHEMA, "tables": refs}
+    if window_seconds:
+        index = FragmentIndex(root)
+        refs = [
+            _index_ref(index, ref)
+            if (
+                ref["name"] in OPERATIONS | {"__lineage"}
+                and ("family_roots" in ref or len(ref.get("parts", [])) > PARTS_PER_PAGE)
+                and document.get("fragment_lineage")
+            )
+            else _pack_parts(root, ref, window_seconds)
+            for ref in refs
+        ]
+    payload = {**document, "schema_id": SCHEMA, "tables": sorted(refs, key=lambda r: r["name"])}
     payload_bytes = canonical(payload)
     if len(payload_bytes) > MAX_MANIFEST_BYTES:
         raise IntegrityError("Gold input manifest exceeds its metadata budget")
@@ -164,7 +263,13 @@ def save(root, document, tables, *, window_seconds=None, reuse=None):
 
 class Evidence:
     def __init__(self, root, identity, document):
-        self.root, self.publication_id, self.document = root, identity, document
+        self.root, self.publication_id = root, identity
+        self.wire_document = document
+        self.document = {
+            **document,
+            "tables": [_unpack_parts(root, ref) for ref in document["tables"]],
+        }
+        document = self.document
         self.manifest = {
             **document,
             "publication_id": identity,
@@ -172,6 +277,7 @@ class Evidence:
             "source_mode": "continuous",
             "tables": [{**r, "delta_version": 0} for r in document["tables"]],
         }
+        self.index = FragmentIndex(root)
         self._tables = {}
         self._fragments = {}
         self.read_stats = defaultdict(Counter)
@@ -190,15 +296,41 @@ class Evidence:
             raise IntegrityError("Gold evidence hash differs")
         return cls(root, identity, document)
 
+    def parts(self, ref, *, families=None, accept=None):
+        if "parts_root" in ref:
+            yield from self.index.parts(ref["parts_root"], accept)
+        elif "family_roots" in ref:
+            for family, root in sorted(ref["family_roots"].items()):
+                if families is None or family in families:
+                    yield from self.index.parts(root, accept)
+        else:
+            for part in evidence_files(ref):
+                if (
+                    families is not None
+                    and "partition" in part
+                    and part["partition"][0] not in families
+                ):
+                    continue
+                if not accept or accept(part):
+                    yield part
+
     def table(self, name, *, max_rows):
         if name not in self._tables:
             ref = next((r for r in self.document["tables"] if r["name"] == name), None)
             if ref is None or ref["rows"] > max_rows:
                 raise IntegrityError("Gold evidence exceeds its explicit row budget")
             parts = []
-            for item in evidence_files(ref):
+            for item in self.parts(ref):
                 parts.append(self._read_part(name, item))
-            table = pa.concat_tables(parts) if len(parts) > 1 else parts[0]
+            if not parts:
+                from ingesta_delta_lake.contracts import CONTRACTS
+
+                from .fragment_delta import LINEAGE_SCHEMA
+
+                schema = LINEAGE_SCHEMA if name == "__lineage" else CONTRACTS[name].schema
+                table = pa.Table.from_pylist([], schema=schema)
+            else:
+                table = pa.concat_tables(parts) if len(parts) > 1 else parts[0]
             if table.num_rows != ref["rows"]:
                 raise IntegrityError("Gold evidence count differs")
             self._tables[name] = table
@@ -213,10 +345,13 @@ class Evidence:
         if previous and previous[0] == item:
             self.read_stats[name]["fragments_reused"] += 1
             return previous[1]
-        table = pq.ParquetFile(checked_file(self.root, item)).read(use_threads=False)
+        path = checked_file(self.root, item)
+        table = pq.ParquetFile(path).read(use_threads=False)
         if table.num_rows != item["rows"]:
             raise IntegrityError("Gold evidence fragment count differs")
-        self.read_stats[name].update(fragments_opened=1, rows_decoded=table.num_rows)
+        self.read_stats[name].update(
+            fragments_opened=1, rows_decoded=table.num_rows, parquet_file_bytes=path.stat().st_size
+        )
         if partition:
             parts[partition] = (item, table)
         return table
@@ -232,12 +367,28 @@ class Evidence:
                 return {key: ref[key] for key in ("uri", "hash", "rows")}
         return None
 
-    def proofs(self, *, max_rows):
+    def proofs(self, *, max_rows, families=None):
         result = {}
-        for row in self.table("__lineage", max_rows=max_rows).to_pylist():
-            result.setdefault(row["family"], {}).setdefault(row["key"], []).append(
-                json.loads(row["proof"])
-            )
+        ref = next((r for r in self.document["tables"] if r["name"] == "__lineage"), None)
+        if ref and ("parts" in ref or "family_roots" in ref) and families is not None:
+
+            def scoped():
+                scanned = 0
+                for part in self.parts(ref, families=families):
+                    scanned += part["rows"]
+                    if scanned > max_rows:
+                        raise IntegrityError("Gold lineage exceeds its explicit row budget")
+                    yield self._read_part("__lineage", part)
+
+            batches = scoped()
+        else:
+            batches = iter((self.table("__lineage", max_rows=max_rows),))
+        for batch in batches:
+            for row in batch.to_pylist():
+                if families is None or row["family"] in families:
+                    result.setdefault(row["family"], {}).setdefault(row["key"], []).append(
+                        json.loads(row["proof"])
+                    )
         return result
 
     def batches(self, name, *, max_rows=None, expression=None, window=None, **_kwargs):
@@ -245,12 +396,25 @@ class Evidence:
         if type(max_rows) is not int or max_rows < 1:
             raise IntegrityError("Gold evidence needs an explicit row budget")
         ref = next((r for r in self.document["tables"] if r["name"] == name), None)
-        if window and name in OPERATIONS and ref and "parts" in ref and name not in self._tables:
+        if (
+            window
+            and name in OPERATIONS
+            and ref
+            and name not in self._tables
+            and ("parts" in ref or "parts_root" in ref)
+        ):
             scanned = 0
-            for part in ref["parts"]:
-                if not _overlaps_fragment(name, part, window):
-                    self.read_stats[name]["fragments_pruned"] += 1
-                    continue
+
+            def accept(part):
+                if any(
+                    _overlaps_fragment(name, part, scope)
+                    for scope in (window if isinstance(window, list) else [window])
+                ):
+                    return True
+                self.read_stats[name]["fragments_pruned"] += 1
+                return False
+
+            for part in self.parts(ref, accept=accept):
                 scanned += part["rows"]
                 if scanned > max_rows:
                     raise IntegrityError("Gold evidence exceeds its explicit row budget")
@@ -303,6 +467,11 @@ def operational_expression(family, window):
 
     if window is None:
         return None
+    if isinstance(window, list):
+        combined = ds.scalar(False)
+        for scope in window:
+            combined |= operational_expression(family, scope)
+        return combined
     left, right = window
     if family == "LISTA_AR":
         return (ds.field("FECHA_ON") < right) & (

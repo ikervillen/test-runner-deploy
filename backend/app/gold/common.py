@@ -44,6 +44,14 @@ def digest(value: Any) -> str:
     return hashlib.sha256(canonical(value)).hexdigest()
 
 
+def live_epoch():
+    if not os.environ.get("FENIX_LIVE_T0"):
+        return None
+    from ingesta_delta_lake.live_epoch import epoch
+
+    return epoch()
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 

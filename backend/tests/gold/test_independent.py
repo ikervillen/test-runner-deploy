@@ -121,21 +121,24 @@ def test_auxiliary_cursor_without_scoring_changes_does_not_export(independent, m
     assert updated.publication_id != original.publication_id
     assert updated.document["silver_read"]["rows"] == 0
     assert "SIP_MODELO" in updated.document["silver_read"]["reused_catalogues"]
-    materialize = independent_inputs.materialize
+    update = independent_inputs.fragment_delta.update
 
-    def one_family_fallback(snapshot, previous, proofs, family, *args, **kwargs):
+    def one_family_fallback(snapshot, previous, family, *args, **kwargs):
         if family == "CONT_ZC":
             raise independent_inputs.FullReadRequired
-        return materialize(snapshot, previous, proofs, family, *args, **kwargs)
+        return update(snapshot, previous, family, *args, **kwargs)
 
-    monkeypatch.setattr(independent_inputs, "materialize", one_family_fallback)
+    monkeypatch.setattr(independent_inputs.fragment_delta, "update", one_family_fallback)
     monkeypatch.setattr(
         independent_inputs,
         "auxiliary_turn",
         lambda *a, **k: (tables, cursor + 3, (version[0], cursor + 3)),
     )
     revised = independent_inputs.export(plan, "live", cfg)
-    assert revised.document["silver_read"]["full_read_families"] == ["CONT_ZC"]
+    stats = revised.document["silver_read"]
+    assert stats["full_read_families"] == []
+    assert set(stats["reconciliation"]) == {"CONT_ZC"}
+    assert stats["reconciliation"]["CONT_ZC"]["examined"] == 0
     assert revised.document["silver_read"]["incremental"] is True
 
 
@@ -825,3 +828,418 @@ def test_historical_gold_publishes_model_and_segment_statistics(tmp_path, native
     assert live_result["status"] == "PUBLISHED"
     details = Snapshot.open(live_root).rows("mia_score_details")
     assert details and {r["muestras"] for r in details} == {4}
+
+
+def test_live_shared_history_matches_previous_route_with_same_pinned_cut(
+    tmp_path, native, monkeypatch
+):
+    from copy import deepcopy
+    from datetime import timedelta
+    from shutil import copytree
+
+    from app.gold import pipeline
+    from app.gold.common import canonical, read_json
+    from app.gold.publications import Snapshot
+
+    from .test_pipeline import CUTOFF, bundle
+
+    monkeypatch.setattr(pipeline, "utc_now", lambda: "2026-11-20T12:00:00+00:00")
+    target = CUTOFF - timedelta(hours=1)
+    evidence = industrial_evidence(
+        tmp_path / "inputs", "live", recent=True, native=native, horizon=target, window_seconds=600
+    )
+    config = read_json(Path(__file__).parents[3] / "config/customer_score.json")
+    options = dict(
+        confirmed_input=evidence,
+        bundle=bundle(),
+        cutoff=target,
+        environment="test",
+        plant="AV",
+        lane="live",
+        current_slot_seconds=600,
+        mia_reference_mode="live",
+    )
+    baseline = tmp_path / "baseline"
+    alternate = tmp_path / "candidate"
+    initial = pipeline.run(evidence.root, baseline, config=config, **options)
+    assert initial["status"] == "PUBLISHED"
+    copytree(baseline, alternate)
+    scoring = deepcopy(config)
+    scoring["weights"]["zc"] += 1
+
+    def force_budget_fallback(*args, **kwargs):
+        raise pipeline._SharedHistoryBudget
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pipeline, "_shared_history", force_budget_fallback)
+        old = pipeline.run(evidence.root, baseline, config=scoring, **options)
+    new = pipeline.run(evidence.root, alternate, config=scoring, **options)
+    assert old["status"] == new["status"] == "PUBLISHED"
+    before = old["incremental"]["score_timing"]
+    after = new["incremental"]["score_timing"]
+    assert before["history_shared_budget_fallback"]
+    assert not after["history_shared_budget_fallback"]
+    assert "quality_scores" in before["history_table_calls"]
+    assert "quality_scores" not in after["history_table_calls"]
+    assert after["history_table_calls"]["mia_window_exposures"] == 1
+
+    left, right = Snapshot.open(baseline), Snapshot.open(alternate)
+    assert left.rows("quality_scores")
+    assert left.publication_id == right.publication_id
+    for ref in left.manifest["tables"]:
+        name = ref["name"]
+        assert sorted(map(canonical, left.rows(name))) == sorted(map(canonical, right.rows(name)))
+    assert (
+        pipeline.run(evidence.root, alternate, config=scoring, **options)["status"] == "UNCHANGED"
+    )
+
+
+def test_fragment_cdf_gold_matches_reference_for_same_silver_cut(tmp_path, native, monkeypatch):
+    from datetime import timedelta
+    from time import perf_counter
+
+    from deltalake import DeltaTable, write_deltalake
+    from ingesta_delta_lake.contracts import CONTRACTS
+    from ingesta_delta_lake.pipeline_rows import business_key, review_hash
+
+    from app.gold import fragment_delta
+    from app.gold.common import canonical, read_json
+    from app.gold.evidence import attribution
+    from app.gold.lanes import hour_holding
+    from app.gold.pipeline import run
+    from app.gold.publications import Snapshot
+    from app.gold.silver_incremental import materialize
+
+    from .test_pipeline import CUTOFF, bundle
+
+    monkeypatch.setattr("app.gold.pipeline.utc_now", lambda: "2026-11-20T12:00:00+00:00")
+    family = "LISTA_RECH"
+    target = CUTOFF - timedelta(hours=1)
+    schema = CONTRACTS[family].schema
+    initial = industrial_evidence(
+        tmp_path / "initial", "live", recent=True, native=native, horizon=target, window_seconds=600
+    )
+    tables = {
+        r["name"]: initial.table(r["name"], max_rows=100000)
+        for r in initial.document["tables"]
+        if r["name"] != "__lineage"
+    }
+    rech = tables[family].to_pylist()
+    earlier = [
+        {**rech[0], "FECHA": target - timedelta(days=2, minutes=n * 10), "CAVIDAD": f"old-{n}"}
+        for n in range(240)
+    ]
+    tables[family] = pa.Table.from_pylist([*rech, *earlier], schema=schema)
+    silver_root = tmp_path / "silver-delta"
+    write_deltalake(
+        silver_root, tables[family], configuration={"delta.enableChangeDataFeed": "true"}
+    )
+    delta = DeltaTable(str(silver_root))
+    table_id = delta.metadata().id
+
+    def ref(version):
+        return {"table_id": table_id, "version": version, "rejected_hashes": []}
+
+    original_proofs = initial.proofs(max_rows=100000)
+    original_proofs[family] = {
+        business_key(family, row): [
+            {"source_table": table_id, "source_version": 0, "row_hash": review_hash(family, row)}
+        ]
+        for row in [*rech, *earlier]
+    }
+    input_root = tmp_path / "input"
+    doc = {
+        **initial.document,
+        "fragment_lineage": 600,
+        "silver_refs": {family: ref(0)},
+        "lineages": original_proofs,
+    }
+    save(input_root, doc, tables, window_seconds=600)
+    delta.update(
+        predicate=f"CAVIDAD = '{rech[0]['CAVIDAD']}'",
+        updates={"RECH": "RECH + 1"},
+    )
+    previous = Evidence.open(input_root)
+    native_snapshot = type("Source", (), {"table": lambda self, _: delta})()
+    native_snapshot.manifest = {"publication_id": "scope-proof", "tables": {family: ref(1)}}
+    started = perf_counter()
+    reference_rows, proofs, n = materialize(
+        native_snapshot, previous, original_proofs, family, ref(1), schema.names, budget=1000
+    )
+    baseline_s = perf_counter() - started
+    baseline_reads = dict(previous.read_stats)
+    previous = Evidence.open(input_root)
+    budget = 64
+    assert len(reference_rows) > budget
+    with pytest.raises(IntegrityError, match="row budget"):
+        previous.rows(family, max_rows=budget)
+    started = perf_counter()
+    fact, lineage, n2 = fragment_delta.update(
+        native_snapshot, previous, family, ref(1), schema, budget=budget, seconds=600
+    )
+    assert fact["rows"] > budget
+    assert sum(c["rows_decoded"] for c in previous.read_stats.values()) + n2 < budget
+    candidate_s = perf_counter() - started
+    print("EXPORT_AB", baseline_s, candidate_s, baseline_reads, dict(previous.read_stats))
+    assert n == n2 > 0
+    window = (hour_holding(target)[0], target)
+    patched = Evidence(input_root, previous.publication_id, {"tables": [fact]})
+    candidate_tables = {
+        **tables,
+        family: pa.Table.from_batches(
+            patched.batches(family, max_rows=1000, window=window), schema=schema
+        ),
+    }
+    reference_tables = {**tables, family: pa.Table.from_pylist(reference_rows, schema=schema)}
+    decisions = attribution(doc, candidate_tables, window=window)
+    baseline_decisions = attribution(doc, reference_tables, window=window)
+    assert {k: t.to_pylist() for k, t in decisions.items()} == {
+        k: t.to_pylist() for k, t in baseline_decisions.items()
+    }
+    candidate_tables.update(decisions)
+    reference_tables.update(baseline_decisions)
+    del candidate_tables[family]
+    published_doc = {**doc, "silver_refs": {family: ref(1)}}
+    current = save(
+        input_root,
+        {**published_doc, "lineages": {k: p for k, p in original_proofs.items() if k != family}},
+        candidate_tables,
+        window_seconds=600,
+        fact_refs=[fact],
+        lineage_refs=lineage,
+    )
+    baseline = save(
+        input_root,
+        {**published_doc, "lineages": {**original_proofs, family: proofs}},
+        reference_tables,
+        window_seconds=600,
+    )
+    assert current.proofs(max_rows=100000) == baseline.proofs(max_rows=100000)
+    assert current.rows(family, max_rows=1000) == baseline.rows(family, max_rows=1000)
+    assert current.publication_id == baseline.publication_id
+    wire = next(r for r in current.wire_document["tables"] if r["name"] == family)
+    assert "parts" not in wire and "parts_pages" not in wire
+    assert wire["parts_root"]["rows"] == wire["rows"]
+    options = dict(
+        bundle=bundle(),
+        config=read_json(Path(__file__).parents[3] / "config/customer_score.json"),
+        cutoff=target,
+        environment="test",
+        plant="AV",
+        lane="live",
+        current_slot_seconds=600,
+        mia_reference_mode="live",
+    )
+
+    def output(evidence, root):
+        result = run(evidence.root, root, confirmed_input=evidence, **options)
+        assert result["status"] == "PUBLISHED"
+        return Snapshot.open(root, require_gold_contract=True)
+
+    left = output(baseline, tmp_path / "baseline")
+    right = output(current, tmp_path / "candidate")
+    assert len(left.manifest["tables"]) == len(right.manifest["tables"]) == 36
+    assert left.rows("quality_scores")
+    for ref_row in left.manifest["tables"]:
+        name = ref_row["name"]
+        assert sorted(map(canonical, left.rows(name))) == sorted(map(canonical, right.rows(name)))
+
+    from app.gold import scoped_reconciliation
+
+    rebuilt, rebuilt_lineage, metrics = scoped_reconciliation.run(
+        tmp_path / "reconcile",
+        previous,
+        native_snapshot,
+        family,
+        schema,
+        origins=tuple({r["origen_fenix"] for r in reference_rows}),
+        seconds=600,
+        budget=64,
+        batch_size=8,
+    )
+    recovered = save(
+        input_root,
+        {**published_doc, "lineages": {k: p for k, p in original_proofs.items() if k != family}},
+        candidate_tables,
+        window_seconds=600,
+        fact_refs=[rebuilt],
+        lineage_refs=rebuilt_lineage,
+    )
+    assert metrics["peak_rows"] <= 64 < rebuilt["rows"]
+    assert recovered.proofs(max_rows=100000) == baseline.proofs(max_rows=100000)
+    reconciled = output(recovered, tmp_path / "reconciled")
+    assert len(reconciled.manifest["tables"]) == 36
+    for ref_row in left.manifest["tables"]:
+        name = ref_row["name"]
+        assert sorted(map(canonical, left.rows(name))) == sorted(
+            map(canonical, reconciled.rows(name))
+        )
+
+
+def test_live_export_can_carry_more_logical_rows_than_its_work_budget(
+    independent, native, monkeypatch
+):
+    from dataclasses import replace
+    from datetime import datetime, timedelta
+    from time import perf_counter
+
+    from ingesta_delta_lake.pipeline_publications import publish_family
+    from ingesta_delta_lake.pipeline_runtime import PipelineWorker
+    from ingesta_delta_lake.service import run
+
+    from app.gold.independent_inputs import export
+
+    plan, cfg = independent
+    worker = PipelineWorker(plan, "live", cfg)
+    source = cfg.sources[0][1] / "CONT_ZC.csv"
+    owner = replace(worker.source, family="CONT_ZC", intake_path=None)
+
+    def inputs(stamps):
+        return "".join(
+            f"21;{stamp:%d/%m/%Y %H:%M:%S};100;100;100;100;0;180;0;100;100;0;0;80.00;80.00;0;1;\n"
+            for stamp in stamps
+        )
+
+    def publish():
+        result = run(owner)
+        assert result["status"] == "APPLIED"
+        publish_family(
+            owner, worker.storage, lane="live", identity=worker.identity, family=owner.family
+        )
+
+    start = datetime(2026, 11, 14, 8)
+    source.write_text(inputs(start + timedelta(minutes=10 * i) for i in range(300)))
+    publish()
+    previous = export(plan, "live", cfg)
+    assert previous.document["silver_read"]["full_read_families"]
+    # Exercise actual legacy on-disk evidence, including source-version lineage partitions.
+    from app.gold.evidence import save
+
+    tables = {
+        r["name"]: previous.table(r["name"], max_rows=1000)
+        for r in previous.document["tables"]
+        if r["name"] != "__lineage"
+    }
+    metadata = {
+        k: v for k, v in previous.document.items() if k not in ("tables", "fragment_lineage")
+    }
+    metadata["lineages"] = previous.proofs(max_rows=1000)
+    legacy = save(previous.root, metadata, tables, window_seconds=600)
+
+    source.write_text(inputs([start + timedelta(minutes=3000)]))
+    publish()
+    small = replace(plan, policy=replace(plan.policy, read_max_rows=128))
+    began = perf_counter()
+    updated = export(small, "live", cfg)
+    print("LEGACY_BUDGET_EXPORT_SECONDS", perf_counter() - began, updated.document["silver_read"])
+    probe = updated.document["silver_read"]
+    assert probe["logical_rows"] > small.policy.read_max_rows
+    assert probe["materialized_rows"] < small.policy.read_max_rows
+    assert probe["lineage_bootstrap"] and "CONT_ZC" in probe["fragment_incremental_families"]
+    assert updated.table("CONT_ZC", max_rows=1000).num_rows == 301
+    assert len(updated.proofs(max_rows=1000)["CONT_ZC"]) == 301
+    assert (
+        Evidence.open(legacy.root, legacy.publication_id).table("CONT_ZC", max_rows=1000).num_rows
+        == 300
+    )
+    assert export(small, "live", cfg).publication_id == updated.publication_id
+
+    from app.gold import fragment_delta
+    from app.gold.silver_incremental import FullReadRequired
+
+    actual_update = fragment_delta.update
+
+    def missing_cdf(snapshot, previous, family, *args, **kwargs):
+        if family == "CONT_ZC":
+            raise FullReadRequired
+        return actual_update(snapshot, previous, family, *args, **kwargs)
+
+    source.write_text(inputs([start + timedelta(minutes=3010)]))
+    publish()
+    monkeypatch.setattr(fragment_delta, "update", missing_cdf)
+    recovered = export(small, "live", cfg)
+    assert recovered.table("CONT_ZC", max_rows=1000).num_rows == 302
+    stats = recovered.document["silver_read"]
+    assert stats["reconciliation"]["CONT_ZC"]["peak_rows"] <= small.policy.read_max_rows
+    assert stats["full_read_families"] == []
+    assert len(recovered.proofs(max_rows=1000)["CONT_ZC"]) == 302
+    assert export(small, "live", cfg).publication_id == recovered.publication_id
+
+
+def test_late_coverage_publishes_previous_closed_hour_in_real_delta(tmp_path, native):
+    from datetime import timedelta
+
+    from app.gold.common import read_json
+    from app.gold.live_hours import retry_closures
+    from app.gold.pipeline import run
+    from app.gold.publications import Snapshot
+
+    from .test_pipeline import CUTOFF, bundle
+
+    closing = CUTOFF - timedelta(hours=1)
+    later = closing + timedelta(minutes=10)
+    source = industrial_evidence(
+        tmp_path / "source",
+        "live",
+        recent=True,
+        native=native,
+        horizon=later,
+        window_seconds=600,
+    )
+    metadata = {k: v for k, v in source.document.items() if k not in {"tables", "schema_id"}}
+    tables = {
+        r["name"]: source.table(r["name"], max_rows=100000) for r in source.document["tables"]
+    }
+    coverage = metadata["coverage"]
+    late = [
+        {**r, "covered_until": (closing - timedelta(minutes=10)).isoformat()}
+        if r["source"] == "CONT_ZC"
+        else r
+        for r in coverage
+    ]
+    initial = save(source.root, {**metadata, "coverage": late}, tables, window_seconds=600)
+    published = tmp_path / "output"
+    options = dict(
+        bundle=bundle(),
+        config=read_json(Path(__file__).parents[3] / "config/customer_score.json"),
+        environment="test",
+        plant="AV",
+        lane="live",
+        current_slot_seconds=600,
+        mia_reference_mode="live",
+    )
+    assert (
+        run(initial.root, published, confirmed_input=initial, cutoff=closing, **options)["status"]
+        == "PUBLISHED"
+    )
+    before = Snapshot.open(published)
+    assert not [r for r in before.rows("quality_scores") if r["corte"] == closing]
+    retry = retry_closures(before, coverage, later, 100000)
+    assert retry and all(item[3] == closing.isoformat() for item in retry)
+    after = save(source.root, {**metadata, "retry_closures": retry}, tables, window_seconds=600)
+    assert (
+        run(after.root, published, confirmed_input=after, cutoff=later, **options)["status"]
+        == "PUBLISHED"
+    )
+    visible = Snapshot.open(published)
+    assert [r for r in visible.rows("quality_scores") if r["corte"] == closing]
+    assert not retry_closures(visible, coverage, later, 100000)
+    settled = {
+        row["id_resultado"]: row
+        for row in visible.rows("quality_scores")
+        if row["corte"] == closing
+    }
+    next_cut = later + timedelta(minutes=10)
+    advanced = save(source.root, {**metadata, "retry_closures": []}, tables, window_seconds=600)
+    assert (
+        run(advanced.root, published, confirmed_input=advanced, cutoff=next_cut, **options)[
+            "status"
+        ]
+        == "PUBLISHED"
+    )
+    final = Snapshot.open(published)
+    assert {
+        row["id_resultado"]: row
+        for row in final.rows("quality_scores")
+        if row["id_resultado"] in settled
+    } == settled

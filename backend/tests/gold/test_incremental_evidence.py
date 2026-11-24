@@ -163,3 +163,245 @@ def test_large_manifest_reopens_and_republishes_without_moving_an_invalid_pointe
     with pytest.raises(IntegrityError, match="Gold input manifest exceeds"):
         save(root, {**document, "extra": True}, {})
     assert Evidence.open(root).publication_id == snapshot.publication_id
+
+
+def test_cdf_reuses_fact_and_lineage_partitions_after_a_late_move(tmp_path, monkeypatch):
+    from datetime import timedelta
+
+    from ingesta_delta_lake.contracts import CONTRACTS
+    from ingesta_delta_lake.pipeline_rows import business_key, review_hash
+
+    from app.gold import evidence, fragment_delta
+
+    family = "LISTA_RECH"
+    schema = CONTRACTS[family].schema
+    start = datetime(2026, 11, 20, 8)
+    rows = [
+        dict(
+            origen_fenix="AV21",
+            FECHA=start + timedelta(minutes=i * 10),
+            MOLDE=3,
+            LINEA=21,
+            COD_MAQ_ZF=4,
+            INSPECC=100,
+            RECH=6,
+            RECH_AUTO=2,
+            CAVIDAD=str(i),
+            FECHA_R=None,
+        )
+        for i in range(32)
+    ]
+    source = pa.Table.from_pylist(rows, schema=schema)
+    path = tmp_path / "silver"
+    root = tmp_path / "evidence"
+    write_deltalake(path, source, configuration={"delta.enableChangeDataFeed": "true"})
+    table = DeltaTable(str(path))
+    table_id = table.metadata().id
+
+    def ref(version):
+        return {"table_id": table_id, "version": version, "rejected_hashes": []}
+
+    def document(version):
+        return {"fragment_lineage": 600, "silver_refs": {family: ref(version)}}
+
+    previous = save(
+        root,
+        {
+            **document(0),
+            "lineages": {
+                family: {
+                    business_key(family, row): [
+                        {
+                            "source_table": table_id,
+                            "source_version": 0,
+                            "row_hash": review_hash(family, row),
+                        }
+                    ]
+                    for row in rows
+                }
+            },
+        },
+        {family: source},
+        window_seconds=600,
+    )
+    table.update(
+        predicate="CAVIDAD = '1'",
+        updates={
+            "FECHA": "CAST('2026-11-20 07:40:00' AS TIMESTAMP)",
+            "origen_fenix": "'AV22'",
+            "RECH": "7",
+        },
+    )
+    added = {**rows[-1], "FECHA": start + timedelta(hours=6), "CAVIDAD": "new"}
+    write_deltalake(path, pa.Table.from_pylist([added], schema=schema), mode="append")
+    silver = DeltaTable(str(path))
+    snapshot = SimpleNamespace(table=lambda name: silver)
+    legacy = Evidence.open(root)
+    expected_rows, expected_proofs, expected_count = materialize(
+        snapshot, legacy, legacy.proofs(max_rows=100), family, ref(2), schema.names, budget=100
+    )
+    candidate = Evidence.open(root)
+    fact, lineage, count = fragment_delta.update(
+        snapshot, candidate, family, ref(2), schema, budget=100, seconds=600
+    )
+    assert count == expected_count == 3
+    assert candidate.read_stats[family]["rows_decoded"] == 1
+    assert candidate.read_stats["__lineage"]["rows_decoded"] == 1
+    assert legacy.read_stats[family]["rows_decoded"] == 32
+    assert legacy.read_stats["__lineage"]["rows_decoded"] == 32
+
+    def persist():
+        return save(
+            root,
+            {**document(2), "lineages": {}},
+            {},
+            window_seconds=600,
+            fact_refs=[fact],
+            lineage_refs=lineage,
+        )
+
+    original_pointer = (root / "current.json").read_bytes()
+    atomic = evidence.atomic_json
+
+    def crash(path, value):
+        if path.name == "current.json":
+            raise OSError("simulated interruption before pointer")
+        atomic(path, value)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(evidence, "atomic_json", crash)
+        with pytest.raises(OSError, match="before pointer"):
+            persist()
+    assert (root / "current.json").read_bytes() == original_pointer
+    result = persist()
+    assert persist().publication_id == result.publication_id
+    assert {business_key(family, row): row for row in result.rows(family, max_rows=100)} == {
+        business_key(family, row): row for row in expected_rows
+    }
+    assert result.proofs(max_rows=100)[family] == expected_proofs
+    assert previous.rows(family, max_rows=100) == rows
+    assert (
+        len(
+            set(p["uri"] for p in fact["parts"])
+            & set(p["uri"] for p in previous.document["tables"][0]["parts"])
+        )
+        == 31
+    )
+
+    silver.delete(predicate="CAVIDAD = 'new'")
+    with pytest.raises(FullReadRequired):
+        fragment_delta.update(snapshot, result, family, ref(3), schema, budget=100, seconds=600)
+    assert Evidence.open(root).publication_id == result.publication_id
+
+
+@pytest.mark.parametrize("scale", [1, 10, 100])
+def test_incremental_work_is_bounded_by_the_changed_partition(tmp_path, scale):
+    from datetime import timedelta
+    from time import perf_counter, process_time
+
+    from ingesta_delta_lake.contracts import CONTRACTS
+    from ingesta_delta_lake.pipeline_rows import business_key, review_hash
+
+    from app.gold import fragment_delta
+    from app.gold.common import IntegrityError
+
+    family = "LISTA_RECH"
+    schema = CONTRACTS[family].schema
+    start = datetime(2026, 11, 20, 8)
+    rows = [
+        dict(
+            origen_fenix="AV21",
+            FECHA=start - timedelta(minutes=10 * (i // 128)),
+            MOLDE=3 + i // 128,
+            LINEA=21,
+            COD_MAQ_ZF=4,
+            INSPECC=100,
+            RECH=6,
+            RECH_AUTO=2,
+            CAVIDAD=str(i % 128),
+            FECHA_R=None,
+        )
+        for i in range(1024 * scale)
+    ]
+    source = pa.Table.from_pylist(rows, schema=schema)
+    delta_path = tmp_path / "silver"
+    write_deltalake(delta_path, source, configuration={"delta.enableChangeDataFeed": "true"})
+    delta = DeltaTable(str(delta_path))
+    table_id = delta.metadata().id
+
+    def ref(version):
+        return dict(table_id=table_id, version=version, rejected_hashes=[])
+
+    def doc(version):
+        return dict(fragment_lineage=600, silver_refs={family: ref(version)}, row_budget=300)
+
+    root = tmp_path / "evidence"
+    save(
+        root,
+        {
+            **doc(0),
+            "lineages": {
+                family: {
+                    business_key(family, row): [
+                        dict(
+                            source_table=table_id,
+                            source_version=0,
+                            row_hash=review_hash(family, row),
+                        )
+                    ]
+                    for row in rows
+                }
+            },
+        },
+        {family: source},
+        window_seconds=600,
+    )
+    delta.update(
+        predicate="MOLDE = 3 AND CAVIDAD = '1'",
+        updates={"RECH": "7"},
+    )
+    baseline = Evidence.open(root)
+    with pytest.raises(IntegrityError, match="row budget"):
+        baseline.table(family, max_rows=300)
+
+    original_view = set((root / "data").iterdir())
+    wall, cpu = perf_counter(), process_time()
+    old = Evidence.open(root)
+    fact, lineage, cdf_rows = fragment_delta.update(
+        SimpleNamespace(table=lambda _: delta), old, family, ref(1), schema, budget=300, seconds=600
+    )
+    result = save(
+        root,
+        {**doc(1), "lineages": {}},
+        {},
+        window_seconds=600,
+        fact_refs=[fact],
+        lineage_refs=lineage,
+    )
+    total_seconds, cpu_seconds = perf_counter() - wall, process_time() - cpu
+    writes = sum(p.stat().st_size for p in set((root / "data").iterdir()) - original_view)
+    counters = old.read_stats
+    print(
+        "SCALE_GOLD",
+        scale,
+        len(rows),
+        round(total_seconds, 4),
+        round(cpu_seconds, 4),
+        cdf_rows,
+        counters[family]["rows_decoded"],
+        counters["__lineage"]["rows_decoded"],
+        counters[family]["fragments_opened"] + counters["__lineage"]["fragments_opened"],
+        counters[family]["parquet_file_bytes"] + counters["__lineage"]["parquet_file_bytes"],
+        writes,
+        counters[family]["rebuilt_partitions"],
+    )
+    assert fact["rows"] == len(rows) > 300 and cdf_rows == 2
+    assert counters[family]["rows_decoded"] == counters["__lineage"]["rows_decoded"] == 128
+    assert counters[family]["rebuilt_partitions"] == 1
+    assert counters[family]["fragments_opened"] == counters["__lineage"]["fragments_opened"] == 1
+    assert {
+        r["CAVIDAD"]: r["RECH"]
+        for r in result.rows(family, window=(start - timedelta(minutes=10), start))
+    }["1"] == 7
+    refs = result.document["tables"]
+    assert next(r for r in refs if r["name"] == family)["rows"] == len(rows)

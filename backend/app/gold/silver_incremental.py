@@ -23,7 +23,7 @@ def references(snapshot):
     }
 
 
-def read_changes(snapshot, family, before, after, columns, budget):
+def read_changes(snapshot, family, before, after, columns, budget, *, locate=None):
     if before is None or after is None or before["table_id"] != after["table_id"]:
         raise FullReadRequired
     if (
@@ -44,6 +44,8 @@ def read_changes(snapshot, family, before, after, columns, budget):
         ):
             count += batch.num_rows
             if count > budget:
+                if locate is not None:
+                    raise FullReadRequired
                 raise IntegrityError("Live Silver changes exceed their explicit row budget")
             for event in batch.to_pylist():
                 kind = event["_change_type"]
@@ -52,6 +54,8 @@ def read_changes(snapshot, family, before, after, columns, budget):
                     # existing retention and reconciliation rules for that version.
                     raise FullReadRequired
                 values = {name: event[name] for name in columns}
+                if locate is not None:
+                    locate(business_key(family, values), values)
                 versions[event["_commit_version"]].append((kind, values))
     except (DeltaError, OSError, pa.ArrowException) as exc:
         raise FullReadRequired from exc
