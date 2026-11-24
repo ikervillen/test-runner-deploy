@@ -8,6 +8,7 @@ param(
     [switch]$ApplicationLive,
     [switch]$FrontendOnly,
     [switch]$GoldOnly,
+    [switch]$AuditArCatalog,
     [switch]$IncludeGoldHistory,
     [switch]$IncludeBackend,
     [switch]$Immediate
@@ -116,6 +117,9 @@ function Find-SavedCompose {
 if ($Revision -cnotmatch '^[a-f0-9]{40}$' -or $GoldRevision -cnotmatch '^[a-f0-9]{40}$' -or
     $Image -cnotmatch '^ghcr\.io/ikervillen/test-runner-deploy@sha256:[a-f0-9]{64}$') {
     throw 'La imagen y ambas revisiones deben estar fijadas.'
+}
+if ($AuditArCatalog -and (-not $GoldOnly -or $IncludeGoldHistory -or $Immediate)) {
+    throw 'AuditArCatalog requiere actualizar exclusivamente Gold Live.'
 }
 if ($Immediate -and -not $GoldOnly) { throw 'El reemplazo inmediato queda limitado a los workers Gold.' }
 if ($IncludeBackend -and (-not $GoldOnly -or -not $IncludeGoldHistory -or -not $Immediate)) {
@@ -466,6 +470,54 @@ if ($LiveFlowOnly) {
         Invoke-Docker compose -p $project -f $activeFile up -d --no-deps --no-build --pull never @restore
         throw
     }
+} elseif ($AuditArCatalog) {
+    $oldGold = $workers['gold-live']
+    $t0 = @($oldGold.Config.Env | Where-Object { $_ -clike 'FENIX_LIVE_T0=*' })
+    if ($t0.Count -ne 1) { throw 'No se puede acreditar el T0 de Gold Live.' }
+    foreach ($service in @('gold-history', 'ingesta-history')) {
+        $running = @(Invoke-Docker ps --filter "label=com.docker.compose.project=$project" `
+            --filter "label=com.docker.compose.service=$service" --format '{{.ID}}')
+        if ($running.Count) { throw "History debe permanecer detenido: $service." }
+    }
+    $gold = $compose.services.'gold-live'
+    $index = [Array]::IndexOf(@($gold.command), '--catalogs')
+    if ($index -lt 0 -or -not $gold.command[$index+1]) {
+        throw 'El Compose no declara el catálogo efectivo de Gold.'
+    }
+    $catalogPath = $gold.command[$index+1]
+    $configMount = @($gold.volumes | Where-Object {
+        $_.target -ceq $profile.configuration_target -and $_.read_only
+    })
+    if ($configMount.Count -ne 1 -or -not $catalogPath.StartsWith("$($configMount[0].target)/")) {
+        throw 'El catálogo debe estar en el montaje de configuración de solo lectura.'
+    }
+    $audit = 'from pathlib import Path; import sys; from app.gold.catalogs import load_independent_bundle; load_independent_bundle(Path(sys.argv[1]), audit=True)'
+    Invoke-Docker compose -p $project -f $candidate run --rm --no-deps --pull never `
+        --entrypoint python gold-live -B -c $audit $catalogPath
+    $goldMount = @($gold.volumes | Where-Object source -ceq 'live-gold')
+    if ($goldMount.Count -ne 1) { throw 'El montaje Gold no está acreditado.' }
+    $check = 'from pathlib import Path; import json, sys; root = Path(sys.argv[1]) / ''published'' / ''operations''; assert all(json.loads(p.read_text())[''state''] == ''ACKNOWLEDGED'' for p in root.glob(''*.json'')), ''Gold still has an unfinished publication'''
+    try {
+        Invoke-Docker compose -p $project -f $activeFile stop --timeout ([int]$site.drain_seconds) gold-live
+        Invoke-Docker compose -p $project -f $candidate run --rm --no-deps --pull never `
+            --entrypoint python gold-live -B -c $check $goldMount[0].target
+    } catch {
+        Invoke-Docker compose -p $project -f $activeFile up -d --no-deps --no-build --pull never gold-live
+        throw
+    }
+    Invoke-Docker compose -p $project -f $candidate up -d --no-deps --no-build --pull never `
+        --timeout ([int]$site.drain_seconds) gold-live
+    $actual = Get-Worker 'gold-live'
+    $oldMounts = @($oldGold.Mounts | Where-Object Type -eq 'volume' | ForEach-Object {
+        "$($_.Name):$($_.Destination)"
+    } | Sort-Object)
+    $newMounts = @($actual.Mounts | Where-Object Type -eq 'volume' | ForEach-Object {
+        "$($_.Name):$($_.Destination)"
+    } | Sort-Object)
+    if ($actual.Config.Env -cnotcontains $t0[0] -or ($oldMounts -join ';') -cne ($newMounts -join ';')) {
+        throw 'El nuevo Gold no conserva el T0 o sus volúmenes.'
+    }
+    Write-Output "Gold Live | $($t0[0]) | Compose anterior: $activeFile"
 } elseif ($Immediate) {
     $order = if ($IncludeBackend) { @('backend', 'gold-history', 'gold-live') } else { $services }
     foreach ($service in $order) {
@@ -493,7 +545,7 @@ foreach ($service in $services) {
     Write-Output "${service} | $($worker.Id.Substring(0, 12)) | $tag"
 }
 Invoke-Docker compose -p $project -f $candidate ps --all
-if (-not $Immediate -and -not $LiveFlowOnly -and -not $ApplicationLive) {
+if (-not $Immediate -and -not $LiveFlowOnly -and -not $ApplicationLive -and -not $AuditArCatalog) {
     "FENIX_VERIFY_CONTEXT=$context", "FENIX_VERIFY_PROJECT=$project", "FENIX_VERIFY_SINCE=$started", `
         "FENIX_VERIFY_PENDING=$originalPending" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 }
