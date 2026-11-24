@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     data_backend: Literal["legacy", "gold"] = "legacy"
     gold_root: Path | None = None
     gold_history_root: Path | None = None
+    gold_live_timezone: str = "Europe/Madrid"
     gold_history_enabled: bool = True
     gold_query_max_rows: int = Field(default=250_000, ge=1, le=1_000_000)
     gold_query_total_rows: int = Field(default=500_000, ge=1, le=2_000_000)

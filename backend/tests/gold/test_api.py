@@ -70,6 +70,18 @@ def test_catalog_and_complete_score_use_only_pinned_gold(gold_api):
     assert coverage[3]["missing"] == []
 
 
+def test_hourly_endpoint_keeps_history_unavailable_without_affecting_live(gold_api):
+    client, _ = gold_api
+    unavailable = client.get("/api/history/catalog")
+    assert unavailable.status_code == 503
+    assert unavailable.json()["error"]["code"] == "HISTORY_UNAVAILABLE"
+    live = client.get("/api/live/scores")
+    assert live.status_code == 200, live.text
+    assert len(live.json()["hours"]) == 8
+    assert live.json()["hours"][-1]["state"] == "open"
+    assert live.json()["hours"][-1]["results"] == []
+
+
 def test_custom_configuration_and_machine_filter_recalculate_without_writes(gold_api):
     client, root = gold_api
     before = (root / "current.json").read_bytes()

@@ -25,7 +25,49 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
+export type LiveResult = {
+  production: string;
+  line: string;
+  machine: number | null;
+  start: string;
+  cutoff: string | null;
+  state: string;
+  reason: string | null;
+  result_id: string | null;
+  total_penalty: number | null;
+  normalized_score: number | null;
+  classification: string | null;
+};
+
+export type LiveScores = {
+  publication_id: string;
+  published_at: string;
+  stale: boolean;
+  mia_provisional: boolean;
+  hours: { start: string; end: string; state: string; results: LiveResult[] }[];
+};
+
 export const api = {
+  getHistoryCatalog: () => request<Catalog>("/api/history/catalog"),
+  getLiveScores: (signal: AbortSignal) =>
+    request<LiveScores>("/api/live/scores", { signal }),
+  getLiveDetail: (publication: string, result: string) =>
+    request<Record<string, Record<string, unknown>[]>>(
+      `/api/live/scores/${encodeURIComponent(publication)}/${encodeURIComponent(result)}`,
+    ),
+  queryHistoryScore: (payload: ProductionQualityScoreQuery) =>
+    request<ProductionQualityScoreResponse>(
+      "/api/history/customer-score/query",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    ),
+  queryHistoryQuality: (payload: CustomerQualityQuery) =>
+    request<CustomerQualityResponse>("/api/history/customer-quality/query", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
   getCatalog: () => request<Catalog>("/api/catalog"),
   getGoldStatus: () => request<GoldStatus>("/api/gold/status"),
   queryCustomerQuality: (payload: CustomerQualityQuery) =>

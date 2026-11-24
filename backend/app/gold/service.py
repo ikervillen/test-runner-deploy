@@ -34,12 +34,23 @@ def _group(rows, key):
 
 
 class GoldService:
-    def __init__(self, settings):
+    def __init__(self, settings, *, history=False):
         self.settings = settings
+        self.history = history
         self.cache = LruCache(settings.score_cache_size)
         self.catalog_cache = LruCache(1)
 
     def query(self):
+        if self.history:
+            if not self.settings.gold_history_enabled or self.settings.gold_history_root is None:
+                raise ApplicationError(
+                    "HISTORY_UNAVAILABLE", "Histórico no disponible", status_code=503
+                )
+            return Query(
+                self.settings.gold_history_root,
+                max_rows=self.settings.gold_query_max_rows,
+                total_rows=self.settings.gold_query_total_rows,
+            )
         if self.settings.gold_history_enabled and self.settings.gold_history_root is not None:
             from .combined_query import CombinedQuery
 
