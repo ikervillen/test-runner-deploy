@@ -447,21 +447,33 @@ def _sync_capture_directories(root, directory):
         directory = directory.parent
 
 
+def _capture_path(config, origin, target, *, recovery=False):
+    origin_path = config.bronze_root / config.plant / origin
+    family_path = origin_path / config.family
+    action = "Capture recovery" if recovery else "Capture"
+    # On Windows, resolving a missing path can retain a short-name ancestor.
+    # Another family can create that ancestor between the independent resolutions.
+    for _ in range(3 if os.name == "nt" else 1):
+        if target.is_symlink():
+            raise IntegrityError(f"{action} cannot follow a symlink")
+        namespace = family_path.resolve()
+        resolved = target.resolve()
+        if namespace.parent != origin_path.resolve():
+            error = f"{action} family escapes its origin"
+        elif not namespace.is_relative_to(
+            config.bronze_root.resolve()
+        ) or not resolved.is_relative_to(namespace):
+            error = f"{action} escapes its Bronze namespace"
+        else:
+            return resolved
+    raise IntegrityError(error)
+
+
 def publish_capture(config, snapshot, data):
     """Durable bytes with a recoverable descriptor before publishing the blob."""
     if snapshot.origin not in dict(config.sources):
         raise IntegrityError("Capture belongs to an unknown origin")
-    original = Path(snapshot.bronze_path)
-    if original.is_symlink():
-        raise IntegrityError("Capture cannot follow a symlink")
-    target = original.resolve()
-    namespace = (config.bronze_root / config.plant / snapshot.origin / config.family).resolve()
-    if namespace.parent != (config.bronze_root / config.plant / snapshot.origin).resolve():
-        raise IntegrityError("Capture family escapes its origin")
-    if not namespace.is_relative_to(config.bronze_root.resolve()) or not target.is_relative_to(
-        namespace
-    ):
-        raise IntegrityError("Capture escapes its Bronze namespace")
+    target = _capture_path(config, snapshot.origin, Path(snapshot.bronze_path))
     if len(data) != snapshot.size or hashlib.sha256(data).hexdigest() != snapshot.sha256:
         raise IntegrityError("Capture differs from its stable source evidence")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -510,15 +522,7 @@ def recover_capture(config, document):
     if snapshot.origin not in dict(config.sources):
         raise IntegrityError("Capture recovery belongs to an unknown origin")
     target = Path(snapshot.bronze_path)
-    namespace = (config.bronze_root / config.plant / snapshot.origin / config.family).resolve()
-    if namespace.parent != (config.bronze_root / config.plant / snapshot.origin).resolve():
-        raise IntegrityError("Capture recovery family escapes its origin")
-    if not namespace.is_relative_to(
-        config.bronze_root.resolve()
-    ) or not target.resolve().is_relative_to(namespace):
-        raise IntegrityError("Capture recovery escapes its namespace")
-    if target.is_symlink():
-        raise IntegrityError("Capture recovery cannot follow a symlink")
+    _capture_path(config, snapshot.origin, target, recovery=True)
     staged = Path(document["staging_path"]) if document.get("staging_path") else None
     if staged is not None and (
         staged.parent != target.parent

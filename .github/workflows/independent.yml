@@ -140,7 +140,7 @@ jobs:
       - name: Prepare the approved Live flow update
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '0963ba77a6c632f7fc1537bb4e61f31483a4ce13' && github.event.head_commit.message == 'Deploy scoped CONT_ZC latency improvements' && github.run_attempt == '1'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '3aa9e5dbba6619b1590e2bfac66ccc67c9232809' && github.event.head_commit.message == 'Deploy CONT_ZC with stable Windows capture paths' && github.run_attempt == '1'
         run: |
           set -euo pipefail
           mkdir -p bundle

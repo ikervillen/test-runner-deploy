@@ -27,7 +27,7 @@ def test_process_roundtrip_and_real_independent_delta_writers(config, source):
         observed.append,
     )
     assert {f for f, _, _ in events} == {"SIP_MODELO", "SIP_DEFECTO_STATUS"}
-    assert all(r["status"] != "FAILED" for _, r, _ in events)
+    assert all(r["status"] != "FAILED" for _, r, _ in events), events
     assert any(len(active) == 2 for active in observed)
     assert config.table_path.joinpath("_delta_log").is_dir()
     assert replace(config, family="SIP_DEFECTO_STATUS").table_path.joinpath("_delta_log").is_dir()
