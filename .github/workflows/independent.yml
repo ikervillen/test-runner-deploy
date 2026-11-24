@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 env:
-  FRONTEND_CONTEXT_COMMIT: 42e17add333d16d55cba475d4ba96b1693ad1a0a
-  GOLD_CONTEXT_COMMIT: 42e17add333d16d55cba475d4ba96b1693ad1a0a
+  FRONTEND_CONTEXT_COMMIT: ea2553db14e8ad96c722e7d90b8b3cd0b2dfab20
+  GOLD_CONTEXT_COMMIT: ea2553db14e8ad96c722e7d90b8b3cd0b2dfab20
   GOLD_SOURCE_COMMIT: ad88dc3d0bdedfbc4da3de06da74e3801b9b64f7
 
 jobs:
@@ -141,7 +141,7 @@ jobs:
       - name: Prepare the approved control room application
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == 'e767a908c23cf430a35c43e8d7b5b227e978c6a0' && github.event.head_commit.message == 'Deploy the Fenix hourly contributions table' && github.run_attempt == '1'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == 'd878ac164c8041a487340533b0dfde26bba667ef' && github.event.head_commit.message == 'Deploy the Fenix hourly contributions table' && github.run_attempt == '1'
         run: |
           set -euo pipefail
           mkdir -p bundle
