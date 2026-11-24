@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 env:
-  FRONTEND_CONTEXT_COMMIT: 19f581077307e83ffc1ee9535c9d575206ff7b38
-  GOLD_CONTEXT_COMMIT: 4bbbfd9495d31410966f612cf343b38a14e4594f
+  FRONTEND_CONTEXT_COMMIT: 42e17add333d16d55cba475d4ba96b1693ad1a0a
+  GOLD_CONTEXT_COMMIT: 42e17add333d16d55cba475d4ba96b1693ad1a0a
   GOLD_SOURCE_COMMIT: ad88dc3d0bdedfbc4da3de06da74e3801b9b64f7
 
 jobs:
@@ -138,15 +138,22 @@ jobs:
         run: |
           python -m pip install uv==0.11.6
           uv run --locked --no-dev python -m scripts.smoke_independent_compose fenix-independent:validation .quality-context
-      - name: Prepare the approved Gold Live AR update
+      - name: Prepare the approved control room application
         id: bundle
         # One-shot authorization for this integration, not a standing deploy trigger.
-        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == '849d2efe0ad9869af52c0c16c7e579c5fb9dcb2c' && github.event.head_commit.message == 'Deploy Gold Live AR catalog and hourly revisions' && github.run_attempt == '1'
+        if: github.repository == 'ikervillen/test-runner-deploy' && github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.event.before == 'e767a908c23cf430a35c43e8d7b5b227e978c6a0' && github.event.head_commit.message == 'Deploy the Fenix hourly contributions table' && github.run_attempt == '1'
         run: |
           set -euo pipefail
           mkdir -p bundle
           docker tag fenix-independent:validation "fenix-independent:sha-$GITHUB_SHA"
-          docker image save "fenix-independent:sha-$GITHUB_SHA" | gzip -1 > bundle/image.tar.gz
+          npm --prefix .quality-context ci
+          npm --prefix .quality-context test
+          docker build --file .quality-context/Dockerfile.frontend --tag "fenix-quality:sha-$GITHUB_SHA" .quality-context
+          docker run --rm --network none --add-host backend:127.0.0.1 \
+            --read-only --tmpfs /etc/nginx/conf.d --tmpfs /var/cache/nginx --tmpfs /var/run \
+            -e BACKEND_PORT=8011 -e NGINX_ENVSUBST_TEMPLATE_DIR=/opt/fenix/templates \
+            "fenix-quality:sha-$GITHUB_SHA" nginx -t
+          docker image save "fenix-independent:sha-$GITHUB_SHA" "fenix-quality:sha-$GITHUB_SHA" | gzip -1 > bundle/image.tar.gz
           echo 'rollout=true' >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: steps.bundle.outputs.rollout == 'true'
@@ -191,7 +198,8 @@ jobs:
           jq -n --arg registry_ref "$digest" --arg local_tag "$tag" \
             --arg image_id "$(docker image inspect "$tag" --format '{{.Id}}')" \
             --arg archive_sha256 "$(sha256sum bundle/image.tar.gz | cut -d' ' -f1)" \
-            '{$registry_ref,$local_tag,$image_id,$archive_sha256}' > bundle/image.json
+            --arg frontend_id "$(docker image inspect "fenix-quality:sha-$GITHUB_SHA" --format '{{.Id}}')" \
+            '{$registry_ref,$local_tag,$image_id,$archive_sha256,$frontend_id}' > bundle/image.json
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "Image: $digest" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -221,7 +229,7 @@ jobs:
           pattern: live-image-*
           path: ${{ runner.temp }}/fenix-image-${{ github.run_id }}-${{ github.run_attempt }}
           merge-multiple: true
-      - name: Audit the mounted catalog and update only Gold Live
+      - name: Deploy only the application frontend and API
         shell: powershell
         env:
           FENIX_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
@@ -230,7 +238,7 @@ jobs:
         run: |
           $bundle = Join-Path $env:RUNNER_TEMP "fenix-image-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           try {
-            ./scripts/update_independent_workers.ps1 -GoldOnly -AuditArCatalog -Bundle $bundle `
+            ./scripts/update_independent_workers.ps1 -ApplicationOnly -Bundle $bundle `
               -Image $env:IMAGE -Revision $env:GITHUB_SHA -GoldRevision $env:GOLD_CONTEXT_COMMIT
           } finally {
             Remove-Item -LiteralPath (Join-Path $bundle 'image.tar.gz'), (Join-Path $bundle 'image.json') -ErrorAction SilentlyContinue

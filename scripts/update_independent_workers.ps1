@@ -7,6 +7,7 @@ param(
     [switch]$FreshLive,
     [switch]$ApplicationLive,
     [switch]$FrontendOnly,
+    [switch]$ApplicationOnly,
     [switch]$GoldOnly,
     [switch]$AuditArCatalog,
     [switch]$IncludeGoldHistory,
@@ -24,11 +25,12 @@ $context = if ($hasSite) { $site.docker_context } else { $env:FENIX_DOCKER_CONTE
 if (-not $context) { throw 'No se ha configurado el contexto Docker.' }
 $project = $profile.project
 if ($FreshLive -and -not $LiveFlowOnly) { throw 'FreshLive requiere LiveFlowOnly.' }
-if ($FrontendOnly) {
-    if ($ApplicationLive -or $LiveFlowOnly -or $GoldOnly -or $IncludeGoldHistory -or $IncludeBackend -or $Immediate) {
-        throw 'FrontendOnly actualiza exclusivamente el frontend.'
+if ($FrontendOnly -or $ApplicationOnly) {
+    if (($FrontendOnly -and $ApplicationOnly) -or $ApplicationLive -or $LiveFlowOnly -or $GoldOnly -or $IncludeGoldHistory -or $IncludeBackend -or $Immediate) {
+        throw 'El despliegue de la aplicación no admite opciones de workers.'
     }
     $services = @('frontend')
+    if ($ApplicationOnly) { $services += 'backend' }
 } elseif ($ApplicationLive) {
     if ($LiveFlowOnly -or $GoldOnly -or $IncludeGoldHistory -or $IncludeBackend -or $Immediate) {
         throw 'ApplicationLive conserva la generación Live existente.'
@@ -178,7 +180,7 @@ if ($LiveFlowOnly) {
     }
 }
 foreach ($service in $services) {
-    if ($FrontendOnly) { break }
+    if ($FrontendOnly -or $ApplicationOnly) { break }
     $definition = $compose.services.$service
     if (-not $definition) { throw "El Compose activo no contiene $service." }
     $namedMounts = @($definition.volumes | Where-Object { $_.type -eq 'volume' })
@@ -231,7 +233,7 @@ if ($loaded.Id -cne $proof.image_id -or
     throw 'Docker ha cargado una imagen distinta de la revisión aprobada.'
 }
 
-if ($FrontendOnly) {
+if ($FrontendOnly -or $ApplicationOnly) {
     $frontend = $compose.services.frontend
     if (-not $frontend.image -or -not $compose.services.backend) {
         throw 'Falta el frontend o el backend en el Compose activo.'
@@ -246,17 +248,55 @@ if ($FrontendOnly) {
         throw 'La imagen del frontend no coincide con el artefacto aprobado.'
     }
     $frontend.image = $frontendTag
+    $rollbackBackend = $null
+    if ($ApplicationOnly) {
+        $oldBackend = $workers.backend
+        $rollbackBackend = $oldBackend.Config.Labels.'com.docker.compose.project.config_files'
+        $oldCompose = Get-Content -LiteralPath $rollbackBackend -Raw | ConvertFrom-Json
+        $backend = $oldCompose.services.backend
+        $oldBackendImage = (Invoke-Docker image inspect $backend.image --format '{{.Id}}') -join ''
+        if ($oldCompose.name -cne $project -or $oldBackend.Image -cne $oldBackendImage -or
+            $backend.PSObject.Properties['ports'] -or
+            $oldBackend.Config.Env -cnotcontains 'APP_GOLD_HISTORY_ENABLED=false') {
+            throw 'La configuración efectiva del backend no coincide con la aplicación Live.'
+        }
+        $t0 = @($oldBackend.Config.Env | Where-Object { $_ -clike 'FENIX_LIVE_T0=*' })
+        $mounts = @($oldBackend.Mounts | ForEach-Object {
+            "$($_.Type):$($_.Source):$($_.Destination):$($_.RW)"
+        } | Sort-Object)
+        if ($t0.Count -ne 1 -or @($oldBackend.Mounts | Where-Object RW).Count) {
+            throw 'El backend debe conservar T0 y los montajes de solo lectura.'
+        }
+        $backend.image = $tag
+        $compose.services.backend = $backend
+    }
     $candidate = Join-Path (Split-Path -Parent $activeFile) "compose.$($Revision.Substring(0, 12)).json"
     [IO.File]::WriteAllText($candidate, ($compose | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
     Invoke-Docker compose -p $project -f $candidate config --quiet
     try {
+        if ($ApplicationOnly) {
+            Invoke-Docker compose -p $project -f $candidate up -d --no-deps --no-build --pull never `
+                --wait --wait-timeout 90 backend
+            $actual = Get-Worker 'backend'
+            $actualMounts = @($actual.Mounts | ForEach-Object {
+                "$($_.Type):$($_.Source):$($_.Destination):$($_.RW)"
+            } | Sort-Object)
+            if ($actual.Image -cne $proof.image_id -or $actual.Config.Env -cnotcontains $t0[0] -or
+                ($mounts -join ';') -cne ($actualMounts -join ';')) {
+                throw 'El backend actualizado difiere de la imagen, T0 o montajes aprobados.'
+            }
+        }
         Invoke-Docker compose -p $project -f $candidate up -d --no-deps --no-build --pull never `
             --wait --wait-timeout 90 frontend
         if ((Get-Worker 'frontend').Image -cne $frontendId) {
             throw 'La imagen frontend activa difiere.'
         }
     } catch {
-        Invoke-Docker compose -p $project -f $activeFile up -d --no-deps --no-build --pull never frontend
+        if ($ApplicationOnly) {
+            Invoke-Docker compose -p $project -f $rollbackBackend up -d --no-deps --no-build --pull never `
+                --wait --wait-timeout 90 backend
+        }
+        Invoke-Docker compose -p $project -f $activeFile up -d --no-deps --no-build --pull never --force-recreate frontend
         throw
     }
     Write-Output "Frontend activo: $frontendTag | rollback: $activeFile"
