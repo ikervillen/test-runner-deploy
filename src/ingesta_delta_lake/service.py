@@ -3,6 +3,7 @@
 import hashlib
 import json
 from contextlib import ExitStack, closing
+from functools import lru_cache
 from pathlib import Path
 
 import portalocker
@@ -13,6 +14,19 @@ from .config import Config
 from .control import Control
 from .delta import DeltaStore
 from .sources import capture_inputs
+
+
+def _source_state(path):
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+@lru_cache(maxsize=128)
+def _verify_immutable_source(path, state, expected):
+    with path.open("rb") as stream:
+        actual = hashlib.file_digest(stream, "sha256").hexdigest()
+    if state != _source_state(path) or actual != expected:
+        raise IntegrityError("La evidencia de la operación pendiente ha cambiado")
 
 
 def _check_evidence(config: Config, prepared: dict) -> None:
@@ -33,7 +47,9 @@ def _check_evidence(config: Config, prepared: dict) -> None:
         path = Path(snapshot["bronze_path"]).resolve()
         if not path.is_relative_to(config.bronze_root):
             raise IntegrityError("La entrada pendiente está fuera de Bronze")
-        if hashlib.sha256(path.read_bytes()).hexdigest() != snapshot["sha256"]:
+        if prepared.get("inspection_plan"):
+            _verify_immutable_source(path, _source_state(path), snapshot["sha256"])
+        elif hashlib.sha256(path.read_bytes()).hexdigest() != snapshot["sha256"]:
             raise IntegrityError("La evidencia de la operación pendiente ha cambiado")
 
 

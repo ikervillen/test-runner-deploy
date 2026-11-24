@@ -205,7 +205,6 @@ def test_compact_rech_skips_identical_oversized_preparation(config, monkeypatch)
     assert attempts == [1, 2]
 
 
-
 def test_original_recovery_budget_rejects_duplicated_preparation(tmp_path):
     from ingesta_delta_lake import compact_control
 
@@ -220,3 +219,45 @@ def test_original_recovery_budget_rejects_duplicated_preparation(tmp_path):
         tmp_path, {"inserts": repeated, "inspection_groups_from_confirmed_rows": True}
     )
     assert 128 * 1024 * 1024 < reference["bytes"] < compact_control.MAX_DOCUMENT
+
+
+def test_rech_plan_keeps_conflicts_in_one_unit_and_resumes_after_commit(config, monkeypatch):
+    from ingesta_delta_lake import rech_plan
+
+    cfg = replace(
+        config, family="LISTA_RECH", control_format=3, timestamp_policy="local_naive_test_v1"
+    )
+    source = cfg.sources[0][1] / "LISTA_RECH.csv"
+
+    def row(cavity, rejects):
+        return f"14/10/2026 00:00:00;0;1;13;96;{rejects};0;{cavity};;\n"
+
+    source.write_text(
+        row("conflict", 1) + "".join(row(str(i), i) for i in range(12)) + row("conflict", 2),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(rech_plan, "PLAN_THRESHOLD", 1)
+    monkeypatch.setattr(rech_plan, "UNIT_BYTES", 600)
+    real = rech_plan.InspectionPlan.checkpoint
+    completed = []
+
+    def interrupt(self, cursor, result):
+        completed.append(cursor)
+        if len(completed) == 3:
+            raise OSError("plan interrupted after Delta confirmation")
+        return real(self, cursor, result)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(rech_plan.InspectionPlan, "checkpoint", interrupt)
+        with pytest.raises(OSError, match="plan interrupted"):
+            run(cfg)
+    assert query(cfg, "SELECT count(*) FROM consumed_inputs") == [(0,)]
+    assert query(cfg, "SELECT cursor FROM rech_plan") == [(completed[1],)]
+    result = run(cfg)
+    rows = DeltaTable(str(cfg.table_path)).to_pyarrow_table().to_pylist()
+    assert {r["CAVIDAD"] for r in rows} == {str(i) for i in range(12)}
+    assert result["resolved_inspection_total"] == 12 * 96
+    assert query(cfg, "SELECT count(*) FROM consumed_inputs") == [(1,)]
+    version = DeltaTable(str(cfg.table_path)).version()
+    run(cfg)
+    assert DeltaTable(str(cfg.table_path)).version() == version

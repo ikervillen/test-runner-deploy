@@ -20,7 +20,7 @@ LIVE_DERIVED_POLICY = "live-production-continuity-v1"
 
 def revalidation_policy(config):
     if config.family == "LISTA_RECH":
-        return "live-lista-rech-bounded-recovery-v1"
+        return "live-lista-rech-bounded-recovery-v2"
     if config.family == "ASIGNACION_PRODUCCION_RAMAL":
         return "live-association-window-v2"
     return LIVE_DERIVED_POLICY
@@ -31,9 +31,14 @@ def live_revalidation(config):
 
 
 def may_revalidate(config, db, value):
-    if not value or not value["paused"] or value["error_type"] != "IntegrityError":
-        return False
     family = config.family
+    if not value or not value["paused"]:
+        return False
+    compatible = {"IntegrityError"}
+    if family == "LISTA_RECH":
+        compatible.add("PreparedArtifactTooLarge")
+    if value["error_type"] not in compatible:
+        return False
     if family not in LEGACY_DEPENDENCIES and not (
         family == "LISTA_RECH" and live_revalidation(config)
     ):
@@ -45,7 +50,10 @@ def may_revalidate(config, db, value):
     message = json.loads(last[0] or "{}").get("error") if last else None
     if family in LEGACY_DEPENDENCIES and message == LEGACY_DEPENDENCIES[family]:
         return True
-    if family == "LISTA_RECH" and message != "Prepared artifact exceeds recovery budget":
+    if family == "LISTA_RECH" and message not in {
+        "Prepared artifact exceeds recovery budget",
+        "Prepared artifact exceeds recovery budget (unchanged input)",
+    }:
         return False
     policy = db.execute(
         "SELECT value FROM settings WHERE key='retry_revalidation_policy'"

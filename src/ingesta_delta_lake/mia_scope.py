@@ -10,15 +10,18 @@ from deltalake import DeltaTable
 from .common import IntegrityError, digest
 
 
-def scope_for(parsed, model, *, exact_periods=False):
-    bounds, groups = {}, set()
+def scope_for(parsed, model, *, exact_periods=False, inspection_signatures=False):
+    bounds, groups, signatures = {}, set(), set()
     periods = defaultdict(set)
     for entry in parsed.entries:
         row = {"origen_fenix": entry[0], **dict(zip(model.FIELDS, entry[1:], strict=True))}
         origin, stamp = row["origen_fenix"], row["FECHA"]
         start, end = bounds.get(origin, (stamp, stamp))
         bounds[origin] = min(start, stamp), max(end, stamp)
-        groups.add(digest(model.group(row)))
+        signature = model.group(row)
+        groups.add(digest(signature))
+        if inspection_signatures:
+            signatures.add(signature)
         if exact_periods:
             periods[origin].add(stamp)
     scope = {
@@ -27,6 +30,8 @@ def scope_for(parsed, model, *, exact_periods=False):
     }
     if exact_periods:
         scope["periods"] = {origin: sorted(stamps) for origin, stamps in periods.items()}
+    if inspection_signatures:
+        scope["signatures"] = [list(value) for value in sorted(signatures, key=digest)]
     return scope
 
 
@@ -54,6 +59,22 @@ def expression(scope):
         result |= (ds.field("origen_fenix").cast(pa.string()) == origin) & in_range
     if periods is not None and set(periods) != seen:
         raise IntegrityError("Exact MIA read periods differ from their declared origins")
+    if isinstance(scope, dict) and "signatures" in scope:
+        exact = ds.scalar(False)
+        for signature in scope["signatures"]:
+            origin, stamp, model, line, machine, cavity = signature
+            if digest(signature) not in scope["groups"] or origin not in seen:
+                raise IntegrityError("Invalid LISTA_RECH inspection signature")
+            field = ds.field("CAVIDAD").cast(pa.string())
+            exact |= (
+                (ds.field("origen_fenix").cast(pa.string()) == origin)
+                & (ds.field("FECHA") == datetime.fromisoformat(stamp))
+                & (ds.field("MOLDE") == model)
+                & (ds.field("LINEA") == line)
+                & (ds.field("COD_MAQ_ZF") == machine)
+                & (field.is_null() if cavity is None else field == cavity)
+            )
+        result &= exact
     return result
 
 

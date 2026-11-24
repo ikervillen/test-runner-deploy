@@ -339,10 +339,13 @@ def available_captures(config, *, known, verified, discoverer=None, capturer=Non
 
 def _read_limited(path: Path, maximum: int) -> bytes:
     with path.open("rb") as file:
-        data = file.read(maximum + 1)
-    if len(data) > maximum:
-        raise CaptureError(f"Archivo por encima del límite de captura: {path}")
-    return data
+        chunks, size = [], 0
+        while block := file.read(min(1024 * 1024, maximum + 1 - size)):
+            size += len(block)
+            if size > maximum:
+                raise CaptureError(f"Archivo por encima del límite de captura: {path}")
+            chunks.append(block)
+    return b"".join(chunks)
 
 
 def stable_capture(
