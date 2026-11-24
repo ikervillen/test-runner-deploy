@@ -1014,7 +1014,8 @@ def test_fragment_cdf_gold_matches_reference_for_same_silver_cut(tmp_path, nativ
     assert current.rows(family, max_rows=1000) == baseline.rows(family, max_rows=1000)
     assert current.publication_id == baseline.publication_id
     wire = next(r for r in current.wire_document["tables"] if r["name"] == family)
-    assert "parts" not in wire and len(wire["parts_pages"]) < 10
+    assert "parts" not in wire and "parts_pages" not in wire
+    assert wire["parts_root"]["rows"] == wire["rows"]
     options = dict(
         bundle=bundle(),
         config=read_json(Path(__file__).parents[3] / "config/customer_score.json"),
