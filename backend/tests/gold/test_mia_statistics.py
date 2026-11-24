@@ -76,3 +76,21 @@ def test_historical_model_then_segment_then_live_per_defect():
     assert (a_other["muestras"], a_other["media_percent"], a_other["sigma_percent"]) == (1, 1, 0)
     b_main = effective["B"]["values"][0]
     assert (b_main["muestras"], b_main["media_percent"]) == (3, 4)
+
+
+def test_hourly_revision_uses_only_statistical_samples_known_at_its_cut():
+    first, _ = cycle({"A": {DEFECT: 1.0}}, 0)
+    exact, _ = cycle({"A": {DEFECT: 3.0}}, 10, previous=first)
+    future, _ = cycle({"A": {DEFECT: 999.0}}, 20, previous=first)
+    _, effective = live_statistics(
+        {"A": {DEFECT: 100.0}},
+        CUT + timedelta(minutes=10),
+        previous_sets=first["sets"] + exact["sets"] + future["sets"],
+        previous_values=first["values"] + exact["values"] + future["values"],
+        historical={},
+        segments=SEGMENTS,
+        catalog="catalog",
+        reuse_cut_sample=True,
+    )
+    row = effective["A"]["values"][0]
+    assert (row["muestras"], row["media_percent"]) == (2, 2.0)

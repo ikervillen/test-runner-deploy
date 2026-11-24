@@ -505,6 +505,7 @@ def _score_job(payload: dict) -> dict:
                 by_zc=payload["by_zc"],
                 segments=payload["segments"],
                 ref=ref,
+                live_references=payload.get("live_references"),
                 config=payload["config"],
                 config_id=payload["config_id"],
                 cutoff=production_cutoff,
@@ -531,7 +532,14 @@ def _score_job(payload: dict) -> dict:
             "raw_inputs_hash": raw_hash,
             "config_id": payload["config_id"],
         },
-        "reference": ref,
+        "reference": {
+            key: [
+                row
+                for group in [ref, *payload.get("live_references", {}).values()]
+                for row in group[key]
+            ]
+            for key in ("sets", "members", "values")
+        },
         "scope_rows": scope_rows,
         "tables": produced,
         "pending": pending[len(payload["pending"]) :],
@@ -591,6 +599,7 @@ def _score_production(
     by_zc,
     segments,
     ref,
+    live_references,
     config,
     config_id,
     cutoff,
@@ -663,7 +672,9 @@ def _score_production(
                     mia=m,
                     ar=a,
                     zc=z,
-                    reference=ref,
+                    reference=live_references.get(w.cutoff, ref)
+                    if live_references is not None
+                    else ref,
                     config=config,
                     config_id=config_id,
                     profile_confirmed=segment.get("estado_correspondencia") == "CONFIRMED"
@@ -1441,24 +1452,49 @@ def build(
                             ),
                             minimum=minimum,
                         )
+                    holding_start = lanes.hour_holding(cutoff)[0]
+                    current_windows = defaultdict(list)
+                    prior_windows: dict[datetime, dict[str, list[Window]]] = defaultdict(
+                        lambda: defaultdict(list)
+                    )
+                    for identity, windows in score_windows.items():
+                        for window in windows:
+                            if window.start == holding_start:
+                                current_windows[identity].append(window)
+                            if window.cutoff < cutoff:
+                                prior_windows[window.cutoff][identity].append(window)
                     with clock.stage("reference_samples"):
                         samples = _live_mia_samples(
-                            snapshot, store, selected, score_windows, pending
+                            snapshot, store, selected, current_windows, pending
                         )
                     with clock.stage("reference_statistics"):
-                        published_refs, effective = mia_statistics.live_statistics(
-                            samples,
-                            cutoff,
+                        previous_values = _reference_rows(
+                            previous, "mia_reference_values", max_total_rows
+                        )
+                        parameters = dict(
                             previous_sets=previous_sets,
-                            previous_values=_reference_rows(
-                                previous,
-                                "mia_reference_values",
-                                max_total_rows,
-                            ),
+                            previous_values=previous_values,
                             historical=historical,
                             segments=segments,
                             catalog=catalog_version,
                         )
+                        if current_windows:
+                            published_refs, effective[cutoff] = mia_statistics.live_statistics(
+                                samples, cutoff, **parameters
+                            )
+                        else:
+                            published_refs = {"sets": [], "members": [], "values": []}
+                        for when, review_windows in sorted(prior_windows.items()):
+                            earlier = [p for p in selected if p["id_produccion"] in review_windows]
+                            measurements = _live_mia_samples(
+                                snapshot, store, earlier, review_windows, pending
+                            )
+                            _, effective[when] = mia_statistics.live_statistics(
+                                measurements,
+                                when,
+                                **{**parameters, "historical": {}},
+                                reuse_cut_sample=True,
+                            )
                 else:
                     published_refs = mia_statistics.historical_statistics(
                         prods,
@@ -1505,10 +1541,12 @@ def build(
             if hour_plan is not None:
                 payload["windows"] = score_windows[production["id_produccion"]]
             if mia_reference_mode == "live":
-                payload["mia_reference"] = effective.get(
-                    production["codigo_modelo_botella"],
-                    {"sets": [], "members": [], "values": []},
-                )
+                empty_reference = {"sets": [], "members": [], "values": []}
+                payload["mia_reference"] = empty_reference
+                payload["live_references"] = {
+                    when: by_model.get(production["codigo_modelo_botella"], empty_reference)
+                    for when, by_model in effective.items()
+                }
             return payload
 
         history_clock = _Stopwatch()

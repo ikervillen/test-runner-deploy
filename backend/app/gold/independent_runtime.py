@@ -232,7 +232,12 @@ class Worker:
         started = monotonic()
         recovered = self.recover_publication() if self.lane == "live" else None
         began_export = monotonic()
-        evidence = export(self.pipelines, self.lane, self.source)
+        evidence = export(
+            self.pipelines,
+            self.lane,
+            self.source,
+            ar_categories=self.catalogs["defect_categories"] if self.lane == "live" else None,
+        )
         began_publish = monotonic()
         result = self.publish(
             evidence,

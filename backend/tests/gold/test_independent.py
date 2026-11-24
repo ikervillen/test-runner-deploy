@@ -655,7 +655,7 @@ def test_worker_recovers_original_input_before_exporting_new_silver(
     worker = runtime.Worker(plan, "live", source, score=config, catalogs=catalogs)
     monkeypatch.setattr(worker, "historical_reference", lambda: None)
 
-    def next_input(*args):
+    def next_input(*args, **kwargs):
         assert read_json(journal)["state"] == "ACKNOWLEDGED"
         original = Snapshot.open(output)
         assert original.publication_id == pending
@@ -1243,3 +1243,88 @@ def test_late_coverage_publishes_previous_closed_hour_in_real_delta(tmp_path, na
         for row in final.rows("quality_scores")
         if row["id_resultado"] in settled
     } == settled
+
+
+def test_ar_category_revision_recovers_pinned_hour_in_real_delta(tmp_path, native):
+    from datetime import timedelta
+
+    from app.gold.common import read_json
+    from app.gold.live_hours import ar_revisions, retry_closures
+    from app.gold.pipeline import run
+    from app.gold.publications import Snapshot
+
+    from .test_pipeline import CUTOFF, bundle
+
+    closing = CUTOFF - timedelta(hours=1)
+    later = closing + timedelta(minutes=10)
+    source = industrial_evidence(
+        tmp_path / "inputs", "live", recent=True, native=native, horizon=later, window_seconds=600
+    )
+    metadata = {k: v for k, v in source.document.items() if k not in {"tables", "schema_id"}}
+    tables = {
+        r["name"]: source.table(r["name"], max_rows=100000) for r in source.document["tables"]
+    }
+    before_cats = {**bundle(), "defect_categories": {"53": None}}
+    initial = save(
+        source.root,
+        {**metadata, "ar_categories": before_cats["defect_categories"], "ar_pin": "v1"},
+        tables,
+        window_seconds=600,
+    )
+    published = tmp_path / "published"
+    options = dict(
+        config=read_json(Path(__file__).parents[3] / "config/customer_score.json"),
+        environment="test",
+        plant="AV",
+        lane="live",
+        current_slot_seconds=600,
+        mia_reference_mode="live",
+    )
+    run(
+        initial.root,
+        published,
+        confirmed_input=initial,
+        cutoff=closing,
+        bundle=before_cats,
+        **options,
+    )
+    before = Snapshot.open(published)
+    assert any(
+        "AR_CATEGORY_UNRESOLVED" in (scope["reason_code"] or "")
+        for scope in before.rows("publication_scope_status")
+        if scope["source"] == "quality_scores"
+    )
+    next_doc = {**metadata, "ar_categories": bundle()["defect_categories"], "ar_pin": "v1"}
+    changes = ar_revisions(
+        tmp_path,
+        before,
+        next_doc,
+        lambda bounds: (
+            source.rows("LISTA_AR", window=bounds),
+            tables["observation_assignments"].to_pylist(),
+        ),
+        later,
+        100000,
+    )
+    next_doc["retry_closures"] = retry_closures(
+        before,
+        metadata["coverage"],
+        later,
+        100000,
+        closed=[],
+        ar_changed=changes,
+    )
+    assert len(next_doc["retry_closures"]) == 1
+    revised = save(source.root, next_doc, tables, window_seconds=600)
+    run(revised.root, published, confirmed_input=revised, cutoff=later, bundle=bundle(), **options)
+    current = Snapshot.open(published)
+    assert any(r["corte"] == closing for r in current.rows("quality_scores"))
+    score = next(r for r in current.rows("quality_scores") if r["corte"] == closing)
+    assert any(
+        r["reference_id"] == score["reference_id"] for r in current.rows("mia_reference_sets")
+    )
+    assert any(
+        r["evidence_reference"] == revised.publication_id and r["estado"] == "READY"
+        for r in current.rows("publication_scope_status")
+        if r["source"] == "quality_scores"
+    )

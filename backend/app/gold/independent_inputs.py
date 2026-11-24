@@ -11,7 +11,7 @@ import pyarrow as pa
 
 from . import fragment_delta, scoped_reconciliation
 from .common import IntegrityError, digest
-from .evidence import OPERATIONS, attribution, registry, save
+from .evidence import OPERATIONS, attribution, operational_expression, registry, save
 from .lanes import hour_holding
 from .producer import FAMILIES, _apply_horizon, _apply_live, auxiliary
 from .series_handover import RELATION, apply_series_handover, recent_relations
@@ -81,7 +81,7 @@ def auxiliary_turn(pipelines, lane, *, encoding):
     return tables, cursor, ([r["hash"] for r in confirmed.document["tables"]], relation_cursor)
 
 
-def export(pipelines, lane, config):
+def export(pipelines, lane, config, *, ar_categories=None):
     """Never reads foreign SQLite, changes a foreign pointer, or acquires its locks."""
     from ingesta_delta_lake import associations as native
     from ingesta_delta_lake.contracts import CONTRACTS
@@ -156,7 +156,14 @@ def export(pipelines, lane, config):
     if (storage.gold / "inputs" / "current.json").exists():
         previous = Evidence.open(storage.gold / "inputs")
         if previous.document.get("source_vector") == vector and (
-            lane != "live" or "series_handover_scopes" in previous.document
+            lane != "live"
+            or (
+                "series_handover_scopes" in previous.document
+                and (
+                    ar_categories is None or previous.document.get("ar_categories") == ar_categories
+                )
+                and not previous.document.get("more_hourly_revisions")
+            )
         ):
             return previous
 
@@ -464,19 +471,100 @@ def export(pipelines, lane, config):
         if horizon:
             window = (hour_holding(horizon)[0], horizon)
             published = storage.gold / "published"
+            if ar_categories is not None:
+                from .live_hours import ar_pin
+
+                doc["ar_categories"] = ar_categories
+                doc["ar_pin"] = ar_pin(doc, silver_refs)
             if (published / "current.json").exists():
-                from .live_hours import retry_closures
+                from .live_hours import ar_revisions, retry_closures
                 from .publications import Snapshot
 
                 visible = Snapshot.open(published, require_gold_contract=True)
                 doc["closed_hours"] = []
-                doc["retry_closures"] = retry_closures(
+                changed = None
+                if ar_categories is not None:
+                    review = previous.document if previous is not None else {}
+                    if "legacy_ar_categories" in review:
+                        doc["legacy_ar_categories"] = review["legacy_ar_categories"]
+                    doc["ar_window_cache"] = review.get("ar_window_cache", {})
+                    # Only compare on a changed dependency, or to drain a bounded backlog.
+                    if (
+                        review.get("ar_pin") != doc["ar_pin"]
+                        or review.get("ar_categories") != ar_categories
+                        or review.get("more_hourly_revisions")
+                        or review.get("ar_review_waiting")
+                    ):
+
+                        def current_ar(bounds):
+                            family = "LISTA_AR"
+                            if family in incremental:
+                                ref, _, _ = incremental[family]
+                                evidence = Evidence(
+                                    previous.root, previous.publication_id, {"tables": [ref]}
+                                )
+                                evidence._fragments, evidence.read_stats = (
+                                    previous._fragments,
+                                    previous.read_stats,
+                                )
+                                evidence.index = previous.index
+                                arrow = pa.Table.from_batches(
+                                    evidence.batches(
+                                        family, max_rows=policy.read_max_rows, window=bounds
+                                    ),
+                                    schema=CONTRACTS[family].schema,
+                                )
+                            else:
+                                arrow = tables[family].filter(
+                                    operational_expression(family, bounds)
+                                )
+                            context = {
+                                name: table
+                                for name, table in tables.items()
+                                if name not in OPERATIONS
+                            }
+                            for name in OPERATIONS:
+                                context[name] = (
+                                    arrow
+                                    if name == family
+                                    else pa.Table.from_batches([], schema=CONTRACTS[name].schema)
+                                )
+                            decisions = attribution(doc, context)["observation_assignments"]
+                            return arrow.to_pylist(), decisions.to_pylist()
+
+                        changed = ar_revisions(
+                            storage.gold, visible, doc, current_ar, horizon, policy.read_max_rows
+                        )
+                waiting = []
+                retries = retry_closures(
                     visible,
                     coverage,
                     horizon,
                     policy.read_max_rows,
                     closed=doc["closed_hours"],
+                    ar_changed=changed,
+                    waiting=waiting,
                 )
+                doc["retry_closures"] = retries[:12]
+                doc["ar_review_waiting"] = bool(
+                    waiting
+                    or (changed is None and previous and previous.document.get("ar_review_waiting"))
+                )
+                # Exclude revised but deferred hours from current-slot calculation as well.
+                if len(retries) > 12:
+                    doc["more_hourly_revisions"] = True
+                    from .metrics import Window
+
+                    for identity, start, end, target in retries[12:]:
+                        doc["closed_hours"].append(
+                            Window(
+                                identity,
+                                "HOUR",
+                                datetime.fromisoformat(start),
+                                datetime.fromisoformat(end),
+                                datetime.fromisoformat(target),
+                            ).identity
+                        )
                 if doc["retry_closures"]:
                     scopes = [
                         window,
