@@ -96,6 +96,14 @@ def test_open_hour_has_no_score_and_zero_survives_for_closed_result():
         snapshot=FixtureSnapshot(
             {
                 "quality_scores": scores,
+                "quality_score_components": [
+                    {"id_resultado": closed.identity, "componente": "MIA", "contribucion": 0.0},
+                    {
+                        "id_resultado": current.identity,
+                        "componente": "Grave",
+                        "contribucion": 123.0,
+                    },
+                ],
                 "productions": [prod("p"), prod("ended", START - timedelta(minutes=5))],
                 "publication_scope_status": [scope("p", END)],
             }
@@ -108,4 +116,5 @@ def test_open_hour_has_no_score_and_zero_survives_for_closed_result():
     assert view.hours[-1].results == []
     closed = view.hours[-2].results[0]
     assert closed.total_penalty == 0.0 and closed.state == "complete"
+    assert closed.contributions == {"MIA": 0.0}
     assert all(r.total_penalty != 123.0 for hour in view.hours for r in hour.results)
