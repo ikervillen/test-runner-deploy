@@ -1,9 +1,12 @@
 """Control por observación compuesta y append Delta con velocidades decimales exactas."""
 
 import json
+import os
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from time import perf_counter
 
 import pyarrow as pa
@@ -97,6 +100,86 @@ class ZcStore(DeltaStore):
         super().__init__(config, control_id)
         self.timings = Counter()
 
+    reuse_version = False
+
+    @contextmanager
+    def measure(self, name):
+        started = perf_counter()
+        try:
+            yield
+        finally:
+            self.timings[name + "_seconds"] += perf_counter() - started
+
+    def table(self):
+        if not self.reuse_version:
+            return super().table()
+        if "_pinned_table" not in self.__dict__:
+            self._pinned_table = super().table()
+        else:
+            self.timings["delta_versions_reused"] += 1
+        return self._pinned_table
+
+    def open_version(self):
+        with self.measure("delta_open"):
+            self.timings["delta_opens"] += 1
+            return super().open_version()
+
+    def transaction_history(self, table):
+        cached = self.__dict__.get("_pinned_history")
+        if self.reuse_version and cached and cached[0] is table:
+            self.timings["transaction_histories_reused"] += 1
+            return cached[1]
+        with self.measure("transaction_log"):
+            history = super().transaction_history(table)
+        if self.reuse_version:
+            self._pinned_history = (table, history)
+        self.timings["commit_metadata_entries"] += len(history)
+        return history
+
+    def scan(self, table, *, filter, batch_size):
+        from .pipeline_read import AcceptedRead
+
+        with self.measure("file_enumeration"):
+            dataset = table.to_pyarrow_dataset(
+                parquet_read_options=ds.ParquetReadOptions(dictionary_columns=["origen_fenix"])
+            )
+        if (
+            not isinstance(table, AcceptedRead)
+            and os.environ.get("INGESTA_ZC_PROFILE_PRUNING") == "1"
+        ):
+            with self.measure("file_pruning"):
+                self.timings["candidate_fragments"] += sum(
+                    1 for _ in dataset.get_fragments(filter=filter)
+                )
+        decoded = pa.schema(
+            [
+                field.with_type(field.type.value_type)
+                if pa.types.is_dictionary(field.type)
+                else field
+                for field in dataset.schema
+            ]
+        )
+        if decoded != zc.SCHEMA:
+            raise IntegrityError("Esquema CONT_ZC incompatible")
+        before = self.disk_read_bytes()
+        with self.measure("parquet_scan_and_decode"):
+            arrow = dataset.scanner(
+                filter=filter, batch_size=batch_size, use_threads=False
+            ).to_table()
+        after = self.disk_read_bytes()
+        if before is not None and after is not None:
+            self.timings["process_physical_read_bytes"] += max(0, after - before)
+        with self.measure("arrow_cast"):
+            return arrow.cast(zc.SCHEMA)
+
+    @staticmethod
+    def disk_read_bytes():
+        try:
+            lines = Path("/proc/self/io").read_text().splitlines()
+            return next(int(row.split()[1]) for row in lines if row.startswith("read_bytes:"))
+        except (OSError, StopIteration, ValueError):
+            return None
+
     def set_scope(self, scope):
         self.scope = scope
 
@@ -137,29 +220,14 @@ class ZcStore(DeltaStore):
                 predicate |= (ds.field("origen_fenix").cast(pa.string()) == origin) & ds.field(
                     "FECHA"
                 ).isin(dates)
-            dataset = table.to_pyarrow_dataset(
-                parquet_read_options=ds.ParquetReadOptions(dictionary_columns=["origen_fenix"])
-            )
-            decoded = pa.schema(
-                [
-                    f.with_type(f.type.value_type) if pa.types.is_dictionary(f.type) else f
-                    for f in dataset.schema
-                ]
-            )
-            if decoded != zc.SCHEMA:
-                raise IntegrityError("Esquema CONT_ZC incompatible")
-            arrow = (
-                dataset.scanner(
-                    filter=predicate, batch_size=self.config.read_batch_rows, use_threads=False
-                )
-                .to_table()
-                .cast(zc.SCHEMA)
-            )
+            arrow = self.scan(table, filter=predicate, batch_size=self.config.read_batch_rows)
         if arrow.schema != zc.SCHEMA:
             raise IntegrityError("Esquema CONT_ZC incompatible")
         self.timings["rows_read"] += arrow.num_rows
         rows = {}
-        for row in arrow.to_pylist():
+        with self.measure("arrow_to_python"):
+            decoded_rows = arrow.to_pylist()
+        for row in decoded_rows:
             if any(row[f] is None for f in zc.SCHEMA.names):
                 raise IntegrityError("CONT_ZC contiene un campo obligatorio nulo")
             if row["FECHA"].microsecond or row["FECHA"].tzinfo is not None:
@@ -181,6 +249,10 @@ class ZcStore(DeltaStore):
         return table.version(), rows
 
     def verify_commit(self, table, version, prepared):
+        with self.measure("commit_cdf"):
+            self._verify_commit(table, version, prepared)
+
+    def _verify_commit(self, table, version, prepared):
         expected = {zc.key(r): zc.row_hash(r) for r in prepared["inserts"]}
         changes, preimages = {}, set()
         for batch in pa.RecordBatchReader.from_stream(table.load_cdf(version, version)):
@@ -203,6 +275,13 @@ class ZcStore(DeltaStore):
             raise IntegrityError("CONT_ZC commit changes differ from its intention")
 
     def insert(self, rows, operation, before_version):
+        try:
+            return self._insert(rows, operation, before_version)
+        finally:
+            self.__dict__.pop("_pinned_table", None)
+            self.__dict__.pop("_pinned_history", None)
+
+    def _insert(self, rows, operation, before_version):
         table = self.table()
         version = table.version() if table is not None else None
         if version != before_version or not rows:

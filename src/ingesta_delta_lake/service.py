@@ -92,9 +92,9 @@ def _apply_pinned(config, control, store, batch):
     if scoped_mia:
         from .mia_scope import verify_files
     version, rows = store.read(table)
-    commits = (
-        [h for h in table.history() if h.get("ingesta_operation_id") == operation] if table else []
-    )
+    latest_only = scoped_zc and batch["state"] == "PREPARED"
+    history = (table.history(1) if latest_only else table.history()) if table else []
+    commits = [h for h in history if h.get("ingesta_operation_id") == operation]
     if len(commits) > 1:
         raise IntegrityError("La operación aparece en más de un commit")
     if commits:
@@ -140,7 +140,7 @@ def _apply_pinned(config, control, store, batch):
         table = store.table()
         after_version, after = store.read(table)
         expected = 0 if version is None else version + 1
-        history = table.history() if table else []
+        history = (table.history(1) if scoped_zc else table.history()) if table else []
         if (
             after_version != expected
             or content_hash(after) != prepared["after_hash"]
