@@ -36,13 +36,13 @@ class DeltaStore:
             if self.path.exists() and (not self.path.is_dir() or any(self.path.iterdir())):
                 raise IntegrityError("El destino contiene archivos sin una tabla Delta reconocible")
             return None
-        table = DeltaTable(str(self.path))
+        table = self.open_version()
         if self.config.change_data_feed and (
             table.metadata().configuration.get("delta.enableChangeDataFeed") != "true"
             or table.metadata().configuration.get("delta.enableExpiredLogCleanup") != "false"
         ):
             raise IntegrityError("Independent storage requires retained CDF; migrate explicitly")
-        history = table.history()
+        history = self.transaction_history(table)
         if not history or any(
             h.get("ingesta_control_id") != self.control_id
             or h.get("ingesta_plant") != self.plant
@@ -53,6 +53,12 @@ class DeltaStore:
                 "Tabla ajena a este control/contrato o modificada por otro escritor"
             )
         return table
+
+    def open_version(self):
+        return DeltaTable(str(self.path))
+
+    def transaction_history(self, table):
+        return table.history()
 
     def read(self, table: DeltaTable | None = None) -> tuple[int | None, dict]:
         table = self.read_view(table if table is not None else self.table())

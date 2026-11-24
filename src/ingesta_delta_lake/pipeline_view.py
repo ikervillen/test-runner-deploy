@@ -2,6 +2,7 @@
 
 import json
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 import pyarrow as pa
@@ -12,6 +13,17 @@ from .contracts import CONTRACTS
 from .pipeline_archive import META
 from .pipeline_publications import _inside, schema_hash
 from .pipeline_rows import business_key, conflicting_keys, payload_hash, reconcile, review_hash
+
+
+def _cdf(table, start, stop, predicate, measure):
+    with measure("reconciliation_cdf_open"):
+        reader = pa.RecordBatchReader.from_stream(table.load_cdf(start, stop, predicate=predicate))
+    while True:
+        with measure("reconciliation_cdf_read"):
+            batch = next(reader, None)
+        if batch is None:
+            return
+        yield batch
 
 
 class ArchiveSnapshot:
@@ -74,7 +86,14 @@ class SilverView:
     def __init__(self, *, live=None, history=None, archive=None):
         self.live, self.history, self.archive = live, history, archive
 
-    def rows(self, family, *, max_rows, batch_size, expression=None, cdf_predicate=None):
+    def rows(
+        self, family, *, max_rows, batch_size, expression=None, cdf_predicate=None, measure=None
+    ):
+        if measure is None:
+
+            def measure(_name):
+                return nullcontext()
+
         grouped, scanned = defaultdict(list), 0
         rejected = set()
         for snapshot in (self.live, self.history):
@@ -110,12 +129,10 @@ class SilverView:
                     table = snapshot.table(family)
                     maintenance = {
                         h["version"]
-                        for h in table.history()
+                        for h in getattr(snapshot, "transaction_history", table.history)()
                         if h.get("ingesta_maintenance") == "archive-retirement"
                     }
-                    for batch in pa.RecordBatchReader.from_stream(
-                        table.load_cdf(start, ref["version"], predicate=cdf_predicate)
-                    ):
+                    for batch in _cdf(table, start, ref["version"], cdf_predicate, measure):
                         # CDF evidence is bounded even when a caller filter excludes all rows.
                         scanned += batch.num_rows
                         if scanned > max_rows:
