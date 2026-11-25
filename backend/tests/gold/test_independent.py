@@ -1166,9 +1166,11 @@ def test_live_export_can_carry_more_logical_rows_than_its_work_budget(
     assert export(small, "live", cfg).publication_id == recovered.publication_id
 
 
-@pytest.mark.parametrize("delay_hours", [0, 9])
+@pytest.mark.parametrize(
+    ("delay_hours", "gap_family"), [(0, "CONT_ZC"), (9, "CONT_ZC"), (9, "LISTA_DEFECTOS")]
+)
 def test_late_coverage_publishes_previous_closed_hour_in_real_delta(
-    tmp_path, native, monkeypatch, delay_hours
+    tmp_path, native, monkeypatch, delay_hours, gap_family
 ):
     from datetime import UTC, timedelta
     from types import SimpleNamespace
@@ -1197,7 +1199,7 @@ def test_late_coverage_publishes_previous_closed_hour_in_real_delta(
     coverage = metadata["coverage"]
     late = [
         {**r, "covered_until": (closing - timedelta(minutes=10)).isoformat()}
-        if r["source"] == "CONT_ZC"
+        if r["source"] == gap_family
         else r
         for r in coverage
     ]
@@ -1217,7 +1219,15 @@ def test_late_coverage_publishes_previous_closed_hour_in_real_delta(
         == "PUBLISHED"
     )
     before = Snapshot.open(published)
-    assert not [r for r in before.rows("quality_scores") if r["corte"] == closing]
+    prior_ids = {r["id_resultado"] for r in before.rows("quality_scores") if r["corte"] == closing}
+    if gap_family == "CONT_ZC":
+        assert not prior_ids
+    else:
+        assert prior_ids
+        assert not any(
+            r["id_resultado"] in prior_ids and r["componente"] == "MIA"
+            for r in before.rows("quality_score_components")
+        )
     older = (closing - timedelta(hours=1), closing) if delay_hours else None
     if older:
         assert not retry_closures(before, coverage, later, 100000)
@@ -1230,6 +1240,17 @@ def test_late_coverage_publishes_previous_closed_hour_in_real_delta(
     )
     visible = Snapshot.open(published)
     assert [r for r in visible.rows("quality_scores") if r["corte"] == closing]
+    if prior_ids:
+        assert prior_ids & {
+            r["id_resultado"]
+            for r in visible.rows("quality_score_components")
+            if r["componente"] == "MIA"
+        }
+        assert (
+            run(after.root, published, confirmed_input=after, cutoff=later, **options)["status"]
+            == "UNCHANGED"
+        )
+        assert Snapshot.open(published).manifest["tables"] == visible.manifest["tables"]
     assert not retry_closures(visible, coverage, later, 100000, older=older)
     if older:
         from app.gold.live_archive import archive
@@ -1258,7 +1279,10 @@ def test_late_coverage_publishes_previous_closed_hour_in_real_delta(
                 if row["result_id"]
             }
 
-        assert scores(recovered) - scores(prior)
+        if prior_ids:
+            assert prior_ids <= scores(recovered) & scores(prior)
+        else:
+            assert scores(recovered) - scores(prior)
         monkeypatch.undo()
     settled = {
         row["id_resultado"]: row

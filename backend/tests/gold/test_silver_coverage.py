@@ -52,13 +52,15 @@ def test_index_and_inline_match_without_bridging_missing_or_decoding_parquet(tmp
     assert index.pages_read < 6 * (DEPTH + 1)
     assert index.pages_read < writer.pages_written
 
-    receipts.update({blank: "empty"}, {blank: "empty"})
+    receipts.update({blank: (1, "empty")}, {blank: "empty"})
     assert covers(project({"parts_root": tree}), hour)
     assert project({"parts": parts}) == project({"parts_root": tree})
     # A newer file invalidates the empty proof until Silver verifies a replacement.
-    receipts.update({blank: "later-revision"}, {})
+    receipts.update({blank: (2, "later-revision")}, {})
     assert not covers(project({"parts_root": tree}), hour)
-    receipts.update({blank: "later-revision"}, {blank: "later-revision"})
+    receipts.update({blank: (1, "empty")}, {blank: "empty"})
+    assert not covers(project({"parts_root": tree}), hour)
+    receipts.update({blank: (2, "later-revision")}, {blank: "later-revision"})
     assert covers(project({"parts_root": tree}), hour)
     assert BlankReceipts(tmp_path / "slots", 600).confirmed(*blank)
 
@@ -81,20 +83,27 @@ def test_an_empty_slot_needs_both_bronze_bytes_and_owner_confirmation(monkeypatc
             pass
 
         def captures(self, **limits):
-            for sequence, (identity, origin) in enumerate(
-                (("confirmed", "AV32"), ("missing-silver", "AV21"), ("not-blank", "AV23")), 1
-            ):
+            entries = (
+                (1, "confirmed", "AV32", b" "),
+                (2, "missing-silver", "AV21", b""),
+                (3, "not-blank", "AV23", b"25/11/2026 07:50:00;old"),
+                (4, "new-revision", "AV22", b""),
+            )
+            for sequence, identity, origin, data in entries:
+                if not limits["after"] < sequence <= limits["after"] + limits["limit"]:
+                    continue
                 yield SimpleNamespace(
                     family=FAMILY,
                     input_id=identity,
                     sequence=sequence,
                     snapshot=SimpleNamespace(
-                        origin=origin, producer_time=clock, source_path=origin, size=1
+                        origin=origin, producer_time=clock, source_path=origin, size=len(data)
                     ),
+                    data=data,
                 )
 
         def read(self, capture, **options):
-            return b" " if capture.input_id == "confirmed" else b"bad"
+            return capture.data
 
     monkeypatch.setattr(bronze, "BronzeFeed", Feed)
     snapshot = SimpleNamespace(
@@ -102,8 +111,14 @@ def test_an_empty_slot_needs_both_bronze_bytes_and_owner_confirmation(monkeypatc
             "identity": "a",
             "tables": {
                 FAMILY: {
-                    "captured_ids": ["confirmed", "not-blank"],
-                    "observed_until": {"AV32": clock, "AV23": clock, "AV21": clock},
+                    "captured_ids": ["missing-silver"],
+                    "observed_until": {"AV32": START.isoformat()},
+                    "slot_receipts": [
+                        [1, "confirmed", "AV32", clock, True],
+                        [3, "not-blank", "AV23", clock, True],
+                        [2, "old-revision", "AV22", clock, True],
+                        [5, "absent-bronze", "AV31", clock, True],
+                    ],
                 }
             },
         }
@@ -112,5 +127,14 @@ def test_an_empty_slot_needs_both_bronze_bytes_and_owner_confirmation(monkeypatc
         None, snapshot, SimpleNamespace(live_batch_files=64, window_seconds=600)
     )
     slot = slot_number(START + STEP, 600)
-    assert set(seen) == {(FAMILY, origin, slot) for origin in ("AV32", "AV21", "AV23")}
-    assert verified == {(FAMILY, "AV32", slot): "confirmed"}
+    assert seen[FAMILY, "AV22", slot] == (4, "new-revision")
+    assert verified == {(FAMILY, "AV32", slot): "confirmed", (FAMILY, "AV23", slot): None}
+    old_pin = SimpleNamespace(manifest={"identity": "a", "tables": {}})
+    assert not confirmed_blanks(
+        None, old_pin, SimpleNamespace(live_batch_files=64, window_seconds=600)
+    )[1]
+    # The exact published receipt is directly addressable even after the Bronze tail advances.
+    Feed.sequence = 9000
+    assert confirmed_blanks(
+        None, snapshot, SimpleNamespace(live_batch_files=64, window_seconds=600), after=8999
+    )[1] == {(FAMILY, "AV32", slot): "confirmed", (FAMILY, "AV23", slot): None}

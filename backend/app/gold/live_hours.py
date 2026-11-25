@@ -36,20 +36,17 @@ def retry_closures(
     upper = start + timedelta(microseconds=1)
     if older:
         lowest, upper = older
-    pending = (field("estado").cast("string") == "WAITING_DEPENDENCY") if older else ds.scalar(True)
     rows = previous.rows(
         "publication_scope_status",
         expression=(
             (field("source").cast("string") == "quality_scores")
             & (field("period_start") >= lowest)
             & (field("period_start") < upper)
-            & pending
         ),
         file_pruning_predicate=[
             ("period_start", ">=", lowest),
             ("period_start", "<", upper),
             ("source", "=", "quality_scores"),
-            *([("estado", "=", "WAITING_DEPENDENCY")] if older else []),
         ],
         max_rows=budget,
     )

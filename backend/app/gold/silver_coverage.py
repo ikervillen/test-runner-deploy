@@ -8,7 +8,7 @@ from .evidence import OPERATIONS
 from .fragment_delta import EPOCH
 
 SLOT_FAMILIES = OPERATIONS - {"LISTA_AR"}
-COVERAGE_RULE = "confirmed-slots-v1"
+COVERAGE_RULE = "confirmed-slots-v2"
 
 
 def slot_number(stamp, seconds):
@@ -29,11 +29,10 @@ def covers(row, window):
     return bool(required) and all(slot in known for slot in required)
 
 
-def confirmed_blanks(storage, snapshot, policy):
-    """Bounded, owner-confirmed receipts, independently of whether Delta had rows."""
+def confirmed_blanks(storage, snapshot, policy, *, receipts=None, after=None, through=None):
+    """Verify exact Bronze bytes against owner outcomes carried by the Silver pin."""
     from ingesta_delta_lake.common import blank_input
     from ingesta_delta_lake.pipeline_bronze import BronzeFeed
-    from ingesta_delta_lake.pipeline_publications import SilverSnapshot
 
     try:
         feed = BronzeFeed(storage)
@@ -41,87 +40,96 @@ def confirmed_blanks(storage, snapshot, policy):
         return {}, {}
     if feed.identity != snapshot.manifest["identity"] or not feed.sequence:
         return {}, {}
-    captures = {}
-    limit = min(512, max(256, policy.live_batch_files))
-    for captured in feed.captures(after=max(0, feed.sequence - limit), limit=limit):
-        if captured.family in SLOT_FAMILIES and captured.snapshot.producer_time:
-            item = captured.snapshot
-            captures[captured.family, item.origin, item.source_path] = captured
-    # Track the latest capture at each slot. A new unconfirmed capture
-    # invalidates the earlier empty proof. An unchanged one keeps its proof.
-    latest = {}
-    for captured in captures.values():
+    latest, accepted, captures = {}, {}, {}
+    for family in SLOT_FAMILIES:
+        for seq, identity, origin, stamp, confirmed in (
+            snapshot.manifest["tables"].get(family, {}).get("slot_receipts", ())
+        ):
+            key = family, origin, slot_number(datetime.fromisoformat(stamp), policy.window_seconds)
+            latest[key] = seq, identity
+            if confirmed:
+                accepted[key] = seq, identity, stamp
+
+    # Bronze may already contain a newer, still unconfirmed revision.
+    through = min(feed.sequence, through) if through is not None else feed.sequence
+    if after is None:
+        after = max(0, through - min(512, max(256, policy.live_batch_files)))
+    changes = feed.captures(after=after, limit=through - after) if through > after else ()
+    for captured in changes:
         item = captured.snapshot
+        if captured.family not in SLOT_FAMILIES or "T" not in (item.producer_time or ""):
+            continue
         slot = slot_number(datetime.fromisoformat(item.producer_time), policy.window_seconds)
         key = captured.family, item.origin, slot
-        if key not in latest or latest[key].sequence < captured.sequence:
-            latest[key] = captured
-    seen = {key: captured.input_id for key, captured in latest.items()}
-    candidates = {v.input_id: v for v in latest.values() if v.snapshot.size <= 4096}
+        if key not in latest or latest[key][0] <= captured.sequence:
+            latest[key] = captured.sequence, captured.input_id
+            captures[key] = captured
     verified = {}
-    if not candidates:
-        return seen, verified
-    accepted = set()
-    inspected = set()
-    for _ in range(32):
-        for family in SLOT_FAMILIES:
-            ref = snapshot.manifest["tables"].get(family, {})
-            for identity in ref.get("captured_ids", ()):
-                if identity in inspected or identity not in candidates:
-                    continue
-                item = candidates[identity].snapshot
-                observed = ref.get("observed_until", {}).get(item.origin)
-                if observed and datetime.fromisoformat(observed) >= datetime.fromisoformat(
-                    item.producer_time
-                ):
-                    accepted.add(identity)
-                    inspected.add(identity)
-        parent = snapshot.manifest.get("parent")
-        if not parent or len(inspected) == len(candidates):
-            break
-        snapshot = SilverSnapshot.open(storage, publication_id=parent)
-    for identity in accepted:
-        captured = candidates[identity]
-        if blank_input(feed.read(captured, max_file_bytes=4096)):
-            item = captured.snapshot
-            slot = slot_number(datetime.fromisoformat(item.producer_time), policy.window_seconds)
-            verified[captured.family, item.origin, slot] = identity
-    return seen, verified
+    for key, (seq, identity, stamp) in accepted.items():
+        if latest[key] != (seq, identity) or seq > through:
+            continue
+        if receipts is not None:
+            prior = receipts.entry(*key)
+            if prior and (prior[0] > seq or (prior[:2] == [seq, identity] and prior[3])):
+                continue
+        captured = captures.get(key)
+        try:
+            if captured is None:
+                captured = next(feed.captures(after=seq - 1, limit=1), None)
+            if (
+                captured
+                and captured.input_id == identity
+                and captured.family == key[0]
+                and captured.snapshot.origin == key[1]
+                and captured.snapshot.producer_time == stamp
+                and captured.snapshot.size <= 4096
+            ):
+                verified[key] = (
+                    identity if blank_input(feed.read(captured, max_file_bytes=4096)) else None
+                )
+        except FileNotFoundError:
+            continue
+    return latest, verified
 
 
 class BlankReceipts:
     """Compact per-day index of verified empty captures, outside the worker checkpoint."""
 
-    def __init__(self, root, seconds):
+    def __init__(self, root, seconds, *, persist=True):
         self.root, self.seconds = root, seconds
+        self.persist = persist
         self.pages = {}
 
     def page(self, slot):
         day = (EPOCH + timedelta(seconds=self.seconds * slot)).date().isoformat()
         if day not in self.pages:
             path = self.root / f"{day}.json"
-            self.pages[day] = (path, read_json(path) if path.is_file() else {})
+            self.pages[day] = (path, read_json(path) if self.persist and path.is_file() else {})
         return self.pages[day]
 
     def confirmed(self, family, origin, slot):
+        certificate = self.entry(family, origin, slot)
+        return bool(certificate and certificate[2])
+
+    def entry(self, family, origin, slot):
         _, page = self.page(slot)
-        return f"{family}:{origin}:{slot}" in page
+        return page.get(f"{family}:{origin}:{slot}")
 
     def update(self, seen, verified):
         edits = {}
-        for (family, origin, slot), newest in seen.items():
+        for (family, origin, slot), (sequence, newest) in seen.items():
             path, page = self.page(slot)
             key = f"{family}:{origin}:{slot}"
             prior = page.get(key)
-            capture = verified.get((family, origin, slot))
-            if capture and prior != capture:
-                page[key] = capture
-            elif not capture and prior is not None and prior != newest:
-                del page[key]
-            else:
+            capture = verified.get((family, origin, slot)) == newest
+            if prior and (prior[0] > sequence or (prior[:2] == [sequence, newest] and prior[3])):
                 continue
+            value = [sequence, newest, capture, (family, origin, slot) in verified]
+            if prior == value:
+                continue
+            page[key] = value
             edits[path] = page
-        for path, page in edits.items():
+        for path, page in edits.items() if self.persist else ():
             path.parent.mkdir(parents=True, exist_ok=True)
             atomic_json(path, page)
 

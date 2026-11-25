@@ -166,6 +166,8 @@ def export(pipelines, lane, config, *, ar_categories=None):
             lane != "live"
             or (
                 previous.document.get("coverage_rule") == COVERAGE_RULE
+                and previous.document.get("receipt_cursor") == cursor
+                and bool(previous.document.get("receipt_frozen")) == (active is not None)
                 and "series_handover_scopes" in previous.document
                 and (
                     ar_categories is None or previous.document.get("ar_categories") == ar_categories
@@ -487,27 +489,57 @@ def export(pipelines, lane, config, *, ar_categories=None):
         if horizon:
             window = (hour_holding(horizon)[0], horizon)
             receipts = BlankReceipts(
-                storage.gold / "inputs" / "coverage-slots", policy.window_seconds
+                storage.gold / "inputs" / "coverage-slots-v2" / digest(own.manifest["identity"]),
+                policy.window_seconds,
+                persist=active is None,
             )
             # Gold can recover an older reconciliation pin. Never regress a newer receipt
             # index with capture acknowledgements belonging to a frozen Silver input.
+            after = (
+                previous.document.get("receipt_cursor")
+                if previous
+                and previous.document.get("coverage_rule") == COVERAGE_RULE
+                and not previous.document.get("receipt_frozen")
+                and active is None
+                else None
+            )
+            receipt_cursor = (
+                min(cursor, after + min(512, max(256, policy.live_batch_files)))
+                if after is not None
+                else cursor
+            )
             receipt_vector = digest(
                 [
-                    cursor,
+                    receipt_cursor,
                     [
                         [
                             family,
-                            own.manifest["tables"].get(family, {}).get("captured_ids"),
-                            projections.get(family, {}).get("meta", {}).get("observed_until"),
+                            own.manifest["tables"].get(family, {}).get("slot_receipts"),
                         ]
                         for family in sorted(SLOT_FAMILIES)
                     ],
                 ]
             )
-            if active is None and (
-                previous is None or previous.document.get("receipt_vector") != receipt_vector
+            if (
+                active is not None
+                or previous is None
+                or (
+                    previous.document.get("receipt_frozen")
+                    or previous.document.get("receipt_vector") != receipt_vector
+                )
             ):
-                receipts.update(*confirmed_blanks(storage, own, policy))
+                receipts.update(
+                    *confirmed_blanks(
+                        storage,
+                        own,
+                        policy,
+                        receipts=receipts,
+                        after=after,
+                        through=receipt_cursor if active is None else None,
+                    )
+                )
+            doc["receipt_cursor"] = receipt_cursor
+            doc["receipt_frozen"] = active is not None
             doc["receipt_vector"] = (
                 previous.document.get("receipt_vector")
                 if active is not None and previous

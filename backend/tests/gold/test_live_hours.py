@@ -79,6 +79,29 @@ def test_only_accredited_missing_closures_are_retried():
     assert recovered == {"outgoing": early.isoformat(), "waiting": END.isoformat()}
 
 
+def test_older_published_partial_with_coverage_reason_is_retried_once():
+    snapshot = FixtureSnapshot(
+        {
+            "productions": [prod("partial"), prod("other")],
+            "publication_scope_status": [
+                dict(scope("partial", END, "MIA_SOURCE_COVERAGE_PENDING"), estado="READY"),
+                scope("other", END),
+            ],
+        }
+    )
+    later = END + timedelta(hours=9)
+    bounds = (START, END)
+    coverage = [
+        dict(source=f, origin="AV31", estado="READY")
+        for f in ("LISTA_RECH", "LISTA_DEFECTOS", "LISTA_AR", "CONT_ZC")
+    ]
+    assert retry_closures(snapshot, coverage, later, 100, older=bounds) == [
+        ["partial", START.isoformat(), END.isoformat(), END.isoformat()]
+    ]
+    snapshot.tables["publication_scope_status"][0]["reason_code"] = "LISTA_RECH_BASE_MISSING"
+    assert not retry_closures(snapshot, coverage, later, 100, older=bounds)
+
+
 def test_open_hour_has_no_score_and_zero_survives_for_closed_result():
     current = Window("p", "HOUR", END, END + timedelta(hours=1), LATER)
     closed = Window("p", "HOUR", START, END, END)
