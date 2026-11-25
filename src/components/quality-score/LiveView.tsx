@@ -1,7 +1,19 @@
 import { useEffect, useState } from "react";
 import { api } from "@/services/api";
 import type { LiveArchive, LiveResult, LiveScores } from "@/services/api";
-import { ArchivePosition } from "./ArchivePosition";
+import { ArchivePosition, archivePoints } from "./ArchivePosition";
+import {
+  chartAxis,
+  chartBottom,
+  chartCeiling,
+  chartGrid,
+  chartHeight,
+  chartInk,
+  chartTicks,
+  chartTop,
+  chartTrace,
+  useChartWidth,
+} from "./liveChart";
 
 const labels: Record<string, string> = {
   partial: "Parcial",
@@ -66,22 +78,34 @@ function HourlyTrend({
   selected?: string | null;
   onSelect: (row: LiveResult) => void;
 }) {
-  const width = 360;
-  const left = 38;
-  const top = 12;
-  const bottom = 218;
-  const step = (width - left - 8) / Math.max(hours.length, 1);
+  const { ref, width } = useChartWidth(280);
+  const left = 1;
+  const right = width - 10;
+  const top = chartTop;
+  const bottom = chartBottom;
+  const step = (right - left) / Math.max(hours.length, 1);
   const points = hours.map((hour, index) =>
     hour.state === "closed"
       ? rows[index].filter((row) => row.total_penalty !== null)
       : [],
   );
+  const latest = points
+    .flat()
+    .sort((a, b) =>
+      (b.cutoff ?? b.start).localeCompare(a.cutoff ?? a.start),
+    )[0];
+  const showTick = (i: number) =>
+    step >= 42 ||
+    i === 0 ||
+    i === hours.length - 1 ||
+    (step >= 23 && i % 2 === 0 && i < hours.length - 2);
   const x = (index: number) => left + (index + 0.5) * step;
   const y = (value: number) => bottom - (value / ceiling) * (bottom - top);
   return (
     <svg
-      className="h-[248px] w-full"
-      viewBox="0 0 360 248"
+      ref={ref}
+      className="block h-[260px] w-full"
+      viewBox={`0 0 ${width} ${chartHeight}`}
       role="img"
       aria-label="Evolución horaria de la penalización total"
     >
@@ -97,40 +121,44 @@ function HourlyTrend({
           strokeWidth=".5"
         />
       ))}
-      {[0, 1, 2, 3, 4].map((tick) => {
-        const value = (tick * ceiling) / 4;
-        return (
-          <g key={tick}>
-            <line
-              x1={left}
-              x2={width - 8}
-              y1={y(value)}
-              y2={y(value)}
-              stroke="#dce4e0"
-            />
-            <text
-              x={left - 6}
-              y={y(value) + 4}
-              textAnchor="end"
-              fill="#53645d"
-              fontSize="11"
-            >
-              {number.format(value)}
-            </text>
-          </g>
-        );
-      })}
+      {chartTicks(ceiling).map((value) => (
+        <line
+          key={value}
+          x1={left}
+          x2={right}
+          y1={y(value)}
+          y2={y(value)}
+          stroke={chartGrid}
+        />
+      ))}
+      <path
+        d={`M${left},${top}V${bottom}H${right}V${top}`}
+        fill="none"
+        stroke={chartAxis}
+      />
+      <text
+        x={right}
+        y={top - 10}
+        textAnchor="end"
+        fill={chartTrace}
+        fontSize="12"
+        fontWeight="600"
+      >
+        Actual
+      </text>
       {hours.map((hour, i) => (
         <g key={hour.start}>
-          <text
-            x={x(i)}
-            y={237}
-            textAnchor="middle"
-            fill="#53645d"
-            fontSize="11"
-          >
-            {stamp(hour.end)}
-          </text>
+          {showTick(i) && (
+            <text
+              x={x(i)}
+              y={bottom + 21}
+              textAnchor="middle"
+              fill={chartInk}
+              fontSize="12"
+            >
+              {stamp(hour.end)}
+            </text>
+          )}
           {points[i].length === 1 &&
             i > 0 &&
             points[i - 1].length === 1 &&
@@ -140,32 +168,51 @@ function HourlyTrend({
                 y1={y(points[i - 1][0].total_penalty!)}
                 x2={x(i)}
                 y2={y(points[i][0].total_penalty!)}
-                stroke="#157054"
-                strokeWidth="2"
+                stroke={chartTrace}
+                strokeWidth="2.3"
               />
             )}
         </g>
       ))}
       {points.map((entries, i) =>
-        entries.map((row, j) => (
-          <circle
-            key={row.result_id ?? row.production}
-            data-result={row.result_id ?? undefined}
-            cx={x(i) + (j - (entries.length - 1) / 2) * 8}
-            cy={y(row.total_penalty!)}
-            r={selected === row.result_id ? 6 : 4}
-            fill={classification(row)[1]}
-            stroke={selected === row.result_id ? "#172a24" : "#fff"}
-            strokeWidth="1.5"
-            className="cursor-pointer"
-            onClick={() => onSelect(row)}
-          >
-            <title>
-              {stamp(hours[i].end)} · {row.production} ·{" "}
-              {number.format(row.total_penalty!)}
-            </title>
-          </circle>
-        )),
+        entries.map((row, j) => {
+          const cx = x(i) + (j - (entries.length - 1) / 2) * 8;
+          const cy = y(row.total_penalty!);
+          const highlighted = selected
+            ? selected === row.result_id
+            : row === latest;
+          return (
+            <g
+              key={row.result_id ?? row.production}
+              className="cursor-pointer"
+              onClick={() => onSelect(row)}
+            >
+              {highlighted && (
+                <circle
+                  cx={cx}
+                  cy={cy}
+                  r={8.2}
+                  fill="none"
+                  stroke={chartTrace}
+                  strokeWidth="1.4"
+                />
+              )}
+              <circle
+                data-result={row.result_id ?? undefined}
+                cx={cx}
+                cy={cy}
+                r={highlighted ? 5.2 : 3.7}
+                fill={classification(row)[1]}
+                stroke="white"
+                strokeWidth="1.5"
+              />
+              <title>
+                {stamp(hours[i].end)} · {row.production} ·{" "}
+                {number.format(row.total_penalty!)}
+              </title>
+            </g>
+          );
+        }),
       )}
     </svg>
   );
@@ -269,7 +316,14 @@ export function LiveView({ historyOnly = false }: { historyOnly?: boolean }) {
         : [],
     ) ?? []),
   );
-  const ceiling = Math.max(4, Math.ceil(maximum / 4) * 4);
+  const ceiling = chartCeiling(
+    Math.max(
+      maximum,
+      ...positions.flatMap(([line, machine]) =>
+        archivePoints(archive, line, machine).map((point) => point.value ?? 0),
+      ),
+    ),
+  );
   return (
     <main className="bg-white px-5 py-6 text-[#182c25] sm:px-8">
       <div className="flex flex-wrap items-end justify-between gap-2 border-b border-[#dce4e0] pb-5">
@@ -386,16 +440,17 @@ export function LiveView({ historyOnly = false }: { historyOnly?: boolean }) {
                   )}
                 </p>
               </div>
-              <div className="grid items-start gap-4 lg:grid-cols-[minmax(0,1.6fr)_minmax(0,0.76fr)_minmax(408px,1.1fr)]">
-                <ArchivePosition
-                  archive={archive}
-                  error={archiveError}
-                  line={line}
-                  machine={machine}
-                  components={components}
-                />
-                <div>
-                  <h3 className="text-sm font-medium">Últimas horas</h3>
+              <div className="grid items-start gap-[18px] lg:grid-cols-[minmax(0,2.05fr)_minmax(408px,1fr)]">
+                <div className="grid min-w-0 items-start gap-3 sm:grid-cols-[minmax(0,69fr)_minmax(0,31fr)] sm:gap-6">
+                  <ArchivePosition
+                    archive={archive}
+                    error={archiveError}
+                    line={line}
+                    machine={machine}
+                    components={components}
+                    ceiling={ceiling}
+                    compact
+                  />
                   <HourlyTrend
                     hours={view.hours}
                     rows={rows}
@@ -408,7 +463,7 @@ export function LiveView({ historyOnly = false }: { historyOnly?: boolean }) {
                     onSelect={select}
                   />
                 </div>
-                <div className="overflow-x-auto">
+                <div className="overflow-x-auto pt-3">
                   <table className="w-full min-w-[408px] text-left text-sm tabular-nums">
                     <caption className="sr-only">
                       Desglose horario de {label}

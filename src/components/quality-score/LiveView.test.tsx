@@ -65,6 +65,16 @@ it("shows zero for a closed result, excludes the open score and pins detail", as
   expect(
     screen.getAllByRole("img", { name: /Evolución horaria/ }),
   ).toHaveLength(7);
+  expect(screen.queryByText("Evolución por turnos")).not.toBeInTheDocument();
+  expect(screen.queryByText(/Media horaria ponderada/)).not.toBeInTheDocument();
+  const charts = screen.getAllByRole("img", {
+    name: /Tendencia provisional|Evolución horaria/,
+  });
+  expect(charts).toHaveLength(14);
+  expect(
+    charts.every((chart) => chart.getAttribute("viewBox")?.endsWith(" 260")),
+  ).toBe(true);
+  expect(screen.getAllByText("Actual")).toHaveLength(7);
   expect(screen.getAllByText("Histórico acumulado no disponible")).toHaveLength(
     7,
   );
