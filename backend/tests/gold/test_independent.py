@@ -1166,8 +1166,12 @@ def test_live_export_can_carry_more_logical_rows_than_its_work_budget(
     assert export(small, "live", cfg).publication_id == recovered.publication_id
 
 
-def test_late_coverage_publishes_previous_closed_hour_in_real_delta(tmp_path, native):
-    from datetime import timedelta
+@pytest.mark.parametrize("delay_hours", [0, 9])
+def test_late_coverage_publishes_previous_closed_hour_in_real_delta(
+    tmp_path, native, monkeypatch, delay_hours
+):
+    from datetime import UTC, timedelta
+    from types import SimpleNamespace
 
     from app.gold.common import read_json
     from app.gold.live_hours import retry_closures
@@ -1177,7 +1181,7 @@ def test_late_coverage_publishes_previous_closed_hour_in_real_delta(tmp_path, na
     from .test_pipeline import CUTOFF, bundle
 
     closing = CUTOFF - timedelta(hours=1)
-    later = closing + timedelta(minutes=10)
+    later = closing + timedelta(hours=delay_hours, minutes=10)
     source = industrial_evidence(
         tmp_path / "source",
         "live",
@@ -1214,7 +1218,10 @@ def test_late_coverage_publishes_previous_closed_hour_in_real_delta(tmp_path, na
     )
     before = Snapshot.open(published)
     assert not [r for r in before.rows("quality_scores") if r["corte"] == closing]
-    retry = retry_closures(before, coverage, later, 100000)
+    older = (closing - timedelta(hours=1), closing) if delay_hours else None
+    if older:
+        assert not retry_closures(before, coverage, later, 100000)
+    retry = retry_closures(before, coverage, later, 100000, older=older)
     assert retry and all(item[3] == closing.isoformat() for item in retry)
     after = save(source.root, {**metadata, "retry_closures": retry}, tables, window_seconds=600)
     assert (
@@ -1223,7 +1230,36 @@ def test_late_coverage_publishes_previous_closed_hour_in_real_delta(tmp_path, na
     )
     visible = Snapshot.open(published)
     assert [r for r in visible.rows("quality_scores") if r["corte"] == closing]
-    assert not retry_closures(visible, coverage, later, 100000)
+    assert not retry_closures(visible, coverage, later, 100000, older=older)
+    if older:
+        from app.gold.live_archive import archive
+        from app.infrastructure.cache import LruCache
+
+        t0 = closing - timedelta(hours=2)
+        monkeypatch.setattr("app.gold.live_archive.live_epoch", lambda: t0)
+        monkeypatch.setattr("app.gold.live_view.live_epoch", lambda: t0)
+        settings = SimpleNamespace(
+            resolved_gold_root=published,
+            gold_live_timezone="UTC",
+            gold_query_max_rows=100000,
+            gold_query_total_rows=300000,
+        )
+        moment = later.replace(tzinfo=UTC)
+        cache = LruCache(4)
+        prior = archive(settings, cache, publication_id=before.publication_id, moment=moment)
+        recovered = archive(settings, cache, moment=moment)
+
+        def scores(page):
+            return {
+                row["result_id"]
+                for shift in page["shifts"]
+                for hour in shift["hours"]
+                for row in hour["results"]
+                if row["result_id"]
+            }
+
+        assert scores(recovered) - scores(prior)
+        monkeypatch.undo()
     settled = {
         row["id_resultado"]: row
         for row in visible.rows("quality_scores")

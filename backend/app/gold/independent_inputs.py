@@ -15,6 +15,13 @@ from .evidence import OPERATIONS, attribution, operational_expression, registry,
 from .lanes import hour_holding
 from .producer import FAMILIES, _apply_horizon, _apply_live, auxiliary
 from .series_handover import RELATION, apply_series_handover, recent_relations
+from .silver_coverage import (
+    COVERAGE_RULE,
+    SLOT_FAMILIES,
+    BlankReceipts,
+    SlotCoverage,
+    confirmed_blanks,
+)
 from .silver_incremental import FullReadRequired, references
 
 AUXILIARY = frozenset(
@@ -158,11 +165,13 @@ def export(pipelines, lane, config, *, ar_categories=None):
         if previous.document.get("source_vector") == vector and (
             lane != "live"
             or (
-                "series_handover_scopes" in previous.document
+                previous.document.get("coverage_rule") == COVERAGE_RULE
+                and "series_handover_scopes" in previous.document
                 and (
                     ar_categories is None or previous.document.get("ar_categories") == ar_categories
                 )
                 and not previous.document.get("more_hourly_revisions")
+                and not previous.document.get("older_retry_scan")
             )
         ):
             return previous
@@ -371,14 +380,20 @@ def export(pipelines, lane, config, *, ar_categories=None):
                 "last_successful_discovery": ref.get("owner_confirmed_at"),
             }
             instants = (
-                [
-                    datetime.fromisoformat(stamp)
-                    for part in incremental[family][0].get("parts", [])
-                    if part["partition"][0] == origin
-                    for stamp in part["time_bounds"]
-                ]
-                if family in incremental and "FECHA" in CONTRACTS[family].schema.names
-                else [r["FECHA"] for r in rows if r.get("origen_fenix") == origin and "FECHA" in r]
+                ()
+                if lane == "live"
+                else (
+                    [
+                        datetime.fromisoformat(stamp)
+                        for part in incremental[family][0].get("parts", [])
+                        if part["partition"][0] == origin
+                        for stamp in part["time_bounds"]
+                    ]
+                    if family in incremental and "FECHA" in CONTRACTS[family].schema.names
+                    else [
+                        r["FECHA"] for r in rows if r.get("origen_fenix") == origin and "FECHA" in r
+                    ]
+                )
             )
             if instants:
                 row.update(
@@ -468,8 +483,45 @@ def export(pipelines, lane, config, *, ar_categories=None):
             )
         doc["retained_live"] = retained or any(s["retained"] for s in reconciled.values())
         horizon = _source_horizon(coverage)
+        doc["coverage_rule"] = COVERAGE_RULE
         if horizon:
             window = (hour_holding(horizon)[0], horizon)
+            receipts = BlankReceipts(
+                storage.gold / "inputs" / "coverage-slots", policy.window_seconds
+            )
+            # Gold can recover an older reconciliation pin. Never regress a newer receipt
+            # index with capture acknowledgements belonging to a frozen Silver input.
+            receipt_vector = digest(
+                [
+                    cursor,
+                    [
+                        [
+                            family,
+                            own.manifest["tables"].get(family, {}).get("captured_ids"),
+                            projections.get(family, {}).get("meta", {}).get("observed_until"),
+                        ]
+                        for family in sorted(SLOT_FAMILIES)
+                    ],
+                ]
+            )
+            if active is None and (
+                previous is None or previous.document.get("receipt_vector") != receipt_vector
+            ):
+                receipts.update(*confirmed_blanks(storage, own, policy))
+            doc["receipt_vector"] = (
+                previous.document.get("receipt_vector")
+                if active is not None and previous
+                else receipt_vector
+            )
+            observed = SlotCoverage(
+                coverage,
+                seconds=policy.window_seconds,
+                indexed=incremental,
+                tables=tables,
+                index=previous.index if previous else None,
+                receipts=receipts,
+            )
+            observed.prepare(window[0] - timedelta(hours=1), horizon)
             published = storage.gold / "published"
             if ar_categories is not None:
                 from .live_hours import ar_pin
@@ -544,6 +596,7 @@ def export(pipelines, lane, config, *, ar_categories=None):
                     closed=doc["closed_hours"],
                     ar_changed=changed,
                     waiting=waiting,
+                    prepare=observed.prepare,
                 )
                 doc["retry_closures"] = retries[:12]
                 doc["ar_review_waiting"] = bool(
@@ -565,6 +618,30 @@ def export(pipelines, lane, config, *, ar_categories=None):
                                 datetime.fromisoformat(target),
                             ).identity
                         )
+                epoch = live_epoch()
+                if epoch is not None:
+                    fence = window[0] - timedelta(hours=7)
+                    first_hour = epoch.replace(minute=0, second=0, microsecond=0)
+                    cursor = previous.document.get("older_retry_before") if previous else None
+                    upper = min(fence, datetime.fromisoformat(cursor)) if cursor else fence
+                    if upper <= first_hour:
+                        upper = fence
+                    lower = max(first_hour, upper - timedelta(hours=4))
+                    if lower < upper:
+                        old = retry_closures(
+                            visible,
+                            coverage,
+                            horizon,
+                            policy.read_max_rows,
+                            older=(lower, upper),
+                            prepare=observed.prepare,
+                        )
+                        # Old work has its own small allocation after the current hour.
+                        doc["retry_closures"].extend(old[:2])
+                        doc["older_retry_before"] = (upper if len(old) > 2 else lower).isoformat()
+                        doc["older_retry_scan"] = len(old) > 2 or lower > first_hour
+                        if len(old) > 2:
+                            doc["more_hourly_revisions"] = True
                 if doc["retry_closures"]:
                     scopes = [
                         window,
@@ -575,6 +652,7 @@ def export(pipelines, lane, config, *, ar_categories=None):
                             }
                         ),
                     ]
+            observed.finalize(horizon)
         if incremental:
             # Attribution consumes only the active window; the immutable manifest keeps
             # the full logical facts. Read through the original cache for untouched parts.

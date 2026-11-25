@@ -62,6 +62,16 @@ def _unique(name, rows):
 
 
 def _coverage_ready(snapshot, p, window, pending, required=None):
+    from .common import live_epoch
+    from .silver_coverage import covers
+
+    floor = live_epoch()
+    coverage_window = window
+    if floor is not None and window.start < floor < window.cutoff:
+        coverage_window = Window(
+            window.production_id, window.kind, floor, window.end, window.cutoff, window.selection_id
+        )
+
     required = required or {"LISTA_DEFECTOS", "LISTA_RECH", "LISTA_AR", "CONT_ZC"}
     scopes = [
         r
@@ -74,9 +84,14 @@ def _coverage_ready(snapshot, p, window, pending, required=None):
     for family in required:
         matching = [r for r in scopes if r["source"] == family and r["estado"] == "READY"]
         if not any(
-            (r.get("covered_from") is None or context.stamp(r["covered_from"]) <= window.start)
-            and (
-                r.get("covered_until") is None or window.cutoff <= context.stamp(r["covered_until"])
+            covers(r, coverage_window)
+            if "confirmed_slots" in r
+            else (
+                (r.get("covered_from") is None or context.stamp(r["covered_from"]) <= window.start)
+                and (
+                    r.get("covered_until") is None
+                    or window.cutoff <= context.stamp(r["covered_until"])
+                )
             )
             for r in matching
         ):

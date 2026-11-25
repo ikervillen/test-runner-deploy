@@ -17,24 +17,39 @@ RETRY_REASONS = {"SOURCE_COVERAGE_PENDING", "MIA_SOURCE_COVERAGE_PENDING"}
 
 
 def retry_closures(
-    previous, coverage, cutoff, budget, *, closed=None, ar_changed=None, waiting=None
+    previous,
+    coverage,
+    cutoff,
+    budget,
+    *,
+    closed=None,
+    ar_changed=None,
+    waiting=None,
+    prepare=None,
+    older=None,
 ):
     from .pipeline import LIVE_FAMILIES, _coverage_ready
 
     start, _ = hour_holding(cutoff)
     lowest = start - timedelta(hours=7)
     field = ds.field
+    upper = start + timedelta(microseconds=1)
+    if older:
+        lowest, upper = older
+    pending = (field("estado").cast("string") == "WAITING_DEPENDENCY") if older else ds.scalar(True)
     rows = previous.rows(
         "publication_scope_status",
         expression=(
             (field("source").cast("string") == "quality_scores")
             & (field("period_start") >= lowest)
-            & (field("period_start") <= start)
+            & (field("period_start") < upper)
+            & pending
         ),
         file_pruning_predicate=[
             ("period_start", ">=", lowest),
-            ("period_start", "<=", start),
+            ("period_start", "<", upper),
             ("source", "=", "quality_scores"),
+            *([("estado", "=", "WAITING_DEPENDENCY")] if older else []),
         ],
         max_rows=budget,
     )
@@ -65,12 +80,16 @@ def retry_closures(
         if row["scope_id"] != window.identity:
             continue
         reasons = set((row.get("reason_code") or "").split(";"))
+        if older and not reasons & RETRY_REASONS:
+            continue
         revised = ar_changed(row, window) if ar_changed else False
         if not revised and row["period_end"] == chunk.cutoff and not reasons & RETRY_REASONS:
             if closed is not None and row["estado"] == "READY":
                 closed.append(window.identity)
             continue
-        if (ar_changed or len(result) < 12) and _coverage_ready(
+        if prepare is not None:
+            prepare(window.start, window.cutoff, origin=production["origen_fenix"])
+        if (older or ar_changed or len(result) < 12) and _coverage_ready(
             probe, production, window, [], LIVE_FAMILIES
         ):
             result.append([identity, left.isoformat(), right.isoformat(), chunk.cutoff.isoformat()])
@@ -79,7 +98,7 @@ def retry_closures(
                 waiting.append(window.identity)
             if closed is not None and row["estado"] == "READY":
                 closed.append(window.identity)
-        if len(result) == 12 and closed is None and not ar_changed:
+        if len(result) == 12 and closed is None and not ar_changed and not older:
             break
     return result
 
