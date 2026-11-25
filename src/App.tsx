@@ -89,12 +89,16 @@ export default function App() {
           Histórico
         </button>
       </nav>
-      {tab === "live" ? <LiveView /> : <HistoryView />}
+      {tab === "live" ? (
+        <LiveView key="live" />
+      ) : (
+        <LiveView key="archive" historyOnly />
+      )}
     </div>
   );
 }
 
-function HistoryView() {
+export function HistoryView() {
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [selectedLines, setSelectedLines] = useState<string[]>([]);
   const [selectedProductions, setSelectedProductions] = useState<string[]>([]);

@@ -37,6 +37,7 @@ export type LiveResult = {
   total_penalty: number | null;
   normalized_score: number | null;
   classification: string | null;
+  model?: string | null;
   contributions: Partial<Record<string, number>>;
 };
 
@@ -48,7 +49,34 @@ export type LiveScores = {
   hours: { start: string; end: string; state: string; results: LiveResult[] }[];
 };
 
+export type ArchivedShift = {
+  start: string;
+  end: string;
+  name: string;
+  partial_t0: boolean;
+  accruing: boolean;
+  hours: LiveScores["hours"];
+};
+
+export type LiveArchive = {
+  t0: string;
+  eligible_until: string;
+  publication: string;
+  shifts: ArchivedShift[];
+  next_before: string | null;
+};
+
 export const api = {
+  getLiveArchive: (before: string | null, signal: AbortSignal) =>
+    request<LiveArchive>(
+      `/api/live/archive${before ? `?before=${encodeURIComponent(before)}` : ""}`,
+      { signal },
+    ),
+  getArchiveDetail: (publication: string, result: string) =>
+    request<Record<string, unknown>>(
+      `/api/live/archive/${encodeURIComponent(publication)}/${encodeURIComponent(result)}`,
+    ),
+
   getHistoryCatalog: () => request<Catalog>("/api/history/catalog"),
   getLiveScores: (signal: AbortSignal) =>
     request<LiveScores>("/api/live/scores", { signal }),

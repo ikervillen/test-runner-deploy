@@ -39,6 +39,7 @@ it("shows zero for a closed result, excludes the open score and pins detail", as
       ZC: 0,
     },
   };
+  vi.spyOn(api, "getLiveArchive").mockRejectedValue(new Error("unavailable"));
   vi.spyOn(api, "getLiveScores").mockResolvedValue({
     publication_id: "publication",
     published_at: "2026-11-24T14:01:00Z",
@@ -64,7 +65,9 @@ it("shows zero for a closed result, excludes the open score and pins detail", as
   expect(
     screen.getAllByRole("img", { name: /Evolución horaria/ }),
   ).toHaveLength(7);
-  expect(screen.getAllByText("Histórico no disponible")).toHaveLength(7);
+  expect(screen.getAllByText("Histórico acumulado no disponible")).toHaveLength(
+    7,
+  );
   expect(document.querySelectorAll("circle[data-result]")).toHaveLength(1);
   expect(screen.getAllByText("En curso")).toHaveLength(7);
   expect(screen.queryByText(/999/)).not.toBeInTheDocument();
@@ -125,6 +128,7 @@ it("keeps both handover results with missing components and shows all hour state
     total_penalty: 2,
     contributions: { MIA: 2 },
   };
+  vi.spyOn(api, "getLiveArchive").mockRejectedValue(new Error("unavailable"));
   vi.spyOn(api, "getLiveScores").mockResolvedValue({
     publication_id: "publication",
     published_at: "2026-11-24T15:00:00Z",
@@ -179,4 +183,65 @@ it("keeps both handover results with missing components and shows all hour state
   });
   expect(within(other).getAllByText("Sin producción")).toHaveLength(2);
   vi.restoreAllMocks();
+});
+
+it("shows the archived shift and opens the original score on its Gold publication", async () => {
+  const result: LiveResult = {
+    production: "fenix:series",
+    line: "AV21",
+    machine: 4,
+    model: "model-A",
+    start: "2026-11-24T10:20:00",
+    cutoff: "2026-11-24T11:00:00",
+    state: "complete",
+    reason: null,
+    result_id: "archived-result",
+    total_penalty: 5,
+    normalized_score: 1,
+    classification: "good",
+    contributions: { MIA: 5 },
+  };
+  vi.spyOn(api, "getLiveArchive").mockResolvedValue({
+    t0: result.start,
+    eligible_until: "2026-11-24T14:00:00",
+    publication: "archived-publication",
+    next_before: null,
+    shifts: [
+      {
+        start: "2026-11-24T06:00:00",
+        end: "2026-11-24T14:00:00",
+        name: "Manana",
+        partial_t0: true,
+        accruing: false,
+        hours: [
+          {
+            start: "2026-11-24T10:00:00",
+            end: result.cutoff!,
+            state: "closed",
+            results: [result],
+          },
+        ],
+      },
+    ],
+  });
+  const detail = vi
+    .spyOn(api, "getArchiveDetail")
+    .mockResolvedValue({ configuration: { version: "official" } });
+  render(<LiveView historyOnly />);
+  const graph = await screen.findAllByRole("img", {
+    name: "Tendencia provisional por turno",
+  });
+  expect(graph).toHaveLength(7);
+  const shifts = screen.getAllByRole("button", { name: /24\/11 · Mañana/ });
+  fireEvent.click(shifts[0]);
+  expect(screen.getByText(/11:00 · model-A · Completo/)).toBeInTheDocument();
+  const table = screen.getByRole("table", {
+    name: "Scores horarios oficiales del turno",
+  });
+  fireEvent.click(within(table).getByRole("button", { name: "5" }));
+  expect(await screen.findByText("Configuración efectiva")).toBeInTheDocument();
+  expect(detail).toHaveBeenCalledWith(
+    "archived-publication",
+    "archived-result",
+  );
 });

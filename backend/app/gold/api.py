@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -25,6 +26,7 @@ from app.schemas.customer_quality import CustomerQualityRequest, CustomerQuality
 from app.schemas.customer_score import CustomerScoreRequest, CustomerScoreResponse
 
 from .coverage import coverage_status
+from .live_archive import archive, archived_result
 from .live_view import LiveScores, detail, live_scores
 from .service import GoldService
 
@@ -54,6 +56,7 @@ def create_gold_app(settings: Settings) -> FastAPI:
     service = GoldService(settings)
     history = GoldService(settings, history=True)
     live_cache: LruCache[tuple, LiveScores] = LruCache(8)
+    archive_cache: LruCache[tuple, dict] = LruCache(16)
     app.state.gold_service = service
     app.state.calculate_customer_score = ScoreUseCase(service)
     app.add_middleware(AuthenticationMiddleware)
@@ -107,6 +110,20 @@ def create_gold_app(settings: Settings) -> FastAPI:
     async def read_detail(publication: str, result: str) -> dict[str, Any]:
         return await app.state.score_query_executor.execute(
             lambda: detail(settings, publication, result)
+        )
+
+    @app.get("/api/live/archive")
+    async def live_archive(
+        before: datetime | None = None, publication: str | None = None
+    ) -> dict[str, Any]:
+        return await app.state.score_query_executor.execute(
+            lambda: archive(settings, archive_cache, before, publication_id=publication)
+        )
+
+    @app.get("/api/live/archive/{publication}/{result}")
+    async def live_archive_detail(publication: str, result: str) -> dict[str, Any]:
+        return await app.state.score_query_executor.execute(
+            lambda: archived_result(settings, publication, result)
         )
 
     @app.get("/api/history/catalog", response_model=CatalogResponse)

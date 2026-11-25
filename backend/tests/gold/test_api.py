@@ -258,3 +258,79 @@ def test_live_bulk_reads_weighted_contributions_from_the_pinned_delta(gold_api, 
         assert row.contributions == {c["componente"]: c["contribucion"] for c in source}
         assert any(c["contribucion"] != c["score"] for c in source)
         assert isclose(sum(row.contributions.values()), row.total_penalty, abs_tol=0.0001)
+
+
+def test_archive_uses_existing_delta_pins_preserves_t0_and_applies_exact_age(
+    gold_api, monkeypatch, calculation
+):
+    from copy import deepcopy
+    from datetime import UTC, timedelta
+    from types import SimpleNamespace
+
+    from app.gold.live_archive import archive, archived_result
+    from app.gold.publications import Snapshot
+    from app.infrastructure.cache import LruCache
+
+    _, root = gold_api
+    settings = SimpleNamespace(
+        resolved_gold_root=root,
+        gold_query_max_rows=100000,
+        gold_query_total_rows=300000,
+        gold_live_timezone="Europe/Madrid",
+    )
+    snapshot = Snapshot.open(root, require_gold_contract=True)
+    scores = snapshot.rows("quality_scores")
+    score = max((r for r in scores if r["tipo_ventana"] == "HOUR"), key=lambda r: r["fin"])
+    cutoff = score["fin"]
+    t0 = cutoff.replace(hour=10, minute=20)
+    monkeypatch.setattr("app.gold.live_archive.live_epoch", lambda: t0)
+    monkeypatch.setattr("app.gold.live_view.live_epoch", lambda: t0)
+    moment = (cutoff + timedelta(hours=7)).replace(tzinfo=UTC)  # Industrial UTC+1 in November.
+    cache = LruCache(4)
+    before = archive(settings, cache, moment=moment - timedelta(seconds=1))
+    visible = archive(settings, cache, moment=moment, publication_id=snapshot.publication_id)
+    assert before["eligible_until"] == cutoff - timedelta(hours=1)
+    assert visible["eligible_until"] == cutoff
+    assert visible["publication"] == snapshot.publication_id
+    assert visible["shifts"][0]["partial_t0"]
+    assert all(hour["end"] <= cutoff for shift in visible["shifts"] for hour in shift["hours"])
+    assert visible["shifts"][0]["hours"][0]["state"] == "before_t0"
+    rows = [
+        r
+        for shift in visible["shifts"]
+        for h in shift["hours"]
+        for r in h["results"]
+        if r["result_id"]
+    ]
+    row = next(r for r in rows if r["result_id"] == score["id_resultado"])
+    assert row["total_penalty"] == score["total_penalty"]
+    result = archived_result(settings, visible["publication"], row["result_id"], moment=moment)
+    assert result["score"] == score
+    assert result["configuration"]["score"] and result["configuration"]["catalogs"]
+    assert result["details"]["quality_score_components"]
+    assert result["coverage"]
+    assert not result["missing"]
+    assert archive(settings, cache, moment=moment) == visible
+
+    source, original_config = calculation
+    revised_config = deepcopy(original_config)
+    revised_config["weights"]["dar"] += 1
+    run(
+        source.root,
+        root,
+        bundle=bundle(),
+        config=revised_config,
+        cutoff=CUTOFF,
+        environment="test",
+        plant="AV",
+        recalculate_closed_ids={score["id_produccion"]},
+        recalculation_reason="Synthetic revision for testing the archived publication pins",
+    )
+    revised = archive(settings, cache, moment=moment)
+    assert revised["publication"] != visible["publication"]
+    assert revised["previous_publication"] == visible["publication"]
+    new_detail = archived_result(settings, revised["publication"], row["result_id"], moment=moment)
+    assert new_detail["score"]["config_id"] != score["config_id"]
+    assert (
+        archived_result(settings, visible["publication"], row["result_id"], moment=moment) == result
+    )

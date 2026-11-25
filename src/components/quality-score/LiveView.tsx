@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "@/services/api";
-import type { LiveResult, LiveScores } from "@/services/api";
+import type { LiveArchive, LiveResult, LiveScores } from "@/services/api";
+import { ArchivePosition } from "./ArchivePosition";
 
 const labels: Record<string, string> = {
   partial: "Parcial",
@@ -170,7 +171,33 @@ function HourlyTrend({
   );
 }
 
-export function LiveView() {
+export function LiveView({ historyOnly = false }: { historyOnly?: boolean }) {
+  const [archive, setArchive] = useState<LiveArchive | null>(null);
+  const [archiveError, setArchiveError] = useState(false);
+  const [before, setBefore] = useState<string | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    async function refreshArchive() {
+      try {
+        const data = await api.getLiveArchive(before, controller.signal);
+        if (!controller.signal.aborted) {
+          setArchive(data);
+          setArchiveError(false);
+        }
+      } catch {
+        if (!controller.signal.aborted) setArchiveError(true);
+      } finally {
+        if (!controller.signal.aborted && !before)
+          timer = setTimeout(refreshArchive, 300000);
+      }
+    }
+    void refreshArchive();
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
+  }, [before]);
   const [view, setView] = useState<LiveScores | null>(null);
   const [error, setError] = useState(false);
   const [chosen, setChosen] = useState<{
@@ -184,6 +211,7 @@ export function LiveView() {
   > | null>(null);
   const [detailError, setDetailError] = useState(false);
   useEffect(() => {
+    if (historyOnly) return;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
     async function refresh() {
@@ -214,7 +242,7 @@ export function LiveView() {
       controller.abort();
       clearTimeout(timer);
     };
-  }, []);
+  }, [historyOnly]);
   useEffect(() => {
     let active = true;
     setDetail(null);
@@ -250,7 +278,9 @@ export function LiveView() {
             Visión de planta
           </p>
           <h1 className="text-3xl font-semibold tracking-tight">
-            Estado de las líneas
+            {historyOnly
+              ? "Histórico acumulado de Gold Live"
+              : "Estado de las líneas"}
           </h1>
         </div>
         {view && (
@@ -270,8 +300,40 @@ export function LiveView() {
       {view?.stale && (
         <p role="status">La publicación Gold está desactualizada.</p>
       )}
-      {!view && !error && <p role="status">Cargando Gold Live…</p>}
+      {!historyOnly && !view && !error && (
+        <p role="status">Cargando Gold Live…</p>
+      )}
+      {historyOnly && (
+        <nav aria-label="Turnos archivados" className="my-4 flex gap-4">
+          <button
+            type="button"
+            disabled={!archive?.next_before}
+            onClick={() => setBefore(archive?.next_before ?? null)}
+          >
+            Turnos anteriores
+          </button>
+          {before && (
+            <button type="button" onClick={() => setBefore(null)}>
+              Volver a los últimos turnos
+            </button>
+          )}
+        </nav>
+      )}
+      {historyOnly &&
+        positions.map(([line, machine, label]) => (
+          <section key={label} className="border-b border-[#dce4e0] py-5">
+            <h2 className="text-3xl font-semibold">{label}</h2>
+            <ArchivePosition
+              archive={archive}
+              error={archiveError}
+              line={line}
+              machine={machine}
+              components={components}
+            />
+          </section>
+        ))}
       {view &&
+        !historyOnly &&
         positions.map(([line, machine, label]) => {
           const rows = view.hours.map((hour) =>
             hour.state === "open"
@@ -325,12 +387,13 @@ export function LiveView() {
                 </p>
               </div>
               <div className="grid items-start gap-4 lg:grid-cols-[minmax(0,1.6fr)_minmax(0,0.76fr)_minmax(408px,1.1fr)]">
-                <div>
-                  <h3 className="text-sm font-medium">Evolución por turnos</h3>
-                  <div className="mt-2 grid h-[206px] place-items-center border border-[#dce4e0] bg-[#f7f9f8] px-3 text-center text-sm text-[#53645d]">
-                    Histórico no disponible
-                  </div>
-                </div>
+                <ArchivePosition
+                  archive={archive}
+                  error={archiveError}
+                  line={line}
+                  machine={machine}
+                  components={components}
+                />
                 <div>
                   <h3 className="text-sm font-medium">Últimas horas</h3>
                   <HourlyTrend

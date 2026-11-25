@@ -25,6 +25,7 @@ class Result(BaseModel):
     total_penalty: float | None = None
     normalized_score: float | None = None
     classification: str | None = None
+    model: str | None = None
     contributions: dict[str, float] = Field(default_factory=dict)
 
 
@@ -73,8 +74,8 @@ def live_scores(settings, cache, *, moment=None):
     return view.model_copy(update={"stale": (now - view.published_at).total_seconds() > 1200})
 
 
-def _project(q, open_hour, now, *, include_contributions=True):
-    start = open_hour - timedelta(hours=7)
+def _project(q, open_hour, now, *, include_contributions=True, archive_start=None):
+    start = archive_start if archive_start is not None else open_hour - timedelta(hours=7)
     field = ds.field
     horizon = (field("inicio") >= start) & (field("fin") <= open_hour)
     scores = _rows(
@@ -108,7 +109,7 @@ def _project(q, open_hour, now, *, include_contributions=True):
     states = {r["scope_id"]: r for r in scopes}
     floor = live_epoch()
     hours = []
-    for i in range(7):
+    for i in range((open_hour - start) // timedelta(hours=1)):
         left = start + timedelta(hours=i)
         right = left + timedelta(hours=1)
         before = floor is not None and right <= floor
@@ -135,7 +136,12 @@ def _project(q, open_hour, now, *, include_contributions=True):
                     machine=production.get("id_maquina_fenix"),
                     start=max(left, began, floor or left),
                     cutoff=score["corte"] if score else None,
-                    state=("partial" if reason else "complete") if score else "pending",
+                    state=("partial" if reason else "complete")
+                    if score
+                    else "unavailable"
+                    if scope.get("estado") == "READY" and archive_start is not None
+                    else "pending",
+                    model=production.get("codigo_modelo_botella"),
                     reason=reason,
                     result_id=score["id_resultado"] if score else None,
                     total_penalty=score["total_penalty"] if score else None,
@@ -151,9 +157,10 @@ def _project(q, open_hour, now, *, include_contributions=True):
                 results=results,
             )
         )
-    hours.append(
-        Hour(start=open_hour, end=open_hour + timedelta(hours=1), state="open", results=[])
-    )
+    if archive_start is None:
+        hours.append(
+            Hour(start=open_hour, end=open_hour + timedelta(hours=1), state="open", results=[])
+        )
     if include_contributions:
         results = {
             row.result_id: row
@@ -198,8 +205,17 @@ def detail(settings, publication, result):
         raise ApplicationError(
             "RESULT_NOT_FOUND", "Resultado horario no disponible.", status_code=404
         )
+    return result_details(q, result)
+
+
+def result_details(q, result):
     return {
-        name: q.rows(name, [result], "id_resultado")
+        name: _rows(
+            q,
+            name,
+            ds.field("id_resultado").cast("string") == result,
+            [("id_resultado", "=", result)],
+        )
         for name in (
             "quality_score_components",
             "mia_score_details",
