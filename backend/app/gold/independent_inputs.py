@@ -40,6 +40,9 @@ def auxiliary_turn(pipelines, lane, *, encoding):
     cursor = previous.document["cursor"] if previous else 0
     initial_cursor = cursor
     relation_cursor = previous.document.get("relation_cursor", 0) if previous else 0
+    # A new operational capture can invalidate a blank even before Silver moves.
+    # Other Bronze traffic must not change the identity of the Gold evidence.
+    slot_cursor = previous.document.get("slot_cursor", 0) if previous else 0
     initial = (
         {
             r["name"]: previous.table(r["name"], max_rows=policy.read_max_rows).to_pylist()
@@ -54,9 +57,9 @@ def auxiliary_turn(pipelines, lane, *, encoding):
         return (
             auxiliary(root, (), captures=(), initial=initial, encoding=encoding),
             cursor,
-            ([r["hash"] for r in previous.document["tables"]], relation_cursor)
+            ([r["hash"] for r in previous.document["tables"]], relation_cursor, slot_cursor)
             if previous
-            else ([], relation_cursor),
+            else ([], relation_cursor, slot_cursor),
         )
     if previous and previous.document["feed_identity"] != feed.identity:
         raise IntegrityError("Gold auxiliary checkpoint belongs to another Bronze owner")
@@ -73,6 +76,8 @@ def auxiliary_turn(pipelines, lane, *, encoding):
             )
         if capture.family == RELATION:
             relation_cursor = capture.sequence
+        if capture.family in SLOT_FAMILIES and "T" in (capture.snapshot.producer_time or ""):
+            slot_cursor = capture.sequence
         cursor = capture.sequence
     tables = auxiliary(root, (), captures=captures, initial=initial, encoding=encoding)
     if sum(t.num_rows for t in tables.values()) > policy.read_max_rows:
@@ -81,11 +86,20 @@ def auxiliary_turn(pipelines, lane, *, encoding):
     if previous is None or cursor != initial_cursor:
         confirmed = save(
             root,
-            {"cursor": cursor, "feed_identity": feed.identity, "relation_cursor": relation_cursor},
+            {
+                "cursor": cursor,
+                "feed_identity": feed.identity,
+                "relation_cursor": relation_cursor,
+                "slot_cursor": slot_cursor,
+            },
             tables,
             reuse=previous,
         )
-    return tables, cursor, ([r["hash"] for r in confirmed.document["tables"]], relation_cursor)
+    return (
+        tables,
+        cursor,
+        ([r["hash"] for r in confirmed.document["tables"]], relation_cursor, slot_cursor),
+    )
 
 
 def export(pipelines, lane, config, *, ar_categories=None):
@@ -140,6 +154,7 @@ def export(pipelines, lane, config, *, ar_categories=None):
     auxiliary_tables, cursor, auxiliary_version = auxiliary_turn(
         pipelines, lane, encoding=config.encoding
     )
+    slot_cursor = auxiliary_version[2]
     historical_gold = None
     try:
         historical_gold = read_json(pipelines.history.gold / "published" / "current.json")[
@@ -166,7 +181,7 @@ def export(pipelines, lane, config, *, ar_categories=None):
             lane != "live"
             or (
                 previous.document.get("coverage_rule") == COVERAGE_RULE
-                and previous.document.get("receipt_cursor") == cursor
+                and previous.document.get("receipt_cursor", slot_cursor) >= slot_cursor
                 and bool(previous.document.get("receipt_frozen")) == (active is not None)
                 and "series_handover_scopes" in previous.document
                 and (

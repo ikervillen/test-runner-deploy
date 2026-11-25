@@ -115,7 +115,18 @@ def test_auxiliary_cursor_without_scoring_changes_does_not_export(independent, m
     monkeypatch.setattr(
         independent_inputs,
         "auxiliary_turn",
-        lambda *a, **k: (tables, cursor + 2, (version[0], cursor + 2)),
+        lambda *a, **k: (tables, cursor + 1, (version[0], version[1], cursor + 1)),
+    )
+    slot_changed = independent_inputs.export(plan, "live", cfg)
+    assert slot_changed.publication_id != original.publication_id
+    assert (
+        independent_inputs.export(plan, "live", cfg).publication_id == slot_changed.publication_id
+    )
+
+    monkeypatch.setattr(
+        independent_inputs,
+        "auxiliary_turn",
+        lambda *a, **k: (tables, cursor + 2, (version[0], cursor + 2, cursor + 1)),
     )
     updated = independent_inputs.export(plan, "live", cfg)
     assert updated.publication_id != original.publication_id
@@ -132,7 +143,7 @@ def test_auxiliary_cursor_without_scoring_changes_does_not_export(independent, m
     monkeypatch.setattr(
         independent_inputs,
         "auxiliary_turn",
-        lambda *a, **k: (tables, cursor + 3, (version[0], cursor + 3)),
+        lambda *a, **k: (tables, cursor + 3, (version[0], cursor + 3, cursor + 1)),
     )
     revised = independent_inputs.export(plan, "live", cfg)
     stats = revised.document["silver_read"]
