@@ -105,15 +105,23 @@ class SilverSnapshot:
         )
 
 
-def publish_family(config, storage, *, lane, identity, family, captured_ids=()):
+def publish_family(config, storage, *, lane, identity, family, captured_ids=(), slot_receipts=None):
     lock = storage.silver / f".writer-{config.plant}-{family}.lock"
     with portalocker.Lock(str(lock), mode="a", timeout=0):
         return _publish_family(
-            config, storage, lane=lane, identity=identity, family=family, captured_ids=captured_ids
+            config,
+            storage,
+            lane=lane,
+            identity=identity,
+            family=family,
+            captured_ids=captured_ids,
+            slot_receipts=slot_receipts,
         )
 
 
-def _publish_family(config, storage, *, lane, identity, family, captured_ids=()):
+def _publish_family(
+    config, storage, *, lane, identity, family, captured_ids=(), slot_receipts=None
+):
     """Called by the owner only after this family's confirmed transformation."""
     cfg = replace(config, family=family)
     if not cfg.control_path.exists():
@@ -216,6 +224,10 @@ def _publish_family(config, storage, *, lane, identity, family, captured_ids=())
             "rejected_hashes": rejected,
             **horizons,
         }
+        if slot_receipts is not None:
+            refs[family]["slot_receipts"] = slot_receipts
+        elif "slot_receipts" in previous_ref:
+            refs[family]["slot_receipts"] = previous_ref["slot_receipts"]
     if (
         parent
         and refs == previous.manifest["tables"]

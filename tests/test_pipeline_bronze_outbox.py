@@ -15,6 +15,42 @@ from ingesta_delta_lake.runtime import atomic_json
 from ingesta_delta_lake.sources import Snapshot, capture, capture_identity
 
 
+def test_slot_receipts_only_attest_exact_successful_revisions(config, pipeline_config):
+    worker = PipelineWorker(pipeline_config, "live", config)
+    worker.prepare()
+    family, stamp = "LISTA_RECH", "2026-11-25T08:30:01"
+    path = config.sources[0][1] / "25112026_83001_LISTA_RECH.csv"
+    path.write_bytes(b"")
+    with closing(
+        Intake(worker.source.intake_path, lane="live", identity=worker.identity)
+    ) as intake:
+        first = intake.remember(family, capture(worker.source, "AV21", path, stamp))
+        intake.publish_captures(worker.storage.exchange, limit=8)
+        for result in (
+            {"status": "FAILED"},
+            {"status": "PARTIAL"},
+            {"status": "APPLIED", "complete": False},
+            {"status": "APPLIED", "remaining_versions": 1},
+        ):
+            assert intake.slot_receipts(family, [first], result) == [
+                [1, first, "AV21", stamp, False]
+            ]
+        accepted = {"status": "APPLIED", "delta_version": 1}
+        assert intake.slot_receipts(family, [first], accepted) == [[1, first, "AV21", stamp, True]]
+        intake.acknowledge([first], accepted, published_at="2026-11-25T07:31:00+00:00")
+        assert intake.slot_receipts(family, [], {}) == [[1, first, "AV21", stamp, True]]
+        path.write_bytes(b" ")
+        second = intake.remember(family, capture(worker.source, "AV21", path, stamp))
+        intake.publish_captures(worker.storage.exchange, limit=8)
+        assert second != first
+        assert intake.slot_receipts(family, [first], accepted) == [
+            [2, second, "AV21", stamp, False]
+        ]
+        assert intake.slot_receipts(family, [second], {"status": "NO_CHANGE"}) == [
+            [2, second, "AV21", stamp, True]
+        ]
+
+
 def test_interrupted_capture_recovers_before_mutable_fenix_alias_is_read_again(
     config, pipeline_config
 ):
