@@ -81,6 +81,9 @@ def auxiliary(
     This local replay producer does not register these sources in the running
     server worker. That integration belongs to the later server validation step.
     """
+    from .common import live_epoch
+
+    floor = live_epoch()
     # Keys differ per family (tuples or scalars) and identify one auxiliary record.
     initial = initial or {}
     parameters = {(r["origen_fenix"], r["id"]): r for r in initial.get("production_parameters", [])}
@@ -149,6 +152,12 @@ def auxiliary(
                     "rechazos": optional_int(raw[5]),
                 }
                 key = (origin, row["id"])
+            if floor:
+                if family == "MP9_LISTA_RECH_ZC" and (row["fecha"] is None or row["fecha"] < floor):
+                    continue
+                end = row.get("fecha_off") or row.get("vigente_hasta")
+                if end is not None and end < floor and key not in accepted:
+                    continue
             previous = accepted.get(key)
             if previous and previous != row:
                 fields = {k for k in row if previous[k] != row[k]}

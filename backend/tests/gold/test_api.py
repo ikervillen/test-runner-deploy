@@ -70,6 +70,18 @@ def test_catalog_and_complete_score_use_only_pinned_gold(gold_api):
     assert coverage[3]["missing"] == []
 
 
+def test_hourly_endpoint_keeps_history_unavailable_without_affecting_live(gold_api):
+    client, _ = gold_api
+    unavailable = client.get("/api/history/catalog")
+    assert unavailable.status_code == 503
+    assert unavailable.json()["error"]["code"] == "HISTORY_UNAVAILABLE"
+    live = client.get("/api/live/scores")
+    assert live.status_code == 200, live.text
+    assert len(live.json()["hours"]) == 8
+    assert live.json()["hours"][-1]["state"] == "open"
+    assert live.json()["hours"][-1]["results"] == []
+
+
 def test_custom_configuration_and_machine_filter_recalculate_without_writes(gold_api):
     client, root = gold_api
     before = (root / "current.json").read_bytes()
@@ -199,3 +211,126 @@ def test_closed_details_keep_their_original_catalog_in_baseline_and_scenario(gol
     response = client.post("/api/customer-score/query", json=scenario)
     assert response.status_code == 200, response.text
     assert response.json()["productions"][0]["dar"]["breakdown"][0]["codes"] == [53]
+
+
+def test_live_bulk_reads_weighted_contributions_from_the_pinned_delta(gold_api, monkeypatch):
+    from datetime import UTC, timedelta
+    from math import isclose
+    from types import SimpleNamespace
+
+    from app.gold.live_view import _project
+    from app.gold.publications import Snapshot
+
+    _, root = gold_api
+    snapshot = Snapshot.open(root, require_gold_contract=True)
+    horizon = snapshot.rows("quality_scores")
+    score = next(r for r in horizon if r["tipo_ventana"] == "HOUR" and r["fin"] <= CUTOFF)
+    target = max(CUTOFF, score["fin"])
+    calls = []
+    original = snapshot.rows
+
+    def record(name, **kwargs):
+        calls.append((name, kwargs))
+        return original(name, **kwargs)
+
+    monkeypatch.delenv("FENIX_LIVE_T0", raising=False)
+    now = (target + timedelta(minutes=5)).replace(tzinfo=UTC)
+    result = _project(
+        SimpleNamespace(
+            snapshot=SimpleNamespace(
+                rows=record, manifest=snapshot.manifest, publication_id=snapshot.publication_id
+            ),
+            max_rows=10000,
+            record_scan=lambda *_: None,
+        ),
+        target,
+        now,
+    )
+    results = [r for hour in result.hours[:-1] for r in hour.results if r.result_id]
+    assert results and result.hours[-1].results == []
+    queries = [kwargs for name, kwargs in calls if name == "quality_score_components"]
+    assert len(queries) == 1
+    ids = sorted(r.result_id for r in results)
+    assert queries[0]["file_pruning_predicate"] == [("id_resultado", "in", ids)]
+    components = original("quality_score_components")
+    for row in results:
+        source = [c for c in components if c["id_resultado"] == row.result_id]
+        assert row.contributions == {c["componente"]: c["contribucion"] for c in source}
+        assert any(c["contribucion"] != c["score"] for c in source)
+        assert isclose(sum(row.contributions.values()), row.total_penalty, abs_tol=0.0001)
+
+
+def test_archive_uses_existing_delta_pins_preserves_t0_and_applies_exact_age(
+    gold_api, monkeypatch, calculation
+):
+    from copy import deepcopy
+    from datetime import UTC, timedelta
+    from types import SimpleNamespace
+
+    from app.gold.live_archive import archive, archived_result
+    from app.gold.publications import Snapshot
+    from app.infrastructure.cache import LruCache
+
+    _, root = gold_api
+    settings = SimpleNamespace(
+        resolved_gold_root=root,
+        gold_query_max_rows=100000,
+        gold_query_total_rows=300000,
+        gold_live_timezone="Europe/Madrid",
+    )
+    snapshot = Snapshot.open(root, require_gold_contract=True)
+    scores = snapshot.rows("quality_scores")
+    score = max((r for r in scores if r["tipo_ventana"] == "HOUR"), key=lambda r: r["fin"])
+    cutoff = score["fin"]
+    t0 = cutoff.replace(hour=10, minute=20)
+    monkeypatch.setattr("app.gold.live_archive.live_epoch", lambda: t0)
+    monkeypatch.setattr("app.gold.live_view.live_epoch", lambda: t0)
+    moment = (cutoff + timedelta(hours=7)).replace(tzinfo=UTC)  # Industrial UTC+1 in November.
+    cache = LruCache(4)
+    before = archive(settings, cache, moment=moment - timedelta(seconds=1))
+    visible = archive(settings, cache, moment=moment, publication_id=snapshot.publication_id)
+    assert before["eligible_until"] == cutoff - timedelta(hours=1)
+    assert visible["eligible_until"] == cutoff
+    assert visible["publication"] == snapshot.publication_id
+    assert visible["shifts"][0]["partial_t0"]
+    assert all(hour["end"] <= cutoff for shift in visible["shifts"] for hour in shift["hours"])
+    assert visible["shifts"][0]["hours"][0]["state"] == "before_t0"
+    rows = [
+        r
+        for shift in visible["shifts"]
+        for h in shift["hours"]
+        for r in h["results"]
+        if r["result_id"]
+    ]
+    row = next(r for r in rows if r["result_id"] == score["id_resultado"])
+    assert row["total_penalty"] == score["total_penalty"]
+    result = archived_result(settings, visible["publication"], row["result_id"], moment=moment)
+    assert result["score"] == score
+    assert result["configuration"]["score"] and result["configuration"]["catalogs"]
+    assert result["details"]["quality_score_components"]
+    assert result["coverage"]
+    assert not result["missing"]
+    assert archive(settings, cache, moment=moment) == visible
+
+    source, original_config = calculation
+    revised_config = deepcopy(original_config)
+    revised_config["weights"]["dar"] += 1
+    run(
+        source.root,
+        root,
+        bundle=bundle(),
+        config=revised_config,
+        cutoff=CUTOFF,
+        environment="test",
+        plant="AV",
+        recalculate_closed_ids={score["id_produccion"]},
+        recalculation_reason="Synthetic revision for testing the archived publication pins",
+    )
+    revised = archive(settings, cache, moment=moment)
+    assert revised["publication"] != visible["publication"]
+    assert revised["previous_publication"] == visible["publication"]
+    new_detail = archived_result(settings, revised["publication"], row["result_id"], moment=moment)
+    assert new_detail["score"]["config_id"] != score["config_id"]
+    assert (
+        archived_result(settings, visible["publication"], row["result_id"], moment=moment) == result
+    )

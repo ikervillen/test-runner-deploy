@@ -2,17 +2,14 @@ import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 
 import { Header } from "@/components/Header";
-import {
-  CoverageNotice,
-  ProductionQualityScorePanel,
-} from "@/components/quality-score";
+import { LiveView } from "@/components/quality-score/LiveView";
+import { ProductionQualityScorePanel } from "@/components/quality-score";
 import { api } from "@/services/api";
 import type {
   Catalog,
   CustomerQualityLabel,
   CustomerQualityResponse,
   FilterSelection,
-  GoldCoverage,
   ProductionCatalog,
   ProductionQualityScoreResponse,
   ScoreConfigOverride,
@@ -69,6 +66,39 @@ const DEFAULT_SCORE_PARAMETERS: ScoreParameterState = {
 };
 
 export default function App() {
+  const [tab, setTab] = useState<"live" | "history">("live");
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <Header />
+      <nav
+        className="flex gap-4 border-b bg-white px-6 py-3"
+        aria-label="Consulta de calidad"
+      >
+        <button
+          type="button"
+          aria-pressed={tab === "live"}
+          onClick={() => setTab("live")}
+        >
+          En vivo
+        </button>
+        <button
+          type="button"
+          aria-pressed={tab === "history"}
+          onClick={() => setTab("history")}
+        >
+          Histórico
+        </button>
+      </nav>
+      {tab === "live" ? (
+        <LiveView key="live" />
+      ) : (
+        <LiveView key="archive" historyOnly />
+      )}
+    </div>
+  );
+}
+
+export function HistoryView() {
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [selectedLines, setSelectedLines] = useState<string[]>([]);
   const [selectedProductions, setSelectedProductions] = useState<string[]>([]);
@@ -84,12 +114,10 @@ export default function App() {
   const [cache, setCache] = useState<ProductionQualityCacheEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [refreshWarning, setRefreshWarning] = useState<string | null>(null);
-  const [coverage, setCoverage] = useState<GoldCoverage[]>([]);
 
   useEffect(() => {
     void api
-      .getCatalog()
+      .getHistoryCatalog()
       .then((response) => {
         setCatalog(response);
         const firstLine = response.lines[0];
@@ -140,31 +168,6 @@ export default function App() {
         : scoreParametersToOverride(parameters),
     [parameters],
   );
-  useEffect(() => {
-    if (catalog?.source !== "gold") return;
-    let active = true;
-    const refresh = () =>
-      void Promise.all([api.getCatalog(), api.getGoldStatus()])
-        .then(([next, status]) => {
-          if (active) {
-            setCatalog(next);
-            setCoverage(status.coverage ?? []);
-            setRefreshWarning(null);
-          }
-        })
-        .catch(() => {
-          if (active)
-            setRefreshWarning(
-              "No se ha podido comprobar una nueva publicación. Se conserva la última vista disponible.",
-            );
-        });
-    refresh();
-    const timer = setInterval(refresh, 30000);
-    return () => {
-      active = false;
-      clearInterval(timer);
-    };
-  }, [catalog?.source]);
   const signature = JSON.stringify({
     selection,
     scoreOverride,
@@ -248,11 +251,11 @@ export default function App() {
     setError(null);
     try {
       const [score, quality] = await Promise.allSettled([
-        api.queryProductionQualityScore({
+        api.queryHistoryScore({
           selection,
           score_config_override: scoreOverride,
         }),
-        api.queryCustomerQuality({ selection }),
+        api.queryHistoryQuality({ selection }),
       ]);
       if (score.status === "rejected") throw score.reason;
       const qualityResult =
@@ -276,9 +279,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-gray-50">
-      <Header />
       <main className="space-y-4 px-6 py-4">
-        {refreshWarning && <StatusPanel text={refreshWarning} />}
         {!catalog && !error ? (
           <StatusPanel text="Cargando catalogo de producciones..." />
         ) : catalog ? (
@@ -304,10 +305,6 @@ export default function App() {
               }
               onToggleLine={toggleLine}
               onToggleProduction={toggleProduction}
-            />
-            <CoverageNotice
-              coverage={coverage}
-              productionIds={selection.production_ids}
             />
             <ProductionQualityScorePanel
               error={error}

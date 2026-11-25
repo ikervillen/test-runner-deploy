@@ -62,6 +62,16 @@ def _unique(name, rows):
 
 
 def _coverage_ready(snapshot, p, window, pending, required=None):
+    from .common import live_epoch
+    from .silver_coverage import covers
+
+    floor = live_epoch()
+    coverage_window = window
+    if floor is not None and window.start < floor < window.cutoff:
+        coverage_window = Window(
+            window.production_id, window.kind, floor, window.end, window.cutoff, window.selection_id
+        )
+
     required = required or {"LISTA_DEFECTOS", "LISTA_RECH", "LISTA_AR", "CONT_ZC"}
     scopes = [
         r
@@ -74,9 +84,14 @@ def _coverage_ready(snapshot, p, window, pending, required=None):
     for family in required:
         matching = [r for r in scopes if r["source"] == family and r["estado"] == "READY"]
         if not any(
-            (r.get("covered_from") is None or context.stamp(r["covered_from"]) <= window.start)
-            and (
-                r.get("covered_until") is None or window.cutoff <= context.stamp(r["covered_until"])
+            covers(r, coverage_window)
+            if "confirmed_slots" in r
+            else (
+                (r.get("covered_from") is None or context.stamp(r["covered_from"]) <= window.start)
+                and (
+                    r.get("covered_until") is None
+                    or window.cutoff <= context.stamp(r["covered_until"])
+                )
             )
             for r in matching
         ):
@@ -505,6 +520,7 @@ def _score_job(payload: dict) -> dict:
                 by_zc=payload["by_zc"],
                 segments=payload["segments"],
                 ref=ref,
+                live_references=payload.get("live_references"),
                 config=payload["config"],
                 config_id=payload["config_id"],
                 cutoff=production_cutoff,
@@ -531,7 +547,14 @@ def _score_job(payload: dict) -> dict:
             "raw_inputs_hash": raw_hash,
             "config_id": payload["config_id"],
         },
-        "reference": ref,
+        "reference": {
+            key: [
+                row
+                for group in [ref, *payload.get("live_references", {}).values()]
+                for row in group[key]
+            ]
+            for key in ("sets", "members", "values")
+        },
         "scope_rows": scope_rows,
         "tables": produced,
         "pending": pending[len(payload["pending"]) :],
@@ -591,6 +614,7 @@ def _score_production(
     by_zc,
     segments,
     ref,
+    live_references,
     config,
     config_id,
     cutoff,
@@ -663,7 +687,9 @@ def _score_production(
                     mia=m,
                     ar=a,
                     zc=z,
-                    reference=ref,
+                    reference=live_references.get(w.cutoff, ref)
+                    if live_references is not None
+                    else ref,
                     config=config,
                     config_id=config_id,
                     profile_confirmed=segment.get("estado_correspondencia") == "CONFIRMED"
@@ -1274,6 +1300,27 @@ def build(
     )
     if current_slot_seconds is not None:
         hour_plan = lanes.current_slot(prods, cutoff, current_slot_seconds)
+        if isinstance(snapshot, Evidence):
+            closed = set(snapshot.document.get("closed_hours", []))
+            hour_plan = [
+                c
+                for c in hour_plan
+                if Window(c.production_id, "HOUR", c.start, c.end, c.cutoff).identity not in closed
+            ]
+        current_keys = {(chunk.production_id, chunk.start) for chunk in hour_plan}
+        if isinstance(snapshot, Evidence):
+            for identity, left, right, accredited in snapshot.document.get("retry_closures", []):
+                start = datetime.fromisoformat(left)
+                if (identity, start) not in current_keys:
+                    hour_plan.append(
+                        lanes.HourChunk(
+                            identity,
+                            start,
+                            datetime.fromisoformat(right),
+                            datetime.fromisoformat(accredited),
+                        )
+                    )
+                    current_keys.add((identity, start))
     recorded = list(checked)
     if hour_plan:
         recorded.extend(_hour_key(chunk.production_id, chunk.start) for chunk in hour_plan or [])
@@ -1322,7 +1369,11 @@ def build(
                 link_rules,
                 only_ids=chosen,
                 spans=spans,
-                current_window=(lanes.hour_holding(cutoff)[0], cutoff)
+                current_window=(
+                    sorted({(c.read_from or c.start, c.cutoff) for c in hour_plan or []})
+                    if isinstance(snapshot, Evidence) and snapshot.document.get("retry_closures")
+                    else (lanes.hour_holding(cutoff)[0], cutoff)
+                )
                 if current_slot_seconds is not None
                 else None,
             )
@@ -1416,24 +1467,49 @@ def build(
                             ),
                             minimum=minimum,
                         )
+                    holding_start = lanes.hour_holding(cutoff)[0]
+                    current_windows = defaultdict(list)
+                    prior_windows: dict[datetime, dict[str, list[Window]]] = defaultdict(
+                        lambda: defaultdict(list)
+                    )
+                    for identity, windows in score_windows.items():
+                        for window in windows:
+                            if window.start == holding_start:
+                                current_windows[identity].append(window)
+                            if window.cutoff < cutoff:
+                                prior_windows[window.cutoff][identity].append(window)
                     with clock.stage("reference_samples"):
                         samples = _live_mia_samples(
-                            snapshot, store, selected, score_windows, pending
+                            snapshot, store, selected, current_windows, pending
                         )
                     with clock.stage("reference_statistics"):
-                        published_refs, effective = mia_statistics.live_statistics(
-                            samples,
-                            cutoff,
+                        previous_values = _reference_rows(
+                            previous, "mia_reference_values", max_total_rows
+                        )
+                        parameters = dict(
                             previous_sets=previous_sets,
-                            previous_values=_reference_rows(
-                                previous,
-                                "mia_reference_values",
-                                max_total_rows,
-                            ),
+                            previous_values=previous_values,
                             historical=historical,
                             segments=segments,
                             catalog=catalog_version,
                         )
+                        if current_windows:
+                            published_refs, effective[cutoff] = mia_statistics.live_statistics(
+                                samples, cutoff, **parameters
+                            )
+                        else:
+                            published_refs = {"sets": [], "members": [], "values": []}
+                        for when, review_windows in sorted(prior_windows.items()):
+                            earlier = [p for p in selected if p["id_produccion"] in review_windows]
+                            measurements = _live_mia_samples(
+                                snapshot, store, earlier, review_windows, pending
+                            )
+                            _, effective[when] = mia_statistics.live_statistics(
+                                measurements,
+                                when,
+                                **{**parameters, "historical": {}},
+                                reuse_cut_sample=True,
+                            )
                 else:
                     published_refs = mia_statistics.historical_statistics(
                         prods,
@@ -1480,10 +1556,12 @@ def build(
             if hour_plan is not None:
                 payload["windows"] = score_windows[production["id_produccion"]]
             if mia_reference_mode == "live":
-                payload["mia_reference"] = effective.get(
-                    production["codigo_modelo_botella"],
-                    {"sets": [], "members": [], "values": []},
-                )
+                empty_reference = {"sets": [], "members": [], "values": []}
+                payload["mia_reference"] = empty_reference
+                payload["live_references"] = {
+                    when: by_model.get(production["codigo_modelo_botella"], empty_reference)
+                    for when, by_model in effective.items()
+                }
             return payload
 
         history_clock = _Stopwatch()

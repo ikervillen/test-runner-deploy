@@ -113,12 +113,21 @@ def _sample_id(model, cutoff):
 
 
 def live_statistics(
-    samples, cutoff, *, previous_sets, previous_values, historical, segments, catalog
+    samples,
+    cutoff,
+    *,
+    previous_sets,
+    previous_values,
+    historical,
+    segments,
+    catalog,
+    reuse_cut_sample=False,
 ):
     """One sample per model and calculation cut. Replaying a cut replaces its measurements."""
     series, replaced = defaultdict(lambda: defaultdict(list)), defaultdict(set)
     models = {_sample_id(model, cutoff): model for model in samples}
     eligible = {}
+    original_rates = defaultdict(dict)
     for row in previous_sets:
         if row["reference_rule_id"] != LIVE_SAMPLE:
             continue
@@ -135,7 +144,10 @@ def live_statistics(
             continue
         model = eligible[identity]
         if identity in models:
-            replaced[model].add(_key(row))
+            key = _key(row)
+            replaced[model].add(key)
+            if row["estado"] == "READY":
+                original_rates[model][key] = row["media_percent"]
         elif row["estado"] == "READY":
             series[model][_key(row)].append(row["media_percent"])
     stored = {"sets": [], "values": [], "members": []}
@@ -144,7 +156,11 @@ def live_statistics(
         current = samples.get(model, {})
         stored["sets"].append(_set(identity, "MODEL", model, LIVE_SAMPLE, catalog, current))
         for key in sorted(current.keys() | replaced[model]):
-            rate = current.get(key)
+            rate = (
+                original_rates[model].get(key, current.get(key))
+                if reuse_cut_sample
+                else current.get(key)
+            )
             stored["values"].extend(_values(identity, {key: [] if rate is None else [rate]}, 1))
             if rate is not None:
                 series[model][key].append(rate)

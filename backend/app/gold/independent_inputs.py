@@ -5,15 +5,23 @@ from __future__ import annotations
 from contextlib import suppress
 from datetime import datetime, timedelta
 from functools import cache
+from json import loads
 
 import pyarrow as pa
 
-from . import fragment_delta
+from . import fragment_delta, scoped_reconciliation
 from .common import IntegrityError, digest
-from .evidence import OPERATIONS, attribution, registry, save
+from .evidence import OPERATIONS, attribution, operational_expression, registry, save
 from .lanes import hour_holding
 from .producer import FAMILIES, _apply_horizon, _apply_live, auxiliary
 from .series_handover import RELATION, apply_series_handover, recent_relations
+from .silver_coverage import (
+    COVERAGE_RULE,
+    SLOT_FAMILIES,
+    BlankReceipts,
+    SlotCoverage,
+    confirmed_blanks,
+)
 from .silver_incremental import FullReadRequired, references
 
 AUXILIARY = frozenset(
@@ -80,7 +88,7 @@ def auxiliary_turn(pipelines, lane, *, encoding):
     return tables, cursor, ([r["hash"] for r in confirmed.document["tables"]], relation_cursor)
 
 
-def export(pipelines, lane, config):
+def export(pipelines, lane, config, *, ar_categories=None):
     """Never reads foreign SQLite, changes a foreign pointer, or acquires its locks."""
     from ingesta_delta_lake import associations as native
     from ingesta_delta_lake.contracts import CONTRACTS
@@ -92,17 +100,38 @@ def export(pipelines, lane, config):
     own = SilverSnapshot.open(storage)
     from ingesta_delta_lake.common import IntegrityError as NativeIntegrityError
 
-    from .common import atomic_json, read_json
+    from .common import atomic_json, immutable_json, live_epoch, read_json
     from .evidence import Evidence
+
+    reconciliation_root = storage.gold / "checkpoint" / "reconciliation"
+    active_path = reconciliation_root / "active.json"
+    input_pointer = storage.gold / "inputs" / "current.json"
+    active = None
+    if lane == "live" and active_path.exists() and input_pointer.exists():
+        pinned = read_json(active_path)
+        if read_json(input_pointer)["publication_id"] == pinned["base"] and (
+            not pinned.get("blocked") or pinned["target"] == own.manifest["publication_id"]
+        ):
+            active = pinned
+            own = SilverSnapshot.open(storage, publication_id=active["target"])
 
     archive = None
     cached_archive = storage.gold / "checkpoint" / "archive-reference.json"
-    try:
-        archive = ArchiveSnapshot(pipelines.history)
-        atomic_json(cached_archive, archive.manifest)
-    except (OSError, NativeIntegrityError, ValueError):
-        if cached_archive.exists():
-            archive = ArchiveSnapshot(pipelines.history, manifest_path=cached_archive)
+    if active is not None:
+        if active.get("archive"):
+            archive = ArchiveSnapshot(
+                pipelines.history,
+                manifest_path=reconciliation_root / f"archive-{active['archive']}.json",
+            )
+            if archive.manifest["publication_id"] != active["archive"]:
+                raise IntegrityError("Frozen archive reference differs")
+    elif not (lane == "live" and live_epoch()):
+        try:
+            archive = ArchiveSnapshot(pipelines.history)
+            atomic_json(cached_archive, archive.manifest)
+        except (OSError, NativeIntegrityError, ValueError):
+            if cached_archive.exists():
+                archive = ArchiveSnapshot(pipelines.history, manifest_path=cached_archive)
     # Live has no dependency on the history backfill's current Silver publication.
     reference = None
     if lane == "history" and (pipelines.live.exchange / "silver" / "current.json").exists():
@@ -118,6 +147,10 @@ def export(pipelines, lane, config):
         ]
     except (OSError, ValueError, KeyError):
         historical_gold = None
+    if lane == "live" and live_epoch():
+        historical_gold = None
+    if active is not None:
+        historical_gold = active["history"]
     vector = [s.manifest["publication_id"] for s in snapshots]
     vector.extend(
         [
@@ -130,7 +163,16 @@ def export(pipelines, lane, config):
     if (storage.gold / "inputs" / "current.json").exists():
         previous = Evidence.open(storage.gold / "inputs")
         if previous.document.get("source_vector") == vector and (
-            lane != "live" or "series_handover_scopes" in previous.document
+            lane != "live"
+            or (
+                previous.document.get("coverage_rule") == COVERAGE_RULE
+                and "series_handover_scopes" in previous.document
+                and (
+                    ar_categories is None or previous.document.get("ar_categories") == ar_categories
+                )
+                and not previous.document.get("more_hourly_revisions")
+                and not previous.document.get("older_retry_scan")
+            )
         ):
             return previous
 
@@ -163,7 +205,12 @@ def export(pipelines, lane, config):
             )
         )
     )
-    migrating = can_apply_cdf and previous.document.get("fragment_lineage") != policy.window_seconds
+    migrating = (
+        lane == "live"
+        and previous is not None
+        and "silver_refs" in previous.document
+        and previous.document.get("fragment_lineage") != policy.window_seconds
+    )
     if migrating:
         previous = fragment_delta.migrate_lineage(
             previous, policy.window_seconds, batch_size=policy.read_batch_rows
@@ -182,6 +229,88 @@ def export(pipelines, lane, config):
                 )
             except FullReadRequired:
                 continue
+    reconciled = {}
+    if (
+        lane == "live"
+        and previous is not None
+        and previous.document.get("fragment_lineage") == policy.window_seconds
+        and (pending_families := sorted(OPERATIONS - incremental.keys()))
+    ):
+        if archive:
+            immutable_json(reconciliation_root / f"archive-{archive_id}.json", archive.manifest)
+        pinned = {
+            "base": previous.publication_id,
+            "target": own.manifest["publication_id"],
+            "history": historical_gold,
+            "archive": archive_id,
+        }
+        atomic_json(active_path, pinned)
+
+        @cache
+        def historical_evidence():
+            return (
+                published_evidence(pipelines.history.gold / "published", historical_gold)
+                if historical_gold
+                else None
+            )
+
+        @cache
+        def legacy_proofs(family):
+            return historical_evidence().proofs(max_rows=policy.read_max_rows, families={family})
+
+        def certified(family, scope, identity, sources):
+            history = historical_evidence()
+            if history is None or not sources:
+                return False
+            ref = next((r for r in history.document["tables"] if r["name"] == "__lineage"), {})
+            if "family_roots" in ref:
+                part = history.index.find(ref["family_roots"].get(family), (family, *scope))
+                candidates = (
+                    [
+                        loads(r["proof"])
+                        for r in history._read_part("__lineage", part).to_pylist()
+                        if r["key"] == identity
+                    ]
+                    if part
+                    else []
+                )
+                history._fragments.pop("__lineage", None)
+            else:
+                candidates = legacy_proofs(family).get(family, {}).get(identity, [])
+            return all(
+                any(
+                    p["source_table"] == q["source_table"]
+                    and p["row_hash"] == q["row_hash"]
+                    and p["source_version"] <= q["source_version"]
+                    for q in candidates
+                )
+                for p in sources
+            )
+
+        for family in pending_families:
+            try:
+                fact, lineage, state = scoped_reconciliation.run(
+                    reconciliation_root,
+                    previous,
+                    own,
+                    family,
+                    CONTRACTS[family].schema,
+                    origins=tuple(origin for origin, _ in config.sources),
+                    seconds=policy.window_seconds,
+                    budget=policy.read_max_rows,
+                    batch_size=policy.read_batch_rows,
+                    certified=certified,
+                    historical_id=historical_gold,
+                    archive_id=archive_id,
+                    archive_rejections=archive.manifest.get("rejections", {}).get(family, ())
+                    if archive
+                    else (),
+                )
+            except (IntegrityError, NativeIntegrityError) as exc:
+                atomic_json(active_path, {**pinned, "blocked": str(exc)})
+                raise
+            incremental[family] = fact, lineage, 0
+            reconciled[family] = {k: state[k] for k in ("examined", "peak_rows", "retained")}
     cases, scanned, logical_rows, materialized = {}, 0, 0, 0
     reused_catalogues = []
     prior_proofs = (
@@ -251,14 +380,20 @@ def export(pipelines, lane, config):
                 "last_successful_discovery": ref.get("owner_confirmed_at"),
             }
             instants = (
-                [
-                    datetime.fromisoformat(stamp)
-                    for part in incremental[family][0].get("parts", [])
-                    if part["partition"][0] == origin
-                    for stamp in part["time_bounds"]
-                ]
-                if family in incremental and "FECHA" in CONTRACTS[family].schema.names
-                else [r["FECHA"] for r in rows if r.get("origen_fenix") == origin and "FECHA" in r]
+                ()
+                if lane == "live"
+                else (
+                    [
+                        datetime.fromisoformat(stamp)
+                        for part in incremental[family][0].get("parts", [])
+                        if part["partition"][0] == origin
+                        for stamp in part["time_bounds"]
+                    ]
+                    if family in incremental and "FECHA" in CONTRACTS[family].schema.names
+                    else [
+                        r["FECHA"] for r in rows if r.get("origen_fenix") == origin and "FECHA" in r
+                    ]
+                )
             )
             if instants:
                 row.update(
@@ -328,6 +463,7 @@ def export(pipelines, lane, config):
         "coverage": coverage,
     }
     window = None
+    scopes = None
     if lane == "live":
         full_families = OPERATIONS - incremental_families
         retained = bool(
@@ -345,19 +481,190 @@ def export(pipelines, lane, config):
                 )
                 or retained
             )
-        doc["retained_live"] = retained
+        doc["retained_live"] = retained or any(s["retained"] for s in reconciled.values())
         horizon = _source_horizon(coverage)
+        doc["coverage_rule"] = COVERAGE_RULE
         if horizon:
             window = (hour_holding(horizon)[0], horizon)
+            receipts = BlankReceipts(
+                storage.gold / "inputs" / "coverage-slots", policy.window_seconds
+            )
+            # Gold can recover an older reconciliation pin. Never regress a newer receipt
+            # index with capture acknowledgements belonging to a frozen Silver input.
+            receipt_vector = digest(
+                [
+                    cursor,
+                    [
+                        [
+                            family,
+                            own.manifest["tables"].get(family, {}).get("captured_ids"),
+                            projections.get(family, {}).get("meta", {}).get("observed_until"),
+                        ]
+                        for family in sorted(SLOT_FAMILIES)
+                    ],
+                ]
+            )
+            if active is None and (
+                previous is None or previous.document.get("receipt_vector") != receipt_vector
+            ):
+                receipts.update(*confirmed_blanks(storage, own, policy))
+            doc["receipt_vector"] = (
+                previous.document.get("receipt_vector")
+                if active is not None and previous
+                else receipt_vector
+            )
+            observed = SlotCoverage(
+                coverage,
+                seconds=policy.window_seconds,
+                indexed=incremental,
+                tables=tables,
+                index=previous.index if previous else None,
+                receipts=receipts,
+            )
+            observed.prepare(window[0] - timedelta(hours=1), horizon)
+            published = storage.gold / "published"
+            if ar_categories is not None:
+                from .live_hours import ar_pin
+
+                doc["ar_categories"] = ar_categories
+                doc["ar_pin"] = ar_pin(doc, silver_refs)
+            if (published / "current.json").exists():
+                from .live_hours import ar_revisions, retry_closures
+                from .publications import Snapshot
+
+                visible = Snapshot.open(published, require_gold_contract=True)
+                doc["closed_hours"] = []
+                changed = None
+                if ar_categories is not None:
+                    review = previous.document if previous is not None else {}
+                    if "legacy_ar_categories" in review:
+                        doc["legacy_ar_categories"] = review["legacy_ar_categories"]
+                    doc["ar_window_cache"] = review.get("ar_window_cache", {})
+                    # Only compare on a changed dependency, or to drain a bounded backlog.
+                    if (
+                        review.get("ar_pin") != doc["ar_pin"]
+                        or review.get("ar_categories") != ar_categories
+                        or review.get("more_hourly_revisions")
+                        or review.get("ar_review_waiting")
+                    ):
+
+                        def current_ar(bounds):
+                            family = "LISTA_AR"
+                            if family in incremental:
+                                ref, _, _ = incremental[family]
+                                evidence = Evidence(
+                                    previous.root, previous.publication_id, {"tables": [ref]}
+                                )
+                                evidence._fragments, evidence.read_stats = (
+                                    previous._fragments,
+                                    previous.read_stats,
+                                )
+                                evidence.index = previous.index
+                                arrow = pa.Table.from_batches(
+                                    evidence.batches(
+                                        family, max_rows=policy.read_max_rows, window=bounds
+                                    ),
+                                    schema=CONTRACTS[family].schema,
+                                )
+                            else:
+                                arrow = tables[family].filter(
+                                    operational_expression(family, bounds)
+                                )
+                            context = {
+                                name: table
+                                for name, table in tables.items()
+                                if name not in OPERATIONS
+                            }
+                            for name in OPERATIONS:
+                                context[name] = (
+                                    arrow
+                                    if name == family
+                                    else pa.Table.from_batches([], schema=CONTRACTS[name].schema)
+                                )
+                            decisions = attribution(doc, context)["observation_assignments"]
+                            return arrow.to_pylist(), decisions.to_pylist()
+
+                        changed = ar_revisions(
+                            storage.gold, visible, doc, current_ar, horizon, policy.read_max_rows
+                        )
+                waiting = []
+                retries = retry_closures(
+                    visible,
+                    coverage,
+                    horizon,
+                    policy.read_max_rows,
+                    closed=doc["closed_hours"],
+                    ar_changed=changed,
+                    waiting=waiting,
+                    prepare=observed.prepare,
+                )
+                doc["retry_closures"] = retries[:12]
+                doc["ar_review_waiting"] = bool(
+                    waiting
+                    or (changed is None and previous and previous.document.get("ar_review_waiting"))
+                )
+                # Exclude revised but deferred hours from current-slot calculation as well.
+                if len(retries) > 12:
+                    doc["more_hourly_revisions"] = True
+                    from .metrics import Window
+
+                    for identity, start, end, target in retries[12:]:
+                        doc["closed_hours"].append(
+                            Window(
+                                identity,
+                                "HOUR",
+                                datetime.fromisoformat(start),
+                                datetime.fromisoformat(end),
+                                datetime.fromisoformat(target),
+                            ).identity
+                        )
+                epoch = live_epoch()
+                if epoch is not None:
+                    fence = window[0] - timedelta(hours=7)
+                    first_hour = epoch.replace(minute=0, second=0, microsecond=0)
+                    cursor = previous.document.get("older_retry_before") if previous else None
+                    upper = min(fence, datetime.fromisoformat(cursor)) if cursor else fence
+                    if upper <= first_hour:
+                        upper = fence
+                    lower = max(first_hour, upper - timedelta(hours=4))
+                    if lower < upper:
+                        old = retry_closures(
+                            visible,
+                            coverage,
+                            horizon,
+                            policy.read_max_rows,
+                            older=(lower, upper),
+                            prepare=observed.prepare,
+                        )
+                        # Old work has its own small allocation after the current hour.
+                        doc["retry_closures"].extend(old[:2])
+                        doc["older_retry_before"] = (upper if len(old) > 2 else lower).isoformat()
+                        doc["older_retry_scan"] = len(old) > 2 or lower > first_hour
+                        if len(old) > 2:
+                            doc["more_hourly_revisions"] = True
+                if doc["retry_closures"]:
+                    scopes = [
+                        window,
+                        *sorted(
+                            {
+                                (datetime.fromisoformat(start), datetime.fromisoformat(target))
+                                for _, start, _, target in doc["retry_closures"]
+                            }
+                        ),
+                    ]
+            observed.finalize(horizon)
         if incremental:
             # Attribution consumes only the active window; the immutable manifest keeps
             # the full logical facts. Read through the original cache for untouched parts.
             for family, (ref, _, _) in incremental.items():
                 view = Evidence(previous.root, previous.publication_id, {"tables": [ref]})
                 view._fragments, view.read_stats = previous._fragments, previous.read_stats
+                view.index = previous.index
                 tables[family] = (
                     pa.Table.from_batches(
-                        view.batches(family, max_rows=policy.read_max_rows, window=window),
+                        view.batches(
+                            family, max_rows=policy.read_max_rows, window=scopes or window
+                        ),
                         schema=CONTRACTS[family].schema,
                     )
                     if window
@@ -388,15 +695,18 @@ def export(pipelines, lane, config):
             "fragment_incremental_families": sorted(incremental),
             "lineage_bootstrap": bool(migrating),
             "full_read_families": sorted(full_families),
+            "reconciliation": reconciled,
             "rows": scanned,
             "decoded_evidence_rows": evidence_decoded,
             "materialized_rows": materialized,
             "logical_rows": logical_rows,
+            "index_pages_read": previous.index.pages_read if previous else 0,
+            "index_pages_written": previous.index.pages_written if previous else 0,
             "referenced_operational_rows": sum(ref["rows"] for ref, _, _ in incremental.values()),
             "reused_catalogues": reused_catalogues,
             "previous_evidence_reads": dict(previous.read_stats) if previous else {},
         }
-    tables.update(attribution(doc, tables, window=window))
+    tables.update(attribution(doc, tables, window=scopes or window))
     tables.update(auxiliary_tables)
     doc["bronze_cursor"] = cursor
     doc["source_vector"] = vector
@@ -430,11 +740,11 @@ def _source_horizon(coverage):
     return max(values, default=None)
 
 
-def published_evidence(root):
+def published_evidence(root, publication_id=None):
     from .evidence import Evidence
     from .publications import Snapshot
 
-    snapshot = Snapshot.open(root, require_gold_contract=True)
+    snapshot = Snapshot.open(root, publication_id=publication_id, require_gold_contract=True)
     descriptor = next(
         d for d in snapshot.manifest["dependencies"] if d.get("kind") == "independent-input"
     )

@@ -50,7 +50,7 @@ def test_new_fenix_severity_uses_mdl_then_fallback_and_flags_internal_conflict(t
 def test_gold_start_applies_the_versioned_mdl_decisions(tmp_path):
     import json
 
-    from app.gold.catalogs import load_independent_bundle
+    from app.gold.catalogs import VERSIONED_AR_CATALOG, load_independent_bundle
 
     path = tmp_path / "catalogs.json"
     path.write_text(
@@ -63,7 +63,11 @@ def test_gold_start_applies_the_versioned_mdl_decisions(tmp_path):
         )
     )
     result = load_independent_bundle(path)
+    source_catalog = json.loads(VERSIONED_AR_CATALOG.read_text(encoding="utf-8"))
+    official = source_catalog["defect_categories"]
+    assert len(official) == 229
     assert result["defect_categories"] == {
+        **official,
         "13": "Grave",
         "39": "Mayor",
         "130": "Grave",

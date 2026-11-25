@@ -4,24 +4,30 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from datetime import datetime
 from typing import Any
 
 import structlog
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from app.api.auth import require_role
 from app.api.errors import register_exception_handlers
 from app.api.lifespan import lifespan
 from app.api.middleware import AuthenticationMiddleware, RequestContextMiddleware
 from app.api.routes import health
 from app.api.routes.customer_score import router as score_router
 from app.config import Settings
+from app.infrastructure.cache import LruCache
 from app.infrastructure.metrics import OperationalMetrics
 from app.infrastructure.operations import ScoreQueryExecutor
 from app.schemas.api import CatalogResponse
 from app.schemas.customer_quality import CustomerQualityRequest, CustomerQualityResponse
+from app.schemas.customer_score import CustomerScoreRequest, CustomerScoreResponse
 
 from .coverage import coverage_status
+from .live_archive import archive, archived_result
+from .live_view import LiveScores, detail, live_scores
 from .service import GoldService
 
 
@@ -48,6 +54,9 @@ def create_gold_app(settings: Settings) -> FastAPI:
         metrics=app.state.operational_metrics,
     )
     service = GoldService(settings)
+    history = GoldService(settings, history=True)
+    live_cache: LruCache[tuple, LiveScores] = LruCache(8)
+    archive_cache: LruCache[tuple, dict] = LruCache(16)
     app.state.gold_service = service
     app.state.calculate_customer_score = ScoreUseCase(service)
     app.add_middleware(AuthenticationMiddleware)
@@ -90,6 +99,48 @@ def create_gold_app(settings: Settings) -> FastAPI:
     @app.post("/api/customer-quality/query", response_model=CustomerQualityResponse)
     async def quality(payload: CustomerQualityRequest) -> CustomerQualityResponse:
         return await asyncio.to_thread(service.quality, payload)
+
+    @app.get("/api/live/scores", response_model=LiveScores)
+    async def read_live() -> LiveScores:
+        return await app.state.score_query_executor.execute(
+            lambda: live_scores(settings, live_cache)
+        )
+
+    @app.get("/api/live/scores/{publication}/{result}")
+    async def read_detail(publication: str, result: str) -> dict[str, Any]:
+        return await app.state.score_query_executor.execute(
+            lambda: detail(settings, publication, result)
+        )
+
+    @app.get("/api/live/archive")
+    async def live_archive(
+        before: datetime | None = None, publication: str | None = None
+    ) -> dict[str, Any]:
+        return await app.state.score_query_executor.execute(
+            lambda: archive(settings, archive_cache, before, publication_id=publication)
+        )
+
+    @app.get("/api/live/archive/{publication}/{result}")
+    async def live_archive_detail(publication: str, result: str) -> dict[str, Any]:
+        return await app.state.score_query_executor.execute(
+            lambda: archived_result(settings, publication, result)
+        )
+
+    @app.get("/api/history/catalog", response_model=CatalogResponse)
+    async def history_catalog() -> CatalogResponse:
+        return await app.state.score_query_executor.execute(history.catalog)
+
+    @app.post("/api/history/customer-score/query", response_model=CustomerScoreResponse)
+    async def history_score(
+        payload: CustomerScoreRequest, request: Request
+    ) -> CustomerScoreResponse:
+        if payload.score_config_override is not None:
+            require_role(request, settings.auth_manager_role)
+        return await app.state.score_query_executor.execute(lambda: history.score(payload))
+
+    @app.post("/api/history/customer-quality/query", response_model=CustomerQualityResponse)
+    async def history_quality(payload: CustomerQualityRequest) -> CustomerQualityResponse:
+        return await app.state.score_query_executor.execute(lambda: history.quality(payload))
 
     @app.get("/api/gold/status")
     async def availability(request: Request) -> dict[str, Any]:

@@ -228,7 +228,7 @@ def update(snapshot, previous, family, after, schema, *, budget, seconds):
         lineage_changes[lineage_key] = None
         scanned += sum(p["rows"] for p in (old_fact, old_lineage) if p)
         if count + scanned > budget:
-            raise IntegrityError("Affected Gold fragments exceed their reconciliation budget")
+            raise FullReadRequired
         rows = (
             {
                 business_key(family, row): row

@@ -111,3 +111,16 @@ def test_commit_outside_a_publication_is_not_adopted(store):
 def test_retention_window_must_be_explicit_and_bounded(tmp_path, capsys, days):
     assert main(["maintain", "--root", str(tmp_path), "--keep-days", days]) == EXIT_DATA
     assert "retention" in capsys.readouterr().err
+
+
+def test_live_archive_protects_delta_versions_from_maintenance(tmp_path):
+    from app.gold.common import atomic_json
+
+    published = tmp_path / "gold" / "published"
+    published.mkdir(parents=True)
+    checkpoint = published.parent / "checkpoint"
+    checkpoint.mkdir()
+    atomic_json(checkpoint / "identity.json", {"lane": "live", "identity": "test"})
+    with pytest.raises(IntegrityError, match="retained by the cumulative archive"):
+        maintain(published, keep_days=1)
+    assert not (published / "maintenance-status.json").exists()

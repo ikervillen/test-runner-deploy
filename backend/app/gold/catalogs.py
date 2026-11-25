@@ -53,7 +53,10 @@ VERSIONED_AR_SEVERITY = (
 )
 
 
-def load_independent_bundle(path: Path) -> dict:
+VERSIONED_AR_CATALOG = VERSIONED_AR_SEVERITY.with_name("ar_severity_catalog.json")
+
+
+def load_independent_bundle(path: Path, *, audit: bool = False) -> dict:
     """Apply approved MDL decisions to the site's baseline on each Gold start."""
     bundle = read_json(path)
     approved = read_json(VERSIONED_AR_SEVERITY)
@@ -73,10 +76,37 @@ def load_independent_bundle(path: Path) -> dict:
         for code, value in categories.items()
     ):
         raise IntegrityError("Invalid Fenix code or category in versioned AR severity decisions")
-    return {
-        **bundle,
-        "defect_categories": {**bundle["defect_categories"], **categories},
-    }
+    generated = read_json(VERSIONED_AR_CATALOG)
+    if generated.get("schema_id") != "quality-ar-severity-catalog-v1":
+        raise IntegrityError("Invalid generated MDL severity catalog")
+    resolved = generated["defect_categories"]
+    if (
+        not isinstance(resolved, dict)
+        or not resolved
+        or any(
+            not code.isascii()
+            or not code.isdigit()
+            or (value is not None and canonical_severity(value) != value)
+            for code, value in resolved.items()
+        )
+    ):
+        raise IntegrityError("Invalid code or classification in the MDL severity catalog")
+    baseline = bundle["defect_categories"]
+    effective = {**baseline, **resolved, **categories}
+    if audit:
+        print(
+            {
+                "mounted_catalog": str(path),
+                "mounted_categories": len(baseline),
+                "effective_categories": len(effective),
+                "classified": sum(v is not None for v in effective.values()),
+                "changed": sum(baseline.get(k) != v for k, v in effective.items()),
+                "changed_codes": [k for k in sorted(effective) if baseline.get(k) != effective[k]],
+                "sources": generated["sources"],
+                "remaining_without_category": sorted(k for k, v in effective.items() if v is None),
+            }
+        )
+    return {**bundle, "defect_categories": effective}
 
 
 def build(snapshot, bundle: dict) -> tuple[dict[str, list[dict]], list[dict]]:

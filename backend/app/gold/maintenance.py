@@ -39,6 +39,9 @@ def maintain(
         portalocker.Lock(root / "pipeline.lock", timeout=0),
         portalocker.Lock(root / "writer.lock", timeout=0),
     ):
+        identity = root.parent / "checkpoint" / "identity.json"
+        if identity.is_file() and read_json(identity).get("lane") == "live":
+            raise IntegrityError("Gold Live Delta versions are retained by the cumulative archive")
         result = _maintain(root, keep_days, now or datetime.now(UTC), failpoint or (lambda _: None))
         atomic_json(root / "maintenance-status.json", {**result, "last_success_at": utc_now()})
     return result

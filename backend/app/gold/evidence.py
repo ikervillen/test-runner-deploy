@@ -283,7 +283,7 @@ class Evidence:
         self.read_stats = defaultdict(Counter)
 
     @classmethod
-    def open(cls, root, identity=None):
+    def open(cls, root, identity=None, *, families=None):
         identity = identity or read_json(root / "current.json")["publication_id"]
         if (
             not isinstance(identity, str)
@@ -294,6 +294,11 @@ class Evidence:
         document = read_json(root / f"{identity}.json", max_bytes=MAX_MANIFEST_BYTES)
         if document.get("schema_id") != SCHEMA or digest(document) != identity:
             raise IntegrityError("Gold evidence hash differs")
+        if families is not None:
+            document = {
+                **document,
+                "tables": [r for r in document["tables"] if r["name"] in families],
+            }
         return cls(root, identity, document)
 
     def parts(self, ref, *, families=None, accept=None):
@@ -406,7 +411,10 @@ class Evidence:
             scanned = 0
 
             def accept(part):
-                if _overlaps_fragment(name, part, window):
+                if any(
+                    _overlaps_fragment(name, part, scope)
+                    for scope in (window if isinstance(window, list) else [window])
+                ):
                     return True
                 self.read_stats[name]["fragments_pruned"] += 1
                 return False
@@ -464,6 +472,11 @@ def operational_expression(family, window):
 
     if window is None:
         return None
+    if isinstance(window, list):
+        combined = ds.scalar(False)
+        for scope in window:
+            combined |= operational_expression(family, scope)
+        return combined
     left, right = window
     if family == "LISTA_AR":
         return (ds.field("FECHA_ON") < right) & (

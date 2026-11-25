@@ -135,7 +135,10 @@ def test_auxiliary_cursor_without_scoring_changes_does_not_export(independent, m
         lambda *a, **k: (tables, cursor + 3, (version[0], cursor + 3)),
     )
     revised = independent_inputs.export(plan, "live", cfg)
-    assert revised.document["silver_read"]["full_read_families"] == ["CONT_ZC"]
+    stats = revised.document["silver_read"]
+    assert stats["full_read_families"] == []
+    assert set(stats["reconciliation"]) == {"CONT_ZC"}
+    assert stats["reconciliation"]["CONT_ZC"]["examined"] == 0
     assert revised.document["silver_read"]["incremental"] is True
 
 
@@ -652,7 +655,7 @@ def test_worker_recovers_original_input_before_exporting_new_silver(
     worker = runtime.Worker(plan, "live", source, score=config, catalogs=catalogs)
     monkeypatch.setattr(worker, "historical_reference", lambda: None)
 
-    def next_input(*args):
+    def next_input(*args, **kwargs):
         assert read_json(journal)["state"] == "ACKNOWLEDGED"
         original = Snapshot.open(output)
         assert original.publication_id == pending
@@ -958,6 +961,7 @@ def test_fragment_cdf_gold_matches_reference_for_same_silver_cut(tmp_path, nativ
     )
     previous = Evidence.open(input_root)
     native_snapshot = type("Source", (), {"table": lambda self, _: delta})()
+    native_snapshot.manifest = {"publication_id": "scope-proof", "tables": {family: ref(1)}}
     started = perf_counter()
     reference_rows, proofs, n = materialize(
         native_snapshot, previous, original_proofs, family, ref(1), schema.names, budget=1000
@@ -1040,8 +1044,41 @@ def test_fragment_cdf_gold_matches_reference_for_same_silver_cut(tmp_path, nativ
         name = ref_row["name"]
         assert sorted(map(canonical, left.rows(name))) == sorted(map(canonical, right.rows(name)))
 
+    from app.gold import scoped_reconciliation
 
-def test_live_export_can_carry_more_logical_rows_than_its_work_budget(independent, native):
+    rebuilt, rebuilt_lineage, metrics = scoped_reconciliation.run(
+        tmp_path / "reconcile",
+        previous,
+        native_snapshot,
+        family,
+        schema,
+        origins=tuple({r["origen_fenix"] for r in reference_rows}),
+        seconds=600,
+        budget=64,
+        batch_size=8,
+    )
+    recovered = save(
+        input_root,
+        {**published_doc, "lineages": {k: p for k, p in original_proofs.items() if k != family}},
+        candidate_tables,
+        window_seconds=600,
+        fact_refs=[rebuilt],
+        lineage_refs=rebuilt_lineage,
+    )
+    assert metrics["peak_rows"] <= 64 < rebuilt["rows"]
+    assert recovered.proofs(max_rows=100000) == baseline.proofs(max_rows=100000)
+    reconciled = output(recovered, tmp_path / "reconciled")
+    assert len(reconciled.manifest["tables"]) == 36
+    for ref_row in left.manifest["tables"]:
+        name = ref_row["name"]
+        assert sorted(map(canonical, left.rows(name))) == sorted(
+            map(canonical, reconciled.rows(name))
+        )
+
+
+def test_live_export_can_carry_more_logical_rows_than_its_work_budget(
+    independent, native, monkeypatch
+):
     from dataclasses import replace
     from datetime import datetime, timedelta
     from time import perf_counter
@@ -1106,3 +1143,224 @@ def test_live_export_can_carry_more_logical_rows_than_its_work_budget(independen
         == 300
     )
     assert export(small, "live", cfg).publication_id == updated.publication_id
+
+    from app.gold import fragment_delta
+    from app.gold.silver_incremental import FullReadRequired
+
+    actual_update = fragment_delta.update
+
+    def missing_cdf(snapshot, previous, family, *args, **kwargs):
+        if family == "CONT_ZC":
+            raise FullReadRequired
+        return actual_update(snapshot, previous, family, *args, **kwargs)
+
+    source.write_text(inputs([start + timedelta(minutes=3010)]))
+    publish()
+    monkeypatch.setattr(fragment_delta, "update", missing_cdf)
+    recovered = export(small, "live", cfg)
+    assert recovered.table("CONT_ZC", max_rows=1000).num_rows == 302
+    stats = recovered.document["silver_read"]
+    assert stats["reconciliation"]["CONT_ZC"]["peak_rows"] <= small.policy.read_max_rows
+    assert stats["full_read_families"] == []
+    assert len(recovered.proofs(max_rows=1000)["CONT_ZC"]) == 302
+    assert export(small, "live", cfg).publication_id == recovered.publication_id
+
+
+@pytest.mark.parametrize("delay_hours", [0, 9])
+def test_late_coverage_publishes_previous_closed_hour_in_real_delta(
+    tmp_path, native, monkeypatch, delay_hours
+):
+    from datetime import UTC, timedelta
+    from types import SimpleNamespace
+
+    from app.gold.common import read_json
+    from app.gold.live_hours import retry_closures
+    from app.gold.pipeline import run
+    from app.gold.publications import Snapshot
+
+    from .test_pipeline import CUTOFF, bundle
+
+    closing = CUTOFF - timedelta(hours=1)
+    later = closing + timedelta(hours=delay_hours, minutes=10)
+    source = industrial_evidence(
+        tmp_path / "source",
+        "live",
+        recent=True,
+        native=native,
+        horizon=later,
+        window_seconds=600,
+    )
+    metadata = {k: v for k, v in source.document.items() if k not in {"tables", "schema_id"}}
+    tables = {
+        r["name"]: source.table(r["name"], max_rows=100000) for r in source.document["tables"]
+    }
+    coverage = metadata["coverage"]
+    late = [
+        {**r, "covered_until": (closing - timedelta(minutes=10)).isoformat()}
+        if r["source"] == "CONT_ZC"
+        else r
+        for r in coverage
+    ]
+    initial = save(source.root, {**metadata, "coverage": late}, tables, window_seconds=600)
+    published = tmp_path / "output"
+    options = dict(
+        bundle=bundle(),
+        config=read_json(Path(__file__).parents[3] / "config/customer_score.json"),
+        environment="test",
+        plant="AV",
+        lane="live",
+        current_slot_seconds=600,
+        mia_reference_mode="live",
+    )
+    assert (
+        run(initial.root, published, confirmed_input=initial, cutoff=closing, **options)["status"]
+        == "PUBLISHED"
+    )
+    before = Snapshot.open(published)
+    assert not [r for r in before.rows("quality_scores") if r["corte"] == closing]
+    older = (closing - timedelta(hours=1), closing) if delay_hours else None
+    if older:
+        assert not retry_closures(before, coverage, later, 100000)
+    retry = retry_closures(before, coverage, later, 100000, older=older)
+    assert retry and all(item[3] == closing.isoformat() for item in retry)
+    after = save(source.root, {**metadata, "retry_closures": retry}, tables, window_seconds=600)
+    assert (
+        run(after.root, published, confirmed_input=after, cutoff=later, **options)["status"]
+        == "PUBLISHED"
+    )
+    visible = Snapshot.open(published)
+    assert [r for r in visible.rows("quality_scores") if r["corte"] == closing]
+    assert not retry_closures(visible, coverage, later, 100000, older=older)
+    if older:
+        from app.gold.live_archive import archive
+        from app.infrastructure.cache import LruCache
+
+        t0 = closing - timedelta(hours=2)
+        monkeypatch.setattr("app.gold.live_archive.live_epoch", lambda: t0)
+        monkeypatch.setattr("app.gold.live_view.live_epoch", lambda: t0)
+        settings = SimpleNamespace(
+            resolved_gold_root=published,
+            gold_live_timezone="UTC",
+            gold_query_max_rows=100000,
+            gold_query_total_rows=300000,
+        )
+        moment = later.replace(tzinfo=UTC)
+        cache = LruCache(4)
+        prior = archive(settings, cache, publication_id=before.publication_id, moment=moment)
+        recovered = archive(settings, cache, moment=moment)
+
+        def scores(page):
+            return {
+                row["result_id"]
+                for shift in page["shifts"]
+                for hour in shift["hours"]
+                for row in hour["results"]
+                if row["result_id"]
+            }
+
+        assert scores(recovered) - scores(prior)
+        monkeypatch.undo()
+    settled = {
+        row["id_resultado"]: row
+        for row in visible.rows("quality_scores")
+        if row["corte"] == closing
+    }
+    next_cut = later + timedelta(minutes=10)
+    advanced = save(source.root, {**metadata, "retry_closures": []}, tables, window_seconds=600)
+    assert (
+        run(advanced.root, published, confirmed_input=advanced, cutoff=next_cut, **options)[
+            "status"
+        ]
+        == "PUBLISHED"
+    )
+    final = Snapshot.open(published)
+    assert {
+        row["id_resultado"]: row
+        for row in final.rows("quality_scores")
+        if row["id_resultado"] in settled
+    } == settled
+
+
+def test_ar_category_revision_recovers_pinned_hour_in_real_delta(tmp_path, native):
+    from datetime import timedelta
+
+    from app.gold.common import read_json
+    from app.gold.live_hours import ar_revisions, retry_closures
+    from app.gold.pipeline import run
+    from app.gold.publications import Snapshot
+
+    from .test_pipeline import CUTOFF, bundle
+
+    closing = CUTOFF - timedelta(hours=1)
+    later = closing + timedelta(minutes=10)
+    source = industrial_evidence(
+        tmp_path / "inputs", "live", recent=True, native=native, horizon=later, window_seconds=600
+    )
+    metadata = {k: v for k, v in source.document.items() if k not in {"tables", "schema_id"}}
+    tables = {
+        r["name"]: source.table(r["name"], max_rows=100000) for r in source.document["tables"]
+    }
+    before_cats = {**bundle(), "defect_categories": {"53": None}}
+    initial = save(
+        source.root,
+        {**metadata, "ar_categories": before_cats["defect_categories"], "ar_pin": "v1"},
+        tables,
+        window_seconds=600,
+    )
+    published = tmp_path / "published"
+    options = dict(
+        config=read_json(Path(__file__).parents[3] / "config/customer_score.json"),
+        environment="test",
+        plant="AV",
+        lane="live",
+        current_slot_seconds=600,
+        mia_reference_mode="live",
+    )
+    run(
+        initial.root,
+        published,
+        confirmed_input=initial,
+        cutoff=closing,
+        bundle=before_cats,
+        **options,
+    )
+    before = Snapshot.open(published)
+    assert any(
+        "AR_CATEGORY_UNRESOLVED" in (scope["reason_code"] or "")
+        for scope in before.rows("publication_scope_status")
+        if scope["source"] == "quality_scores"
+    )
+    next_doc = {**metadata, "ar_categories": bundle()["defect_categories"], "ar_pin": "v1"}
+    changes = ar_revisions(
+        tmp_path,
+        before,
+        next_doc,
+        lambda bounds: (
+            source.rows("LISTA_AR", window=bounds),
+            tables["observation_assignments"].to_pylist(),
+        ),
+        later,
+        100000,
+    )
+    next_doc["retry_closures"] = retry_closures(
+        before,
+        metadata["coverage"],
+        later,
+        100000,
+        closed=[],
+        ar_changed=changes,
+    )
+    assert len(next_doc["retry_closures"]) == 1
+    revised = save(source.root, next_doc, tables, window_seconds=600)
+    run(revised.root, published, confirmed_input=revised, cutoff=later, bundle=bundle(), **options)
+    current = Snapshot.open(published)
+    assert any(r["corte"] == closing for r in current.rows("quality_scores"))
+    score = next(r for r in current.rows("quality_scores") if r["corte"] == closing)
+    assert any(
+        r["reference_id"] == score["reference_id"] for r in current.rows("mia_reference_sets")
+    )
+    assert any(
+        r["evidence_reference"] == revised.publication_id and r["estado"] == "READY"
+        for r in current.rows("publication_scope_status")
+        if r["source"] == "quality_scores"
+    )

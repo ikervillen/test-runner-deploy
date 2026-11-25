@@ -85,7 +85,9 @@ class Worker:
         return identity
 
     def historical_reference(self):
-        if self.lane != "live":
+        from .common import live_epoch
+
+        if self.lane != "live" or live_epoch():
             return None
         root = self.pipelines.history.gold / "published"
         cache = self.root / "checkpoint" / "history-reference.json"
@@ -230,7 +232,12 @@ class Worker:
         started = monotonic()
         recovered = self.recover_publication() if self.lane == "live" else None
         began_export = monotonic()
-        evidence = export(self.pipelines, self.lane, self.source)
+        evidence = export(
+            self.pipelines,
+            self.lane,
+            self.source,
+            ar_categories=self.catalogs["defect_categories"] if self.lane == "live" else None,
+        )
         began_publish = monotonic()
         result = self.publish(
             evidence,
