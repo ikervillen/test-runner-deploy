@@ -1082,9 +1082,12 @@ def test_fragment_cdf_gold_matches_reference_for_same_silver_cut(tmp_path, nativ
     assert len(reconciled.manifest["tables"]) == 36
     for ref_row in left.manifest["tables"]:
         name = ref_row["name"]
-        assert sorted(map(canonical, left.rows(name))) == sorted(
-            map(canonical, reconciled.rows(name))
-        )
+        expected, observed = left.rows(name), reconciled.rows(name)
+        if name == "quality_scores":
+            for rows, snapshot in ((expected, left), (observed, reconciled)):
+                for row in rows:
+                    assert row.pop("basis_publication_id") == snapshot.publication_id
+        assert sorted(map(canonical, expected)) == sorted(map(canonical, observed))
 
 
 def test_live_export_can_carry_more_logical_rows_than_its_work_budget(

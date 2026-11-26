@@ -45,6 +45,24 @@ it("shows zero for a closed result, excludes the open score and pins detail", as
     published_at: "2026-11-24T14:01:00Z",
     stale: false,
     mia_provisional: true,
+    active_productions: [
+      {
+        line: "AV31",
+        machine: 7,
+        state: "active",
+        production: "p2",
+        model: "1048-A",
+        start: row.cutoff,
+      },
+      {
+        line: "AV31",
+        machine: 8,
+        state: "active",
+        production: "p3",
+        model: "2019-B",
+        start: row.cutoff,
+      },
+    ],
     hours: [
       { start: row.start, end: row.cutoff!, state: "closed", results: [row] },
       {
@@ -62,6 +80,15 @@ it("shows zero for a closed result, excludes the open score and pins detail", as
   const result = await screen.findByRole("button", {
     name: /AV31A.*15:00.*86,08.*Bueno/,
   });
+  expect(
+    screen.getByRole("heading", { name: /AV31A.*Modelo 1048-A/ }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("heading", { name: /AV31B.*Modelo 2019-B/ }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("heading", { name: /AV32A.*Sin producción activa/ }),
+  ).toBeInTheDocument();
   expect(
     screen.getAllByRole("img", { name: /Evolución horaria/ }),
   ).toHaveLength(7);
@@ -139,6 +166,7 @@ it("shows the selected handover close without presenting partial components as a
     reason: null,
     result_id: "p2",
     total_penalty: 2,
+    component_states: {},
     contributions: { MIA: 2 },
   };
   vi.spyOn(api, "getLiveArchive").mockRejectedValue(new Error("unavailable"));

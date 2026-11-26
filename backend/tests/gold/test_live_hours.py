@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 import pyarrow.dataset as ds
@@ -160,3 +161,79 @@ def test_open_hour_has_no_score_and_zero_survives_for_closed_result():
     assert closed.total_penalty == 0.0 and closed.state == "complete"
     assert closed.contributions == {"MIA": 0.0}
     assert all(r.total_penalty != 123.0 for hour in view.hours for r in hour.results)
+
+
+def test_live_model_uses_pin_presences_for_tandem_and_model_change():
+    def produce(identity, machine, model, began=START):
+        return {
+            **prod(identity),
+            "id_maquina_fenix": machine,
+            "fecha_inicio_zc": began,
+            "codigo_modelo_botella": model,
+        }
+
+    def presence(identity, machine, begins, ends=None):
+        return dict(
+            id_asignacion=f"fenix-zc-presence:{identity}",
+            id_produccion=identity,
+            id_maquina_fenix=machine,
+            linea="AV31",
+            zona="ZC",
+            estado_asignacion="CONFIRMED",
+            vigente_desde=begins,
+            vigente_hasta=ends,
+        )
+
+    transition = START + timedelta(minutes=5)
+    snapshot = FixtureSnapshot(
+        {
+            "productions": [
+                dict(
+                    produce("old", 7, "AAA"),
+                    fecha_inicio_zf=START,
+                    estado_dato="VALID",
+                    fecha_fin_zf=END + timedelta(minutes=5),
+                ),
+                dict(
+                    produce("new", 7, "BBB", transition),
+                    estado_dato="VALID",
+                    fecha_inicio_zf=END + timedelta(minutes=5),
+                ),
+                produce("other", 8, "CCC"),
+                produce("inactive", 4, "DDD"),
+            ],
+            "production_assignments": [
+                presence("old", 7, START, transition),
+                presence("new", 7, transition),
+                presence("other", 8, START),
+            ],
+            "quality_scores": [
+                dict(
+                    id_resultado=w.identity,
+                    **w.key,
+                    total_penalty=1.0,
+                    normalized_score=1.0,
+                    estado_interpretacion="GOOD",
+                )
+                for w in [Window("old", "HOUR", START, END, END)]
+            ],
+            "publication_scope_status": [scope("old", END)],
+        }
+    )
+    q = SimpleNamespace(snapshot=snapshot, max_rows=100, record_scan=lambda n: None)
+    view = _project(
+        q, END, LATER.replace(tzinfo=UTC), include_contributions=False, timezone=ZoneInfo("UTC")
+    )
+    assert [(p.machine, p.production, p.model) for p in view.active_productions] == [
+        (7, "new", "BBB"),
+        (8, "other", "CCC"),
+    ]
+    assert {r.production: r.model for r in view.hours[-2].results}["old"] == "AAA"
+    assert view.active_productions[0].zf_model == "AAA"
+    snapshot.tables["production_assignments"].append(presence("conflict", 8, START))
+    snapshot.manifest["created_at"] = "2026-11-24T14:06:00+00:00"
+    revised = _project(
+        q, END, LATER.replace(tzinfo=UTC), include_contributions=False, timezone=ZoneInfo("UTC")
+    )
+    assert revised.active_productions[1].state == "ambiguous"
+    assert revised.active_productions[1].model is None

@@ -88,6 +88,21 @@ def test_open_ar_contributes_45_minutes_without_fabricating_a_close():
     )
 
 
+def test_an_unresolved_non_dar_event_only_blocks_its_aql_category():
+    row = {**event(START, None), "cavidad": "99Z", "grupo_dar": None}
+    result = ar_bases([row], capacity(), window(), independent=True)
+    assert result["pending_by_component"] == {"Grave": "AR_MOULD_IDENTITY_PENDING"}
+    assert not result["amounts"]
+
+
+def test_ar_on_the_outgoing_hot_zone_stops_at_the_accredited_zone_end():
+    hot_end = START + timedelta(minutes=3)
+    old = {"fecha_inicio_zf": START - timedelta(days=1), "fecha_fin_zc": hot_end}
+    row = {**event(START, None), "zona": "ZC"}
+    result = ar_bases([row], capacity(), window(), production=old)
+    assert result["amounts"][0]["tiempo_afectado_us"] == 3 * 60_000_000
+
+
 def test_overlap_is_union_and_closure_recalculates_without_extra_event():
     rows = [
         event(START, START + timedelta(minutes=30)),
