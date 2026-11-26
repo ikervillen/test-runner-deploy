@@ -112,7 +112,7 @@ it("shows zero for a closed result, excludes the open score and pins detail", as
   vi.restoreAllMocks();
 });
 
-it("keeps both handover results with missing components and shows all hour states", async () => {
+it("shows the selected handover close without presenting partial components as a total", async () => {
   const old: LiveResult = {
     production: "fenix:old",
     line: "AV32",
@@ -122,9 +122,12 @@ it("keeps both handover results with missing components and shows all hour state
     state: "partial",
     reason: "MIA_REFERENCE_PENDING",
     result_id: "p1",
-    total_penalty: 4,
-    normalized_score: 1,
-    classification: "observed",
+    total_penalty: null,
+    normalized_score: null,
+    classification: null,
+    partial_subtotal: 4,
+    model: "2939/577",
+    component_states: { ZC: "NOT_APPLICABLE", MIA: "WAITING_DEPENDENCY" },
     contributions: { Grave: 4 },
   };
   const incoming: LiveResult = {
@@ -155,7 +158,7 @@ it("keeps both handover results with missing components and shows all hour state
         start: old.start,
         end: incoming.cutoff!,
         state: "closed",
-        results: [incoming, old],
+        results: [old],
       },
       {
         start: incoming.cutoff!,
@@ -183,8 +186,22 @@ it("keeps both handover results with missing components and shows all hour state
   const table = await screen.findByRole("table", {
     name: "Desglose horario de AV32B",
   });
-  expect(within(table).getByText("old · 14:00–14:20")).toBeInTheDocument();
-  expect(within(table).getByText("new · 14:20–15:00")).toBeInTheDocument();
+  expect(
+    within(table).getAllByRole("rowheader", { name: /^15:00/ }),
+  ).toHaveLength(1);
+  expect(
+    within(table).getByRole("rowheader", { name: /^15:00/ }),
+  ).toHaveAttribute(
+    "title",
+    expect.stringContaining("2939/577 · fenix:old · 14:00–14:20"),
+  );
+  expect(within(table).getByText("N/A")).toBeInTheDocument();
+  expect(
+    within(table).getByRole("button", { name: /Detalle Grav./ }),
+  ).toHaveTextContent("4");
+  expect(
+    within(table).queryByRole("button", { name: /Ver desglose/ }),
+  ).not.toBeInTheDocument();
   for (const state of ["Anterior a T0", "Parcial", "Pendiente", "En curso"]) {
     expect(within(table).getByText(state)).toBeInTheDocument();
   }

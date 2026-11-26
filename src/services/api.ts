@@ -37,6 +37,11 @@ export type LiveResult = {
   total_penalty: number | null;
   normalized_score: number | null;
   classification: string | null;
+  partial_subtotal?: number | null;
+  evaluated_weight?: number | null;
+  component_states?: Partial<
+    Record<string, "READY" | "WAITING_DEPENDENCY" | "NOT_APPLICABLE">
+  >;
   model?: string | null;
   contributions: Partial<Record<string, number>>;
 };
