@@ -320,14 +320,40 @@ def _iter_table(tables, name):
 
 
 def _score_components(formula, reference):
-    from .scoring import LIVE_PARTIAL_MIA_FORMULA
+    from .scoring import LIVE_PARTIAL_MIA_FORMULA, PARTIAL_FORMULA_PREFIX, SCORE_COMPONENTS
 
     components = {"MIA", "Critico", "Grave", "Mayor", "Menor", "Leve", "DAR", "ZC"}
     if formula == LIVE_PARTIAL_MIA_FORMULA:
         if reference is not None:
             raise IntegrityError("A score with pending MIA cannot claim a MIA reference")
         components.remove("MIA")
+    elif formula.startswith(PARTIAL_FORMULA_PREFIX):
+        members = formula.removeprefix(PARTIAL_FORMULA_PREFIX).split(",")
+        components = set(members)
+        if (
+            sorted(components) != members
+            or not components < SCORE_COMPONENTS
+            or ("MIA" not in components and reference is not None)
+        ):
+            raise IntegrityError("Invalid partial score component membership")
     return components
+
+
+def _validate_score_status(row):
+    from .scoring import PARTIAL_FORMULA_PREFIX
+
+    if row["formula_version"].startswith(PARTIAL_FORMULA_PREFIX) != (
+        row["estado_interpretacion"] == "partial"
+    ):
+        raise IntegrityError("Only complete scores may carry an official classification")
+
+
+def _normalized_valid(formula, total, weight, normalized):
+    from .scoring import PARTIAL_FORMULA_PREFIX
+
+    if weight == 0 and formula.startswith(PARTIAL_FORMULA_PREFIX):
+        return normalized == total == 0
+    return weight > 0 and round(total / weight, 4) == normalized
 
 
 def _validate_spilled(tables, *, complete=False):
@@ -373,6 +399,7 @@ def _validate_spilled(tables, *, complete=False):
             ):
                 raise IntegrityError(f"{name}: invalid window or cutoff")
             if name == "quality_scores":
+                _validate_score_status(row)
                 grain = tuple(
                     row[k]
                     for k in ("id_produccion", "tipo_ventana", "inicio", "fin", "seleccion_id")
@@ -416,7 +443,7 @@ def _validate_spilled(tables, *, complete=False):
         got_weight = round(sum(item[2] for item in parts), 4)
         if got_total != total or got_weight != weight:
             raise IntegrityError("Score components and total/weight do not reconcile")
-        if weight <= 0 or round(got_total / weight, 4) != normalized:
+        if not _normalized_valid(formula, got_total, weight, normalized):
             raise IntegrityError("Normalized score does not reconcile")
 
 
@@ -480,6 +507,7 @@ def validate(tables, *, complete=False):
                 raise IntegrityError(f"{name}: detail without official complete score")
     if "quality_score_components" in tables:
         for identity, score in scores.items():
+            _validate_score_status(score)
             parts = [r for r in tables["quality_score_components"] if r["id_resultado"] == identity]
             if {r["componente"] for r in parts} != _score_components(
                 score["formula_version"],
@@ -490,5 +518,7 @@ def validate(tables, *, complete=False):
             weight = round(sum(r["peso"] for r in parts), 4)
             if total != score["total_penalty"] or weight != score["evaluated_weight"]:
                 raise IntegrityError("Score components and total/weight do not reconcile")
-            if weight <= 0 or round(total / weight, 4) != score["normalized_score"]:
+            if not _normalized_valid(
+                score["formula_version"], total, weight, score["normalized_score"]
+            ):
                 raise IntegrityError("Normalized score does not reconcile")

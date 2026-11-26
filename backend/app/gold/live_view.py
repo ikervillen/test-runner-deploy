@@ -12,6 +12,7 @@ from .common import live_epoch
 from .lanes import canonical_hour
 from .metrics import Window
 from .query import Query
+from .scoring import SCORE_COMPONENTS, has_official_total
 
 
 class Result(BaseModel):
@@ -25,9 +26,27 @@ class Result(BaseModel):
     result_id: str | None = None
     total_penalty: float | None = None
     normalized_score: float | None = None
+    partial_subtotal: float | None = None
+    evaluated_weight: float | None = None
     classification: str | None = None
     model: str | None = None
     contributions: dict[str, float] = Field(default_factory=dict)
+    component_states: dict[str, str] = Field(default_factory=dict)
+
+
+def evaluation_states(contributions, reason):
+    codes = set((reason or "").split(";"))
+    states = {}
+    for component in sorted(SCORE_COMPONENTS):
+        family = component if component in {"MIA", "ZC"} else "AR"
+        states[component] = (
+            "READY"
+            if component in contributions
+            else "NOT_APPLICABLE"
+            if f"{family}_NOT_APPLICABLE" in codes
+            else "WAITING_DEPENDENCY"
+        )
+    return states
 
 
 class Hour(BaseModel):
@@ -131,6 +150,7 @@ def _project(q, open_hour, now, *, include_contributions=True, archive_start=Non
                 if row and row["corte"] == cutoff and scope.get("period_end") == cutoff
                 else None
             )
+            official = score is not None and has_official_total(score.get("formula_version"))
             results.append(
                 Result(
                     production=identity,
@@ -138,7 +158,7 @@ def _project(q, open_hour, now, *, include_contributions=True, archive_start=Non
                     machine=production.get("id_maquina_fenix"),
                     start=max(left, began, floor or left),
                     cutoff=cutoff,
-                    state=("partial" if reason else "complete")
+                    state=("partial" if reason or not official else "complete")
                     if score
                     else "unavailable"
                     if scope.get("estado") == "READY" and archive_start is not None
@@ -146,9 +166,11 @@ def _project(q, open_hour, now, *, include_contributions=True, archive_start=Non
                     model=production.get("codigo_modelo_botella"),
                     reason=reason,
                     result_id=score["id_resultado"] if score else None,
-                    total_penalty=score["total_penalty"] if score else None,
-                    normalized_score=score["normalized_score"] if score else None,
-                    classification=score["estado_interpretacion"] if score else None,
+                    total_penalty=score["total_penalty"] if score and official else None,
+                    normalized_score=score["normalized_score"] if score and official else None,
+                    partial_subtotal=score["total_penalty"] if score and not official else None,
+                    evaluated_weight=score.get("evaluated_weight") if score else None,
+                    classification=score["estado_interpretacion"] if score and official else None,
                 )
             )
         for (line, machine), candidates in ambiguous.items():
@@ -194,6 +216,9 @@ def _project(q, open_hour, now, *, include_contributions=True, archive_start=Non
                 results[component["id_resultado"]].contributions[component["componente"]] = (
                     component["contribucion"]
                 )
+        for hour in hours:
+            for row in hour.results:
+                row.component_states = evaluation_states(row.contributions, row.reason)
     published_at = datetime.fromisoformat(q.snapshot.manifest["created_at"])
     return LiveScores(
         publication_id=q.snapshot.publication_id,

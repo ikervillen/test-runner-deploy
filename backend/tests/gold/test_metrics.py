@@ -259,6 +259,45 @@ def test_all_components_publish_together_and_missing_profile_publishes_nothing()
     assert "MODEL_SEGMENT_DAR_PROFILE_PENDING" in waiting.pending
 
 
+@pytest.mark.parametrize(
+    ("blocked", "expected"),
+    [
+        ({"AR": "AR_SOURCE_COVERAGE_PENDING"}, {"MIA", "ZC"}),
+        (
+            {"MIA": "MIA_SOURCE_COVERAGE_PENDING"},
+            {"Critico", "Grave", "Mayor", "Menor", "Leve", "DAR", "ZC"},
+        ),
+        ({"ZC": "ZC_NOT_APPLICABLE"}, {"MIA", "Critico", "Grave", "Mayor", "Menor", "Leve", "DAR"}),
+        ({"AR": "AR_SOURCE_COVERAGE_PENDING", "ZC": "ZC_SOURCE_COVERAGE_PENDING"}, {"MIA"}),
+    ],
+)
+def test_independent_components_have_an_unclassified_partial_result(blocked, expected):
+    from app.gold.contracts import validate
+
+    config = json.loads(
+        (Path(__file__).resolve().parents[3] / "config/customer_score.json").read_text()
+    )
+    m = mia_bases([], [inspection(1, 100)], window())
+    a = ar_bases([], capacity(), window())
+    result = calculate(
+        window(),
+        mia=m,
+        ar=a,
+        zc=[{"rueda": 90, "teoricos": 100, "muestras": 1, "id_base_zc": "wheel"}],
+        reference={"values": [], "sets": []},
+        config=config,
+        config_id="c",
+        profile_confirmed=True,
+        coverage_ready=True,
+        calculation_time=END,
+        component_coverage=blocked,
+    )
+    assert set(blocked.values()) <= set(result.pending)
+    assert {r["componente"] for r in result.tables["quality_score_components"]} == expected
+    assert result.tables["quality_scores"][0]["estado_interpretacion"] == "partial"
+    validate(result.tables)
+
+
 def test_physical_override_requires_independent_evidence_and_rejects_overlap():
     old = {
         "id_produccion": "old",
