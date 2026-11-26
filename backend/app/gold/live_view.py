@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from app.domain.errors import ApplicationError
 
 from .common import live_epoch
+from .lanes import canonical_hour
 from .metrics import Window
 from .query import Query
 
@@ -114,7 +115,8 @@ def _project(q, open_hour, now, *, include_contributions=True, archive_start=Non
         right = left + timedelta(hours=1)
         before = floor is not None and right <= floor
         results = []
-        for production in productions if not before else []:
+        owners, ambiguous = canonical_hour(productions, left, right) if not before else ({}, {})
+        for production in owners.values():
             identity = production["id_produccion"]
             began = production.get("fecha_inicio_operativo_zc") or production["fecha_inicio_zc"]
             finished = production["fecha_fin_zf"]
@@ -135,7 +137,7 @@ def _project(q, open_hour, now, *, include_contributions=True, archive_start=Non
                     line=production["linea"],
                     machine=production.get("id_maquina_fenix"),
                     start=max(left, began, floor or left),
-                    cutoff=score["corte"] if score else None,
+                    cutoff=cutoff,
                     state=("partial" if reason else "complete")
                     if score
                     else "unavailable"
@@ -147,6 +149,18 @@ def _project(q, open_hour, now, *, include_contributions=True, archive_start=Non
                     total_penalty=score["total_penalty"] if score else None,
                     normalized_score=score["normalized_score"] if score else None,
                     classification=score["estado_interpretacion"] if score else None,
+                )
+            )
+        for (line, machine), candidates in ambiguous.items():
+            results.append(
+                Result(
+                    production="",
+                    line=candidates[0].get("linea") or line,
+                    machine=machine,
+                    start=left,
+                    cutoff=None,
+                    state="pending",
+                    reason="HOURLY_HANDOVER_AMBIGUOUS",
                 )
             )
         hours.append(

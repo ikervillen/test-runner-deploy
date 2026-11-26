@@ -9,6 +9,7 @@ overlaps. Totals that span several hours are a later read.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -133,13 +134,56 @@ def current_slot(productions, cutoff: datetime, slot_seconds: int) -> list[HourC
     """Score the latest delivery with the context of its industrial hour."""
     start, end = hour_holding(cutoff)
     slot_start = cutoff - timedelta(seconds=slot_seconds)
-    return [
-        chunk
-        for production in productions
-        if _started(production) < cutoff
-        and (chunk := _clip(production, start, end, cutoff)) is not None
-        and chunk.cutoff > slot_start
-    ]
+    owners, _ = canonical_hour(productions, start, end)
+    result = []
+    for production in productions:
+        chunk = _clip(production, start, end, cutoff)
+        if chunk is None:
+            continue
+        owner = chunk.production_id in owners
+        if chunk.cutoff > slot_start or (owner and cutoff == end):
+            result.append(
+                chunk
+                if owner
+                else HourChunk(chunk.production_id, start, end, chunk.cutoff, facts_only=True)
+            )
+    return result
+
+
+def canonical_hour(productions, start, end):
+    """Select by accredited position and ZF interval, independently of available scores."""
+    positions = defaultdict(list)
+    for p in productions:
+        physical = p.get("id_maquina_fenix")
+        position = (p.get("origen_fenix") or p.get("linea"), physical)
+        if physical is None:
+            position = (p["id_produccion"], None)
+        if _started(p) < end and (not p.get("fecha_fin_zf") or stamp(p["fecha_fin_zf"]) > start):
+            positions[position].append(p)
+    owners, ambiguous = {}, {}
+    for position, rows in positions.items():
+        zf = sorted(
+            (
+                (stamp(p["fecha_inicio_zf"]), p["id_produccion"], p)
+                for p in rows
+                if p.get("fecha_inicio_zf") and stamp(p["fecha_inicio_zf"]) < end
+            ),
+            key=lambda row: (row[0], row[1]),
+        )
+        if not zf and len(rows) == 1 and not rows[0].get("fecha_inicio_zf"):
+            owner = rows[0]  # Older metadata can lack ZF for a position with a single candidate.
+        elif len(zf) == 1:
+            owner = zf[0][2]
+        elif len(zf) == 2 and zf[0][0] <= start:
+            first_end = stamp(zf[0][2].get("fecha_fin_zf"))
+            owner = zf[0][2] if first_end and first_end <= zf[1][0] else None
+        else:
+            owner = None
+        if owner is not None:
+            owners[owner["id_produccion"]] = owner
+        elif len(rows) > 1:
+            ambiguous[position] = rows
+    return owners, ambiguous
 
 
 def slot_start(moment: datetime) -> datetime:
