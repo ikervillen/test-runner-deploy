@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from . import references
+from .ar_units import conflicts, record_episode
 from .common import PendingBasis, digest
 from .metrics import Window, ar_bases, mia_bases, production_windows, zc_bases
 from .scoring import calculate
@@ -96,7 +97,20 @@ def recalculate(q, production, payload, config, bundle, mappings, scopes, branch
         minimum=config["mia"]["historical_scope"]["min_samples"],
     )
     capacity = q.rows("production_capacity", [identity])
-    events = q.rows("ar_intervals", [identity])
+    same_origin = {
+        p["id_produccion"]: p
+        for p in candidates
+        if p["origen_fenix"] == production["origen_fenix"]
+        and p["codigo_modelo_botella"] == production["codigo_modelo_botella"]
+    }
+    same_origin[identity] = production
+    events, episodes = [], {}
+    for event in q.rows("ar_intervals", same_origin):
+        owner = event["id_produccion"]
+        record_episode(episodes, event, same_origin[owner])
+        if owner == identity:
+            events.append(event)
+    ar_conflicts = conflicts(episodes)
     links = q.rows("zc_production_links", [identity])
     zc_ids = {r["id_observacion"] for r in links}
     counters = q.rows("zc_observations", zc_ids, "id_observacion")
@@ -132,7 +146,7 @@ def recalculate(q, production, payload, config, bundle, mappings, scopes, branch
             mia = {"exposure": {**e, **w.key}, "rates": rates_from_amounts(amounts, e, codes)}
         ar_reason = "ASSIGNED_CAPACITY_PENDING"
         try:
-            ar = ar_bases(events, capacity, w)
+            ar = ar_bases(events, capacity, w, production=production, conflicts=ar_conflicts)
         except PendingBasis as exc:
             ar, ar_reason = None, exc.code
         if ar:

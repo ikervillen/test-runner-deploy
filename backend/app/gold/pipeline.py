@@ -29,6 +29,7 @@ from . import (
     mia_statistics,
     references,
 )
+from .ar_units import conflicts, record_episode
 from .attribution import Attribution
 from .common import (
     IntegrityError,
@@ -299,6 +300,8 @@ def _spill_facts(
 ):
     """Write accepted facts for this chunk. The scan keeps one Arrow batch, not the history."""
     assigned = {r["id_asignacion"]: r["id_produccion"] for r in tables["production_assignments"]}
+    productions = {r["id_produccion"]: r for r in tables["productions"]}
+    episodes: dict = {}
 
     def wanted(production_id: str) -> bool:
         return only_ids is None or production_id in only_ids
@@ -332,6 +335,7 @@ def _spill_facts(
             tables["model_segment_catalog"],
         )
         for row in rows:
+            record_episode(episodes, row, productions[row["id_produccion"]])
             if not wanted(row["id_produccion"]):
                 continue
             if not _in_chunk(spans, row["id_produccion"], row["fecha_on"], row["fecha_off"]):
@@ -385,6 +389,7 @@ def _spill_facts(
                     key=(production_id, observation_id),
                 )
     store.ready()
+    return conflicts(episodes)
 
 
 def _zc_links(decisions, tables):
@@ -531,6 +536,7 @@ def _score_job(payload: dict) -> dict:
                 old_tables=payload["old_tables"],
                 last_discovery=payload["last_discovery"],
                 windows=payload.get("windows"),
+                ar_conflicts=payload.get("ar_conflicts", ()),
                 live_mia="mia_reference" in payload,
                 production_clock=clock,
                 windows_timing=windows_timing,
@@ -625,6 +631,7 @@ def _score_production(
     old_tables,
     last_discovery,
     windows=None,
+    ar_conflicts=(),
     live_mia=False,
     production_clock,
     windows_timing,
@@ -645,7 +652,9 @@ def _score_production(
         ar_pending_reason = "ASSIGNED_CAPACITY_PENDING"
         try:
             with clock.stage("ar_bases"):
-                a = ar_bases(tables["ar_intervals"], capacities, w)
+                a = ar_bases(
+                    tables["ar_intervals"], capacities, w, production=p, conflicts=ar_conflicts
+                )
         except PendingBasis as exc:
             a = None
             ar_pending_reason = exc.code
@@ -1359,7 +1368,7 @@ def build(
                 spans = defaultdict(list)
                 for chunk in hour_plan:
                     spans[chunk.production_id].append(chunk)
-            _spill_facts(
+            ar_conflicts = _spill_facts(
                 reader,
                 tables,
                 Attribution(decisions, prods),
@@ -1534,6 +1543,7 @@ def build(
                 "production": production,
                 "productions": prods,
                 "capacities": capacities,
+                "ar_conflicts": ar_conflicts,
                 "by_zc": by_zc,
                 "previous_states": previous_states,
                 "old_tables": old_tables,

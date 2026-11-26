@@ -6,6 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from .ar_units import affected_unit, continuity
 from .common import IntegrityError, PendingBasis, digest
 
 
@@ -200,7 +201,9 @@ def merged_duration(intervals: list[tuple[datetime, datetime]]) -> tuple[int, in
     return events, duration + microseconds(end - start)
 
 
-def ar_bases(events: list[dict], capacities: list[dict], window: Window) -> dict:
+def ar_bases(
+    events: list[dict], capacities: list[dict], window: Window, *, production=None, conflicts=()
+) -> dict:
     pieces = sorted(
         [
             c
@@ -231,31 +234,27 @@ def ar_bases(events: list[dict], capacities: list[dict], window: Window) -> dict
         )
     by = defaultdict(list)
     by_defect = defaultdict(list)
-    for event in events:
-        if event["id_produccion"] != window.production_id:
-            continue
+    production = production or {}
+    own = [event for event in events if event["id_produccion"] == window.production_id]
+    joined = continuity(own, production) if any(event["cavidad"] == "99Z" for event in own) else {}
+    for event in own:
         left, right = (
             max(window.start, event["fecha_on"]),
             min(window.cutoff, event["fecha_off"] or window.cutoff),
         )
         if left >= right:
             continue
-        if event["cavidad"] in {None, "", "-", "99Z"}:
-            raise PendingBasis(
-                "AR_CAVITY_UNRESOLVED", "An affecting AR event has no identified physical cavity"
-            )
+        unit = affected_unit(event, production, joined, conflicts)
         if event["categoria"] is None:
             raise PendingBasis(
                 "AR_CATEGORY_UNRESOLVED", "An affecting AR event has no accepted severity category"
             )
-        by[("CATEGORY", event["categoria"], event["cavidad"])].append((left, right))
+        by[("CATEGORY", event["categoria"], unit)].append((left, right))
         if event.get("codigo_defecto") is not None:
-            by_defect[(event["categoria"], event["codigo_defecto"], event["cavidad"])].append(
-                (left, right)
-            )
+            by_defect[(event["categoria"], event["codigo_defecto"], unit)].append((left, right))
         if event["grupo_dar"]:
-            by[("DAR_GROUP", event["grupo_dar"], event["cavidad"])].append((left, right))
-            by[("DAR_TOTAL", "DAR", event["cavidad"])].append((left, right))
+            by[("DAR_GROUP", event["grupo_dar"], unit)].append((left, right))
+            by[("DAR_TOTAL", "DAR", unit)].append((left, right))
     amounts: defaultdict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
     for (kind, code, _), intervals in by.items():
         count, duration = merged_duration(intervals)
