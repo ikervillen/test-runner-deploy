@@ -65,7 +65,8 @@ def load_site(path):
         "environments",
         "settings",
     }
-    if set(site) != keys:
+    optional = {"frontend_bind_address", "frontend_remote_subnet"}
+    if not keys <= set(site) <= keys | optional:
         raise ValueError("Campos de configuración del servidor incompatibles")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", site["repository"]):
         raise ValueError("Repositorio no válido")

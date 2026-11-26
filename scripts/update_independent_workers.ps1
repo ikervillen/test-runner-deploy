@@ -55,6 +55,51 @@ function Invoke-Docker {
     if ($LASTEXITCODE -ne 0) { throw "Docker falló al ejecutar $($args[0])." }
 }
 
+function Get-FrontendBinding($Backend) {
+    $address = '127.0.0.1'
+    if ($site.frontend_bind_address) { $address = [string]$site.frontend_bind_address }
+    if ($address -eq '127.0.0.1') { return "${address}:$($profile.api_port):8080" }
+    $ip = $null
+    if (-not [Net.IPAddress]::TryParse($address, [ref]$ip) -or
+        $ip.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -or
+        $ip.ToString() -cne $address -or $address -eq '0.0.0.0') {
+        throw 'frontend_bind_address debe ser una IPv4 específica asignada al servidor.'
+    }
+    if ($Backend.Config.Env -cnotcontains 'APP_AUTH_MODE=disabled') {
+        throw 'El acceso directo por LAN requiere confirmar el modo sin autenticación. El modo proxy requiere su pasarela corporativa.'
+    }
+    $subnet = [string]$site.frontend_remote_subnet
+    if ($subnet -notmatch '^(\d{1,3}\.){3}\d{1,3}/(\d{1,2})$' -or [int]$Matches[2] -notin (8..32)) {
+        throw 'Configura frontend_remote_subnet con el CIDR IPv4 autorizado.'
+    }
+    $prefix = [int]$Matches[2]
+    $networkAddress = $subnet.Split('/')[0]
+    $mask = (0..3 | ForEach-Object {
+        $bits = [Math]::Min(8, [Math]::Max(0, $prefix - (8 * $_)))
+        [int](256 - [Math]::Pow(2, 8 - $bits))
+    }) -join '.'
+    $nic = Get-NetIPAddress -AddressFamily IPv4 -IPAddress $address -ErrorAction Stop
+    $connection = Get-NetConnectionProfile -InterfaceIndex $nic.InterfaceIndex -ErrorAction Stop
+    $network = switch ([string]$connection.NetworkCategory) {
+        'DomainAuthenticated' { 'Domain' }
+        'Private' { 'Private' }
+        default { throw 'La interfaz LAN debe usar un perfil de red Domain o Private.' }
+    }
+    $firewall = Get-NetFirewallProfile -PolicyStore ActiveStore -Name $network
+    $rule = Get-NetFirewallRule -PolicyStore ActiveStore -Name 'Fenix-Frontend-LAN-8011'
+    $ports = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $rule
+    $addresses = Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $rule
+    if ($firewall.Enabled -ne 'True' -or $firewall.DefaultInboundAction -eq 'Allow' -or
+        $rule.Enabled -ne 'True' -or $rule.Direction -ne 'Inbound' -or $rule.Action -ne 'Allow' -or
+        "$($rule.Profile)" -cne $network -or $ports.Protocol -notin @('TCP','6') -or
+        ($ports.LocalPort -join ',') -ne [string]$profile.api_port -or
+        ($addresses.LocalAddress -join ',') -ne $address -or
+        ($addresses.RemoteAddress -join ',') -notin @($subnet, "$networkAddress/$mask")) {
+        throw 'El firewall efectivo no acredita el puerto, la interfaz y la subred autorizados para Fenix.'
+    }
+    return "${address}:$($profile.api_port):8080"
+}
+
 function Get-Worker([string]$Service, [switch]$AllowStopped, [switch]$AllowMissing) {
     $filters = @('--filter', "label=com.docker.compose.project=$project",
         '--filter', "label=com.docker.compose.service=$Service", '--format', '{{.ID}}')
@@ -248,6 +293,7 @@ if ($FrontendOnly -or $ApplicationOnly) {
         throw 'La imagen del frontend no coincide con el artefacto aprobado.'
     }
     $frontend.image = $frontendTag
+    $frontend.ports = @(Get-FrontendBinding (Get-Worker 'backend'))
     $rollbackBackend = $null
     if ($ApplicationOnly) {
         $oldBackend = $workers.backend
@@ -299,7 +345,8 @@ if ($FrontendOnly -or $ApplicationOnly) {
         Invoke-Docker compose -p $project -f $activeFile up -d --no-deps --no-build --pull never --force-recreate frontend
         throw
     }
-    Write-Output "Frontend activo: $frontendTag | rollback: $activeFile"
+    Write-Output "Frontend activo: $frontendTag | puerto: $($frontend.ports[0]) | rollback: $activeFile"
+    if ($rollbackBackend) { Write-Output "Rollback backend: $rollbackBackend" }
     return
 }
 
@@ -359,19 +406,7 @@ if ($ApplicationLive) {
         throw 'El backend debe montar exclusivamente Gold Live en lectura.'
     }
     $hadFrontend = $null -ne $compose.services.PSObject.Properties['frontend']
-    if ($hadFrontend) {
-        $ports = @($compose.services.frontend.ports)
-    } else {
-        $ports = @($backend.ports | ForEach-Object {
-            if ($_ -isnot [string] -or $_ -notmatch '^.+:\d+:\d+$') {
-                throw 'El puerto del backend debe tener una dirección de enlace explícita.'
-            }
-            $_ -replace ':\d+$', ':8080'
-        })
-    }
-    if ($ports.Count -ne 1 -or $ports[0] -notmatch '^127\.0\.0\.1:\d+:8080$') {
-        throw 'El frontend requiere el enlace local que utiliza el proxy de confianza.'
-    }
+    $ports = @(Get-FrontendBinding $workers['backend'])
     $backend.PSObject.Properties.Remove('ports')
     $portIndex = [Array]::IndexOf(@($backend.command), '--port')
     if ($portIndex -lt 0 -or $backend.command[$portIndex+1] -notmatch '^\d{1,5}$') {
