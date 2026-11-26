@@ -4,6 +4,8 @@
   "docker_context": "default",
   "state_root": "C:/ProgramData/FenixIngesta/deployments",
   "input_bind": "C:/DataSharing/Fenix",
+  "frontend_bind_address": "127.0.0.1",
+  "frontend_remote_subnet": null,
   "drain_seconds": 1800,
   "interval_seconds": 600,
   "environments": {
