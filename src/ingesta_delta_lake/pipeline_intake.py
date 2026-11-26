@@ -269,12 +269,48 @@ class Intake:
         query += " ORDER BY producer_time " + ("DESC" if self.lane == "live" else "ASC")
         return tuple(r[0] for r in self.db.execute(query + " LIMIT ?", [*params, limit]))
 
+    @staticmethod
+    def accepted_result(result):
+        return (
+            result.get("status") in {"APPLIED", "NO_CHANGE"}
+            and result.get("complete", True)
+            and not result.get("remaining_versions", 0)
+            and not result.get("publication_error")
+        )
+
+    def slot_receipts(self, family, ids, result):
+        """Project exact owner outcomes into the next immutable Silver pin.
+
+        Use the recent Bronze sequence range, including existing owner receipts.
+        A later capture wins even when the owner has not confirmed it yet.
+        """
+        head = int(self.setting("published_capture_sequence") or 0)
+        # Reaccredit recent accepted inputs from the existing journal on rollout.
+        # Bound the indexed rowid query independently of lifetime input count.
+        rows = self.db.execute(
+            "SELECT i.rowid,i.input_id,i.origin,i.producer_time,i.state,r.result,i.descriptor "
+            "FROM inputs i LEFT JOIN receipts r ON r.receipt_id=i.result "
+            "WHERE i.rowid>? AND i.rowid<=? AND i.family=? ORDER BY i.rowid",
+            (max(0, head - 2048), head, family),
+        )
+        applied = set(ids) if self.accepted_result(result) else set()
+        latest = {}
+        from .common import slot_stamp
+
+        for sequence, identity, origin, stamp, state, receipt, descriptor in rows:
+            slot = slot_stamp(stamp)
+            if slot is None:
+                continue
+            snapshot = json.loads(descriptor)
+            accepted = snapshot["size"] <= 4096 and (
+                identity in applied
+                or (state == "HANDLED" and receipt and self.accepted_result(json.loads(receipt)))
+            )
+            latest[origin, slot] = [sequence, identity, origin, stamp, bool(accepted)]
+        return list(latest.values())
+
     def acknowledge(self, ids, result, *, published_at):
-        if (
-            result.get("status") not in {"APPLIED", "NO_CHANGE"}
-            or not result.get("complete", True)
-            or result.get("remaining_versions", 0)
-        ):
+        if not self.accepted_result(result):
             return
         summary = {
             k: result[k]

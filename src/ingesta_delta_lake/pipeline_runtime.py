@@ -370,6 +370,9 @@ class PipelineWorker:
                     identity=self.identity,
                     family=family,
                     captured_ids=ids,
+                    slot_receipts=intake.slot_receipts(family, ids, result)
+                    if self.lane == "live" and family in {"LISTA_DEFECTOS", "LISTA_RECH", "CONT_ZC"}
+                    else None,
                 )
                 if family == "CONT_ZC":
                     result.setdefault("timing_zc", {})["silver_publish_seconds"] = round(
