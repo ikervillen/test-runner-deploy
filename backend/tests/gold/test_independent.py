@@ -1190,6 +1190,7 @@ def test_late_coverage_publishes_previous_closed_hour_in_real_delta(
     from app.gold.live_hours import retry_closures
     from app.gold.pipeline import run
     from app.gold.publications import Snapshot
+    from app.gold.scoring import has_official_total
 
     from .test_pipeline import CUTOFF, bundle
 
@@ -1230,15 +1231,14 @@ def test_late_coverage_publishes_previous_closed_hour_in_real_delta(
         == "PUBLISHED"
     )
     before = Snapshot.open(published)
-    prior_ids = {r["id_resultado"] for r in before.rows("quality_scores") if r["corte"] == closing}
-    if gap_family == "CONT_ZC":
-        assert not prior_ids
-    else:
-        assert prior_ids
-        assert not any(
-            r["id_resultado"] in prior_ids and r["componente"] == "MIA"
-            for r in before.rows("quality_score_components")
-        )
+    prior = [r for r in before.rows("quality_scores") if r["corte"] == closing]
+    prior_ids = {r["id_resultado"] for r in prior}
+    missing = "ZC" if gap_family == "CONT_ZC" else "MIA"
+    assert prior_ids and all(not has_official_total(row["formula_version"]) for row in prior)
+    assert not any(
+        r["id_resultado"] in prior_ids and r["componente"] == missing
+        for r in before.rows("quality_score_components")
+    )
     older = (closing - timedelta(hours=1), closing) if delay_hours else None
     if older:
         assert not retry_closures(before, coverage, later, 100000)
@@ -1255,7 +1255,7 @@ def test_late_coverage_publishes_previous_closed_hour_in_real_delta(
         assert prior_ids & {
             r["id_resultado"]
             for r in visible.rows("quality_score_components")
-            if r["componente"] == "MIA"
+            if r["componente"] == missing
         }
         assert (
             run(after.root, published, confirmed_input=after, cutoff=later, **options)["status"]

@@ -562,6 +562,7 @@ def _score_job(payload: dict) -> dict:
                 last_discovery=payload["last_discovery"],
                 windows=payload.get("windows"),
                 ar_conflicts=payload.get("ar_conflicts", ()),
+                mia_facts=(fact_rows["mia_inspections"], fact_rows["mia_rejections"]),
                 live_mia="mia_reference" in payload,
                 production_clock=clock,
                 windows_timing=windows_timing,
@@ -657,6 +658,7 @@ def _score_production(
     last_discovery,
     windows=None,
     ar_conflicts=(),
+    mia_facts=(),
     live_mia=False,
     production_clock,
     windows_timing,
@@ -678,7 +680,12 @@ def _score_production(
         try:
             with clock.stage("ar_bases"):
                 a = ar_bases(
-                    tables["ar_intervals"], capacities, w, production=p, conflicts=ar_conflicts
+                    tables["ar_intervals"],
+                    capacities,
+                    w,
+                    production=p,
+                    conflicts=ar_conflicts,
+                    independent=live_mia,
                 )
         except PendingBasis as exc:
             a = None
@@ -691,6 +698,14 @@ def _score_production(
         tables.setdefault("zc_window_bases", []).extend(z)
         with clock.stage("coverage"):
             component_coverage = _component_coverage(snapshot, p, w, pending) if live_mia else None
+            if component_coverage is not None and w.cutoff < w.end:
+                for component, groups in (("MIA", mia_facts), ("ZC", (tables["zc_observations"],))):
+                    if component not in component_coverage and any(
+                        row["periodo_inicio"] < w.cutoff < row["periodo_fin"]
+                        for rows in groups
+                        for row in rows
+                    ):
+                        component_coverage[component] = f"{component}_TRANSITION_SAMPLE_UNRESOLVED"
             ready = live_mia or _coverage_ready(snapshot, p, w, pending)
         if (
             not live_mia

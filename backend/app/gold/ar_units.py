@@ -1,6 +1,7 @@
 """Physical identity for AR exposure; source and attribution rows stay intact."""
 
 from collections import defaultdict
+from itertools import pairwise
 
 from .common import PendingBasis
 
@@ -33,8 +34,8 @@ def episode_key(event, production):
 
 
 def continuity(events, production):
-    """Only join representations of the same episode with one accredited cavity."""
-    detached, physical = set(), defaultdict(set)
+    """Accredit bridges only for a matching episode and while its physical row applies."""
+    detached, physical = set(), defaultdict(list)
     for event in events:
         key = episode_key(event, production)
         if key is None:
@@ -43,30 +44,39 @@ def continuity(events, production):
         if cavity == "99Z":
             detached.add(key)
         elif cavity not in {None, "", "-"}:
-            physical[key].add(cavity)
-    return {
-        key: next(iter(physical[key])) if len(physical[key]) == 1 else None
-        for key in detached
-        if physical[key]
-    }
+            physical[key].append((cavity, event["fecha_on"], event["fecha_off"]))
+    bridges = defaultdict(list)
+    for key in detached:
+        bridges[key[0]].extend(physical.get(key, ()))
+    return bridges
 
 
-def affected_unit(event, production, joined, conflicting_events):
+def affected_intervals(event, production, bridges, conflicting_events, left, right):
     cavity = event["cavidad"]
     if cavity in {None, "", "-"}:
         raise PendingBasis("AR_CAVITY_UNRESOLVED", "AR event has no identified physical cavity")
-    key = (
-        episode_key(event, production) if cavity == "99Z" or joined or conflicting_events else None
-    )
-    if key in conflicting_events or (key in joined and joined[key] is None):
+    key = episode_key(event, production) if cavity == "99Z" or conflicting_events else None
+    if key in conflicting_events:
         raise PendingBasis("AR_MOULD_ATTRIBUTION_PENDING", "Conflicting accredited AR attributions")
-    if cavity == "99Z":
-        if key is None:
-            raise PendingBasis("AR_MOULD_IDENTITY_PENDING", "99Z has no accredited mould identity")
-        return key[0]
-    if key in joined and joined[key] == cavity:
-        return key[0]
-    return ("cavity", cavity)
+    if cavity != "99Z":
+        return [(("cavity", cavity), left, right)]
+    if key is None:
+        raise PendingBasis("AR_MOULD_IDENTITY_PENDING", "99Z has no accredited mould identity")
+    unit = key[0]
+    segments = [
+        (c, max(start, left), min(end or right, right))
+        for c, start, end in bridges.get(unit, ())
+        if start < right and (end is None or end > left)
+    ]
+    breaks = sorted({left, right, *(t for _, start, end in segments for t in (start, end))})
+    result = []
+    for start, end in pairwise(breaks):
+        cavities = {c for c, a, b in segments if a <= start and end <= b}
+        if len(cavities) > 1:
+            raise PendingBasis("AR_MOULD_ATTRIBUTION_PENDING", "One mould has multiple cavities")
+        affected = ("cavity", next(iter(cavities))) if cavities else unit
+        result.append((affected, start, end))
+    return result
 
 
 def record_episode(episodes, event, production):

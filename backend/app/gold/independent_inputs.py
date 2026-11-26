@@ -485,6 +485,8 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
     window = None
     scopes = None
     if lane == "live":
+        doc["ar_unit_rule"] = AR_UNIT_RULE
+        doc["score_config_id"] = score_config_id
         full_families = OPERATIONS - incremental_families
         retained = bool(
             incremental_families and previous and previous.document.get("retained_live")
@@ -578,8 +580,6 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
 
                 doc["ar_categories"] = ar_categories
                 doc["ar_pin"] = ar_pin(doc, silver_refs)
-            doc["ar_unit_rule"] = AR_UNIT_RULE
-            doc["score_config_id"] = score_config_id
             if (published / "current.json").exists():
                 from .live_hours import ar_revisions, retry_closures
                 from .publications import Snapshot
