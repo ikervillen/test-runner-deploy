@@ -170,6 +170,16 @@ def archived_result(settings, publication, result, *, moment=None):
         missing.append("mia_reference_sets")
     if not details["quality_score_components"]:
         missing.append("quality_score_components")
+    from .scoring import has_official_total
+
+    if not has_official_total(score.get("formula_version")):
+        score = {
+            **score,
+            "partial_subtotal": score["total_penalty"],
+            "total_penalty": None,
+            "normalized_score": None,
+            "estado_interpretacion": "partial",
+        }
     return {
         "publication": q.snapshot.publication_id,
         "score": score,

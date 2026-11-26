@@ -115,6 +115,31 @@ def _coverage_ready(snapshot, p, window, pending, required=None):
     return True
 
 
+def _component_coverage(snapshot, production, window, pending):
+    """Use each family's accredited zone, preserving unknown boundary states."""
+    result = {}
+    for component, families, zone, absent_code, coverage_code in (
+        ("MIA", MIA_FAMILIES, "zf", "MIA_NOT_APPLICABLE", "MIA_SOURCE_COVERAGE_PENDING"),
+        ("ZC", {"CONT_ZC"}, "zc", "ZC_NOT_APPLICABLE", "ZC_SOURCE_COVERAGE_PENDING"),
+        ("AR", {"LISTA_AR"}, None, None, "AR_SOURCE_COVERAGE_PENDING"),
+    ):
+        start, cutoff = window.start, window.cutoff
+        if zone:
+            began = production.get(f"fecha_inicio_{zone}")
+            finished = production.get(f"fecha_fin_{zone}")
+            if (began is not None and began >= cutoff) or (
+                finished is not None and finished <= start
+            ):
+                result[component] = absent_code
+                continue
+            start = max(start, began or start)
+            cutoff = min(cutoff, finished or cutoff)
+        effective = Window(window.production_id, window.kind, start, window.end, cutoff)
+        if not _coverage_ready(snapshot, production, effective, pending, families):
+            result[component] = coverage_code
+    return result
+
+
 SCORE_TABLES = (
     "quality_scores",
     "quality_score_components",
@@ -665,13 +690,8 @@ def _score_production(
             z = zc_bases(tables["zc_observations"], w, by_zc[p["id_produccion"]])
         tables.setdefault("zc_window_bases", []).extend(z)
         with clock.stage("coverage"):
-            ready = _coverage_ready(
-                snapshot,
-                p,
-                w,
-                pending,
-                LIVE_FAMILIES - MIA_FAMILIES if live_mia else None,
-            )
+            component_coverage = _component_coverage(snapshot, p, w, pending) if live_mia else None
+            ready = live_mia or _coverage_ready(snapshot, p, w, pending)
         if (
             not live_mia
             and preserve_closed
@@ -682,14 +702,6 @@ def _score_production(
             with clock.stage("preserved_result"):
                 result = _preserved_result(w, previous_scores, old_tables)
         else:
-            with clock.stage("mia_coverage"):
-                mia_ready = not live_mia or _coverage_ready(
-                    snapshot,
-                    p,
-                    w,
-                    pending,
-                    MIA_FAMILIES,
-                )
             with clock.stage("calculate"):
                 result = calculate(
                     w,
@@ -711,7 +723,7 @@ def _score_production(
                     line=p["linea"],
                     ar_pending_reason=ar_pending_reason,
                     live_mia=live_mia,
-                    mia_coverage_ready=mia_ready,
+                    component_coverage=component_coverage,
                 )
         for name, seconds in clock.stages.items():
             production_clock.stages[name] = round(

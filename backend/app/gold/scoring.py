@@ -47,6 +47,14 @@ def validate_config(raw: dict) -> None:
 
 
 LIVE_PARTIAL_MIA_FORMULA = "live-score-mia-pending-v1"
+PARTIAL_FORMULA_PREFIX = "shared-score-partial-v2:"
+SCORE_COMPONENTS = frozenset(("MIA", *SEVERITIES, "DAR", "ZC"))
+
+
+def has_official_total(formula: str | None) -> bool:
+    return not (
+        formula == LIVE_PARTIAL_MIA_FORMULA or (formula or "").startswith(PARTIAL_FORMULA_PREFIX)
+    )
 
 
 def calculate(
@@ -66,32 +74,39 @@ def calculate(
     configuration_status: str = "CONFIRMED",
     live_mia: bool = False,
     mia_coverage_ready: bool = True,
+    component_coverage: dict[str, str] | None = None,
 ) -> ScoreResult:
-    """Pending means no new official total/components, rather than a partial score."""
+    """Evaluate credited components; partial rows carry an explicit membership and status."""
     validate_config(config)
-    pending = []
-    if not coverage_ready:
-        pending.append("SOURCE_COVERAGE_PENDING")
+    independent = component_coverage is not None
+    blockers = component_coverage or {}
+    ar_pending = [blockers["AR"]] if "AR" in blockers else []
+    dar_pending, zc_pending = [], [blockers["ZC"]] if "ZC" in blockers else []
     if not profile_confirmed:
-        pending.append("MODEL_SEGMENT_DAR_PROFILE_PENDING")
-    if ar is None or ar["exposure"]["tiempo_disponible_us"] <= 0:
-        pending.append(ar_pending_reason)
-    if not zc or sum(r["teoricos"] for r in zc) <= 0:
-        pending.append("ZC_THEORETICAL_BASE_MISSING")
+        dar_pending.append("MODEL_SEGMENT_DAR_PROFILE_PENDING")
+    if "AR_NOT_APPLICABLE" not in ar_pending and (
+        ar is None or ar["exposure"]["tiempo_disponible_us"] <= 0
+    ):
+        ar_pending.append(ar_pending_reason)
+    if "ZC_NOT_APPLICABLE" not in zc_pending and (not zc or sum(r["teoricos"] for r in zc) <= 0):
+        zc_pending.append("ZC_THEORETICAL_BASE_MISSING")
     stats = {(r["espacio_defecto"], r["codigo_defecto"]): r for r in reference["values"]}
-    mia_pending = []
-    if mia["exposure"]["inspeccionadas"] <= 0:
+    mia_pending = [blockers["MIA"]] if "MIA" in blockers else []
+    if "MIA_NOT_APPLICABLE" not in mia_pending and mia["exposure"]["inspeccionadas"] <= 0:
         mia_pending.append("LISTA_RECH_BASE_MISSING")
-    if not mia_coverage_ready:
+    if not independent and not mia_coverage_ready:
         mia_pending.append("MIA_SOURCE_COVERAGE_PENDING")
-    for rate in mia["rates"]:
+    for rate in mia["rates"] if "MIA_NOT_APPLICABLE" not in mia_pending else ():
         stat = stats.get((rate["espacio_defecto"], rate["codigo_defecto"]))
         if stat is None or stat["estado"] != "READY":
             mia_pending.append(f"MIA_REFERENCE_PENDING:{rate['codigo_defecto']}")
-    if pending or (mia_pending and not live_mia):
-        return ScoreResult({}, tuple(sorted(set(pending + mia_pending))))
+    pending = ar_pending + dar_pending + zc_pending
+    if not coverage_ready:
+        pending.append("SOURCE_COVERAGE_PENDING")
+    reasons = tuple(sorted(set(pending + mia_pending)))
+    if not independent and (pending or (mia_pending and not live_mia)):
+        return ScoreResult({}, reasons)
     evaluate_mia = not mia_pending
-    assert ar is not None  # A missing capacity basis is reported as pending above.
     score_config = _ScoreConfig(int(config["version"]), config)
     identity = window.identity
     tables: dict[str, list[dict]] = {
@@ -156,94 +171,113 @@ def calculate(
             "MIA", mia_total / max(weight, 1.0), weight, mia["exposure"]["inspected_basis_id"]
         )
         tables["quality_score_components"][-1]["contribucion"] = round(mia_total, 4)
-    available = ar["exposure"]["tiempo_disponible_us"]
-    by = {(r["ambito"], r["codigo_ambito"]): r for r in ar["amounts"]}
-    for category in SEVERITIES:
-        affected = by.get(("CATEGORY", category), {}).get("tiempo_afectado_us", 0)
-        exposure = affected / available * 100
-        limit = float(config["aql"]["category_limits_percent"][category])
-        if limit <= 0:
-            value, ratio = _zero_aql_score(exposure, config["aql"]), None
-        else:
-            ratio = exposure / limit
-            value = _aql_band_score(ratio)
-        weight = float(config["weights"]["categories"][category])
-        component(category, value, weight, ar["exposure"]["capacity_basis_id"])
-        tables["aql_score_details"].append(
+    if ar is not None and not ar_pending:
+        available = ar["exposure"]["tiempo_disponible_us"]
+        by = {(r["ambito"], r["codigo_ambito"]): r for r in ar["amounts"]}
+        for category in SEVERITIES:
+            affected = by.get(("CATEGORY", category), {}).get("tiempo_afectado_us", 0)
+            exposure = affected / available * 100
+            limit = float(config["aql"]["category_limits_percent"][category])
+            if limit <= 0:
+                value, ratio = _zero_aql_score(exposure, config["aql"]), None
+            else:
+                ratio = exposure / limit
+                value = _aql_band_score(ratio)
+            weight = float(config["weights"]["categories"][category])
+            component(category, value, weight, ar["exposure"]["capacity_basis_id"])
+            tables["aql_score_details"].append(
+                {
+                    "id_resultado": identity,
+                    "categoria": category,
+                    "affected_cavity_minutes": round(affected / 60_000_000, 4),
+                    "total_cavity_minutes": round(available / 60_000_000, 4),
+                    "exposure_percent": round(exposure, 4),
+                    "aql_percent": limit,
+                    "ratio": round(ratio, 4) if ratio is not None else None,
+                    "score": round(value, 4),
+                    "peso": weight,
+                    "contribucion": round(value * weight, 4),
+                    "top_defect_code": ar.get("top_defects", {}).get(category),
+                }
+            )
+        if not dar_pending:
+            dar_amount = by.get(("DAR_TOTAL", "DAR"), {}).get("tiempo_afectado_us", 0)
+            dar_value = _dar_score(dar_amount / available * 100, config["dar"])
+            component(
+                "DAR",
+                dar_value,
+                float(config["weights"]["dar"]),
+                ar["exposure"]["capacity_basis_id"],
+            )
+            for r in ar["amounts"]:
+                if r["ambito"] != "DAR_GROUP":
+                    continue
+                affected = r["tiempo_afectado_us"]
+                exposure = affected / available * 100
+                tables["dar_score_details"].append(
+                    {
+                        "id_resultado": identity,
+                        "grupo_id": r["codigo_ambito"],
+                        "eventos": r["eventos"],
+                        "affected_minutes": round(affected / 60_000_000, 4),
+                        "share_percent": round(100 * affected / dar_amount, 4)
+                        if dar_amount
+                        else 0.0,
+                        "exposure_percent": round(exposure, 4),
+                        "score": round(_dar_score(exposure, config["dar"]), 4),
+                        "threshold_rule_id": config_id,
+                    }
+                )
+    if not zc_pending:
+        actual = sum(r["rueda"] for r in zc) / sum(r["teoricos"] for r in zc) * 100
+        targets = config["zc"]["target_percent"]
+        target = float(targets.get("by_line", {}).get(line, targets["default"]))
+        value = min(10.0, max(0.0, target - actual) / float(config["zc"]["penalty_divisor_points"]))
+        weight = float(config["weights"]["zc"])
+        component("ZC", value, weight, zc[0]["id_base_zc"])
+        tables["zc_score_details"].append(
             {
                 "id_resultado": identity,
-                "categoria": category,
-                "affected_cavity_minutes": round(affected / 60_000_000, 4),
-                "total_cavity_minutes": round(available / 60_000_000, 4),
-                "exposure_percent": round(exposure, 4),
-                "aql_percent": limit,
-                "ratio": round(ratio, 4) if ratio is not None else None,
+                "target_percent": target,
+                "actual_percent": round(actual, 4),
+                "loss_points": round(max(0.0, target - actual), 4),
                 "score": round(value, 4),
                 "peso": weight,
                 "contribucion": round(value * weight, 4),
-                "top_defect_code": ar.get("top_defects", {}).get(category),
+                "muestras": sum(r["muestras"] for r in zc),
+                "basis_reference": zc[0]["id_base_zc"],
             }
         )
-    dar_amount = by.get(("DAR_TOTAL", "DAR"), {}).get("tiempo_afectado_us", 0)
-    dar_value = _dar_score(dar_amount / available * 100, config["dar"])
-    component(
-        "DAR", dar_value, float(config["weights"]["dar"]), ar["exposure"]["capacity_basis_id"]
-    )
-    for r in ar["amounts"]:
-        if r["ambito"] != "DAR_GROUP":
-            continue
-        affected = r["tiempo_afectado_us"]
-        exposure = affected / available * 100
-        tables["dar_score_details"].append(
-            {
-                "id_resultado": identity,
-                "grupo_id": r["codigo_ambito"],
-                "eventos": r["eventos"],
-                "affected_minutes": round(affected / 60_000_000, 4),
-                "share_percent": round(100 * affected / dar_amount, 4) if dar_amount else 0.0,
-                "exposure_percent": round(exposure, 4),
-                "score": round(_dar_score(exposure, config["dar"]), 4),
-                "threshold_rule_id": config_id,
-            }
-        )
-    actual = sum(r["rueda"] for r in zc) / sum(r["teoricos"] for r in zc) * 100
-    targets = config["zc"]["target_percent"]
-    target = float(targets.get("by_line", {}).get(line, targets["default"]))
-    value = min(10.0, max(0.0, target - actual) / float(config["zc"]["penalty_divisor_points"]))
-    weight = float(config["weights"]["zc"])
-    component("ZC", value, weight, zc[0]["id_base_zc"])
-    tables["zc_score_details"].append(
-        {
-            "id_resultado": identity,
-            "target_percent": target,
-            "actual_percent": round(actual, 4),
-            "loss_points": round(max(0.0, target - actual), 4),
-            "score": round(value, 4),
-            "peso": weight,
-            "contribucion": round(value * weight, 4),
-            "muestras": sum(r["muestras"] for r in zc),
-            "basis_reference": zc[0]["id_base_zc"],
-        }
-    )
     total = round(sum(r["contribucion"] for r in tables["quality_score_components"]), 4)
     weight = round(sum(r["peso"] for r in tables["quality_score_components"]), 4)
-    if weight <= 0:
+    if not tables["quality_score_components"]:
+        return ScoreResult({}, reasons or ("NO_EVALUABLE_WEIGHT",))
+    if weight <= 0 and not (independent and reasons):
         return ScoreResult({}, ("NO_EVALUABLE_WEIGHT",))
+    partial = independent and bool(reasons)
+    formula = (
+        PARTIAL_FORMULA_PREFIX
+        + ",".join(sorted(r["componente"] for r in tables["quality_score_components"]))
+        if partial
+        else "shared-score-math-v1"
+        if evaluate_mia
+        else LIVE_PARTIAL_MIA_FORMULA
+    )
     tables["quality_scores"].append(
         {
             "id_resultado": identity,
             **window.key,
             "config_id": config_id,
-            "formula_version": "shared-score-math-v1" if evaluate_mia else LIVE_PARTIAL_MIA_FORMULA,
+            "formula_version": formula,
             "reference_id": reference["sets"][0]["reference_id"]
             if evaluate_mia and reference["sets"]
             else None,
             "total_penalty": total,
             "normalized_score": round(total / weight, 4) if weight else 0.0,
             "evaluated_weight": weight,
-            "estado_interpretacion": _status(total, score_config),
+            "estado_interpretacion": "partial" if partial else _status(total, score_config),
             "fecha_calculo": calculation_time,
             "configuration_status": configuration_status,
         }
     )
-    return ScoreResult(tables, tuple(sorted(set(mia_pending))))
+    return ScoreResult(tables, reasons)
