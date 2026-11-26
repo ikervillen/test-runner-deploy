@@ -389,6 +389,18 @@ export function LiveView({ historyOnly = false }: { historyOnly?: boolean }) {
       {view &&
         !historyOnly &&
         positions.map(([line, machine, label]) => {
+          const active = view.active_productions?.find(
+            (item) => item.line === line && item.machine === machine,
+          );
+          const modelLabel = view.stale
+            ? "Modelo sin actualizar"
+            : active?.state === "ambiguous"
+              ? "Producción sin confirmar"
+              : active?.model
+                ? `Modelo ${active.model}`
+                : active || !view.active_productions
+                  ? "Modelo no disponible"
+                  : "Sin producción activa acreditada";
           const rows = view.hours.map((hour) =>
             hour.state === "open"
               ? []
@@ -417,9 +429,17 @@ export function LiveView({ historyOnly = false }: { historyOnly?: boolean }) {
               className="border-b border-[#dce4e0] py-5"
             >
               <div className="mb-3 flex items-baseline justify-between gap-3">
-                <h2 className="text-4xl font-semibold tracking-tight md:text-[44px]">
-                  {label}
-                  <span className="sr-only"> · Máquina {machine}</span>
+                <h2 className="flex min-w-0 items-baseline gap-3">
+                  <span className="shrink-0 text-4xl font-semibold tracking-tight md:text-[44px]">
+                    {label}
+                  </span>
+                  <span
+                    className="truncate text-sm font-medium text-[#496357] md:text-base"
+                    title={modelLabel}
+                  >
+                    {modelLabel}
+                  </span>
+                  <span className="sr-only">Máquina {machine}</span>
                 </h2>
                 <p
                   className="text-4xl font-semibold tabular-nums md:text-[44px]"
@@ -431,6 +451,16 @@ export function LiveView({ historyOnly = false }: { historyOnly?: boolean }) {
                     Penalización total publicada:{" "}
                   </span>
                   {headline ? number.format(headline.total_penalty!) : "—"}
+                  {headline?.model &&
+                    active?.production &&
+                    headline.production !== active.production && (
+                      <span
+                        className="ml-2 inline-block max-w-32 truncate align-middle text-xs font-medium"
+                        title={`Score del modelo ${headline.model}`}
+                      >
+                        Modelo {headline.model}
+                      </span>
+                    )}
                   {headline && (
                     <span className="sr-only">
                       {" "}

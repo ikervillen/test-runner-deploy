@@ -46,6 +46,14 @@ export type LiveScores = {
   published_at: string;
   stale: boolean;
   mia_provisional: boolean;
+  active_productions?: {
+    line: string;
+    machine: number;
+    state: "active" | "ambiguous" | "unavailable";
+    production: string | null;
+    model: string | null;
+    start: string | null;
+  }[];
   hours: { start: string; end: string; state: string; results: LiveResult[] }[];
 };
 
