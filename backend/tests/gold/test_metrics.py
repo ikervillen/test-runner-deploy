@@ -101,6 +101,82 @@ def test_overlap_is_union_and_closure_recalculates_without_extra_event():
     assert len(rows) == 2
 
 
+@pytest.mark.parametrize("origin", ["AV31", "AV32"])
+def test_detached_moulds_count_by_episode_and_keep_the_capacity(origin):
+    production = {"planta": "AIALA", "origen_fenix": origin, "codigo_modelo_botella": "2939/577"}
+    detached = {
+        **event(START, None),
+        "origen_fenix": origin,
+        "zona": "ZF",
+        "codigo_defecto": "331",
+        "cavidad": "99Z",
+    }
+    rows = [{**detached, "molde": m} for m in (3, 11, 20)]
+    rows[-1] = {**rows[-1], "codigo_defecto": "255", "grupo_dar": None}
+    rows.append({**rows[0], "fecha_on": START + timedelta(minutes=15), "grupo_dar": "other"})
+    result = ar_bases(rows, capacity(), window(), production=production)
+    minutes = {
+        (r["ambito"], r["codigo_ambito"]): r["tiempo_afectado_us"] / 60_000_000
+        for r in result["amounts"]
+    }
+    assert result["exposure"]["tiempo_disponible_us"] == 1440 * 60_000_000
+    assert minutes == {
+        ("CATEGORY", "Grave"): 180,
+        ("DAR_GROUP", "ovalizacion"): 120,
+        ("DAR_GROUP", "other"): 45,
+        ("DAR_TOTAL", "DAR"): 120,
+    }
+    assert (
+        ar_bases(rows[:2], capacity(), window(), production=production)["amounts"][0][
+            "tiempo_afectado_us"
+        ]
+        == 120 * 60_000_000
+    )
+
+
+@pytest.mark.parametrize(
+    ("cavity", "reason"),
+    [
+        (None, "AR_CAVITY_UNRESOLVED"),
+        ("", "AR_CAVITY_UNRESOLVED"),
+        ("-", "AR_CAVITY_UNRESOLVED"),
+        ("99Z", "AR_MOULD_IDENTITY_PENDING"),
+    ],
+)
+def test_missing_ar_identity_remains_pending(cavity, reason):
+    with pytest.raises(IntegrityError) as error:
+        ar_bases([{**event(START, None), "cavidad": cavity}], capacity(), window())
+    assert error.value.code == reason
+
+
+def test_accredited_cavity_change_and_conflicting_tandem_assignment():
+    from app.gold.ar_units import conflicts, record_episode
+
+    production = {"planta": "AIALA", "origen_fenix": "AV31", "codigo_modelo_botella": "2939/577"}
+    detached = {
+        **event(START, START + timedelta(minutes=30)),
+        "origen_fenix": "AV31",
+        "zona": "ZF",
+        "codigo_defecto": "331",
+        "cavidad": "99Z",
+        "molde": 3,
+    }
+    physical = {**detached, "cavidad": "1A", "fecha_off": START + timedelta(minutes=45)}
+    result = ar_bases([detached, physical], capacity(), window(), production=production)
+    assert result["amounts"][0]["tiempo_afectado_us"] == 45 * 60_000_000
+    other = {**detached, "id_produccion": "q"}
+    episodes = {}
+    record_episode(episodes, detached, production)
+    record_episode(episodes, other, {**production, "codigo_modelo_botella": "1358/242"})
+    assert not conflicts(episodes)
+    record_episode(episodes, other, production)
+    with pytest.raises(IntegrityError) as error:
+        ar_bases(
+            [detached], capacity(), window(), production=production, conflicts=conflicts(episodes)
+        )
+    assert error.value.code == "AR_MOULD_ATTRIBUTION_PENDING"
+
+
 def test_capacity_gap_is_pending_not_inferred_from_mia():
     rows = capacity()
     rows[0]["vigente_desde"] = START + timedelta(minutes=1)
