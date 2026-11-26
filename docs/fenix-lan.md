@@ -44,7 +44,7 @@ $site | Add-Member -NotePropertyName frontend_remote_subnet -NotePropertyValue $
 
 ## Validación y reversión
 
-El workflow de la integración contiene una activación acotada a la aplicación. Se ejecuta tras integrar en `develop` desde la base revisada, con un mensaje que incluya `Fenix LAN and active production models`. Si la base de `develop` cambia, revisa el disparador antes de la integración. Conserva el Compose anterior del frontend y del backend que imprime el job.
+El workflow de la integración contiene una activación acotada a la aplicación. Se ejecuta tras integrar en `develop` desde la base revisada, con un mensaje que incluya `Fenix LAN and active production models`. Si la configuración de red se prepara más tarde, ejecuta `Independent pipelines validation` desde `develop` con `rollout_application` activado. Conserva el Compose anterior del frontend y del backend que imprime el job.
 
 Ejecutar en el servidor y repetir desde un equipo autorizado con la misma IP.
 
