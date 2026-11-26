@@ -10,10 +10,24 @@ import pyarrow.dataset as ds
 from .attribution import ACCEPTED, source_id
 from .common import IntegrityError, digest
 from .evidence import Evidence
-from .lanes import _clip, hour_holding
+from .lanes import _clip, canonical_hour, hour_holding
 from .metrics import Window
 
 RETRY_REASONS = {"SOURCE_COVERAGE_PENDING", "MIA_SOURCE_COVERAGE_PENDING"}
+AR_REVIEW_REASONS = {
+    "AR_CAVITY_UNRESOLVED",
+    "AR_MOULD_IDENTITY_PENDING",
+    "AR_MOULD_ATTRIBUTION_PENDING",
+    "AR_CATEGORY_UNRESOLVED",
+    "AR_CATALOG_UNRESOLVED",
+    "AR_ZONE_UNRESOLVED",
+    "MODEL_SEGMENT_DAR_PROFILE_PENDING",
+    "CAPACITY_COVERAGE_GAP",
+}
+COMPONENT_COVERAGE_REASONS = {
+    "AR_SOURCE_COVERAGE_PENDING": {"LISTA_AR"},
+    "ZC_SOURCE_COVERAGE_PENDING": {"CONT_ZC"},
+}
 
 
 def retry_closures(
@@ -62,6 +76,26 @@ def retry_closures(
             max_rows=budget,
         )
     }
+    contextual = [p for p in by_id.values() if p.get("fecha_inicio_zf") is not None]
+    if contextual:
+        origins = sorted({p["origen_fenix"] for p in contextual})
+        peers = previous.rows(
+            "productions",
+            expression=(
+                field("origen_fenix").cast("string").isin(origins)
+                & (field("fecha_inicio_zf") < upper + timedelta(hours=1))
+                & (field("fecha_fin_zf").is_null() | (field("fecha_fin_zf") > lowest))
+            ),
+            file_pruning_predicate=[("origen_fenix", "in", origins)],
+            max_rows=budget,
+        )
+    else:
+        peers = []
+
+    @cache
+    def owners(start, end):
+        return canonical_hour(peers, start, end)[0]
+
     probe = SimpleNamespace(manifest={"coverage": coverage})
     result = []
     for row in sorted(rows, key=lambda r: (r["period_start"], r["scope_id"])):
@@ -70,6 +104,8 @@ def retry_closures(
             continue
         production = by_id[identity]
         right = left + timedelta(hours=1)
+        if production.get("fecha_inicio_zf") is not None and identity not in owners(left, right):
+            continue
         chunk = _clip(production, left, right, right)
         if chunk is None or chunk.cutoff > cutoff:
             continue
@@ -77,17 +113,23 @@ def retry_closures(
         if row["scope_id"] != window.identity:
             continue
         reasons = set((row.get("reason_code") or "").split(";"))
-        if older and not reasons & RETRY_REASONS:
+        coverage_reasons = reasons & (RETRY_REASONS | COMPONENT_COVERAGE_REASONS.keys())
+        if older and not (coverage_reasons or (ar_changed and reasons & AR_REVIEW_REASONS)):
             continue
         revised = ar_changed(row, window) if ar_changed else False
-        if not revised and row["period_end"] == chunk.cutoff and not reasons & RETRY_REASONS:
+        if not revised and row["period_end"] == chunk.cutoff and not coverage_reasons:
             if closed is not None and row["estado"] == "READY":
                 closed.append(window.identity)
             continue
         if prepare is not None:
             prepare(window.start, window.cutoff, origin=production["origen_fenix"])
+        required = LIVE_FAMILIES
+        if coverage_reasons and not reasons & RETRY_REASONS:
+            required = set().union(*(COMPONENT_COVERAGE_REASONS[r] for r in coverage_reasons))
+        elif revised and not coverage_reasons:
+            required = {"LISTA_AR"}
         if (older or ar_changed or len(result) < 12) and _coverage_ready(
-            probe, production, window, [], LIVE_FAMILIES
+            probe, production, window, [], required
         ):
             result.append([identity, left.isoformat(), right.isoformat(), chunk.cutoff.isoformat()])
         elif revised:
@@ -126,7 +168,7 @@ def ar_pin(document, silver_refs):
 
 def _ar_by_production(rows, decisions):
     assigned = {
-        d["source_id"]: d["productions"][0]
+        d["source_id"]: d
         for d in decisions
         if d["source_family"] == "LISTA_AR"
         and d["status"] in ACCEPTED
@@ -137,24 +179,35 @@ def _ar_by_production(rows, decisions):
     for row in rows:
         key = source_id("LISTA_AR", row)
         if key in assigned:
-            result[assigned[key]].append((key, row))
+            decision = assigned[key]
+            result[decision["productions"][0]].append((key, row, decision))
     return result
 
 
-def _ar_window(rows, categories, window):
+def _ar_window(rows, categories, window, rule=None):
     relevant = []
-    for key, row in rows:
+    for key, row, decision in rows:
         left = max(window.start, row["FECHA_ON"])
         right = min(window.cutoff, row["FECHA_OFF"] or window.cutoff)
         if left < right:
-            relevant.append((key, left, right, categories.get(str(row["COD_AR"]))))
+            relevant.append(
+                (
+                    key,
+                    left,
+                    right,
+                    categories.get(str(row["COD_AR"])),
+                    decision.get("zone"),
+                    decision.get("assignment_id"),
+                    rule if row["CAVIDAD"] == "99Z" else None,
+                )
+            )
     return sorted(relevant)
 
 
-def ar_revisions(root, visible, document, current, cutoff, budget):
+def ar_revisions(root, visible, document, current, cutoff, budget, *, bounds=None):
     """Compare a score with its own immutable inputs, including moves and deletions."""
     low = hour_holding(cutoff)[0] - timedelta(hours=7)
-    plan_bounds = (low, cutoff)
+    plan_bounds = bounds or (low, cutoff)
     legacy_categories = document.get("legacy_ar_categories")
     if legacy_categories is None:
         legacy_categories = {
@@ -167,11 +220,11 @@ def ar_revisions(root, visible, document, current, cutoff, budget):
         }
         document["legacy_ar_categories"] = legacy_categories
     work = 0
-    baseline = document.pop("ar_window_cache", {})
-    remembered = {}
-    document["ar_window_cache"] = remembered
-    revisions = {}
-    document["ar_scope_changes"] = revisions
+    baseline = document.get("ar_window_cache", {})
+    remembered = {} if bounds is None else None
+    if remembered is not None:
+        document["ar_window_cache"] = remembered
+    revisions = document.setdefault("ar_scope_changes", {})
 
     @cache
     def inputs(identity):
@@ -201,22 +254,40 @@ def ar_revisions(root, visible, document, current, cutoff, budget):
 
     def changed(scope, window):
         identity = scope.get("evidence_reference")
-        key = digest([window.identity, window.cutoff, identity])
+        if not identity:
+            return False
+        key = digest(["ar-window-v2", window.identity, window.cutoff, identity])
         before = baseline.get(key)
         if before is None:
-            prior = inputs(identity)
+            try:
+                prior = inputs(identity)
+            except (FileNotFoundError, IntegrityError):
+                return False
+            pinned_config = prior.document.get("score_config_id")
+            if (bounds and not pinned_config) or (
+                pinned_config and pinned_config != document.get("score_config_id")
+            ):
+                return False
             pinned = prior.document.get("ar_categories", legacy_categories)
+            old_rule = prior.document.get("ar_unit_rule")
             if (
                 prior.document.get("ar_pin") == document["ar_pin"]
                 and pinned == document["ar_categories"]
+                and old_rule == document.get("ar_unit_rule")
             ):
                 return False
             before = digest(
-                _ar_window(old_assignments(identity)[window.production_id], pinned, window)
+                _ar_window(
+                    old_assignments(identity)[window.production_id], pinned, window, old_rule
+                )
             )
-        remembered[key] = before
+        if remembered is not None:
+            remembered[key] = before
         after = _ar_window(
-            current_assignments()[window.production_id], document["ar_categories"], window
+            current_assignments()[window.production_id],
+            document["ar_categories"],
+            window,
+            document.get("ar_unit_rule"),
         )
         fingerprint = digest(after)
         if before == fingerprint:

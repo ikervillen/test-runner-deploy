@@ -10,6 +10,7 @@ from json import loads
 import pyarrow as pa
 
 from . import fragment_delta, scoped_reconciliation
+from .ar_units import AR_UNIT_RULE
 from .common import IntegrityError, digest
 from .evidence import OPERATIONS, attribution, operational_expression, registry, save
 from .lanes import hour_holding
@@ -102,7 +103,7 @@ def auxiliary_turn(pipelines, lane, *, encoding):
     )
 
 
-def export(pipelines, lane, config, *, ar_categories=None):
+def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None):
     """Never reads foreign SQLite, changes a foreign pointer, or acquires its locks."""
     from ingesta_delta_lake import associations as native
     from ingesta_delta_lake.contracts import CONTRACTS
@@ -181,6 +182,8 @@ def export(pipelines, lane, config, *, ar_categories=None):
             lane != "live"
             or (
                 previous.document.get("coverage_rule") == COVERAGE_RULE
+                and previous.document.get("ar_unit_rule") == AR_UNIT_RULE
+                and previous.document.get("score_config_id") == score_config_id
                 and previous.document.get("receipt_cursor", slot_cursor) >= slot_cursor
                 and bool(previous.document.get("receipt_frozen")) == (active is not None)
                 and "series_handover_scopes" in previous.document
@@ -575,6 +578,8 @@ def export(pipelines, lane, config, *, ar_categories=None):
 
                 doc["ar_categories"] = ar_categories
                 doc["ar_pin"] = ar_pin(doc, silver_refs)
+            doc["ar_unit_rule"] = AR_UNIT_RULE
+            doc["score_config_id"] = score_config_id
             if (published / "current.json").exists():
                 from .live_hours import ar_revisions, retry_closures
                 from .publications import Snapshot
@@ -587,10 +592,10 @@ def export(pipelines, lane, config, *, ar_categories=None):
                     if "legacy_ar_categories" in review:
                         doc["legacy_ar_categories"] = review["legacy_ar_categories"]
                     doc["ar_window_cache"] = review.get("ar_window_cache", {})
-                    # Only compare on a changed dependency, or to drain a bounded backlog.
                     if (
                         review.get("ar_pin") != doc["ar_pin"]
                         or review.get("ar_categories") != ar_categories
+                        or review.get("ar_unit_rule") != AR_UNIT_RULE
                         or review.get("more_hourly_revisions")
                         or review.get("ar_review_waiting")
                     ):
@@ -675,12 +680,26 @@ def export(pipelines, lane, config, *, ar_categories=None):
                         upper = fence
                     lower = max(first_hour, upper - timedelta(hours=4))
                     if lower < upper:
+                        older_changed = (
+                            ar_revisions(
+                                storage.gold,
+                                visible,
+                                doc,
+                                current_ar,
+                                horizon,
+                                policy.read_max_rows,
+                                bounds=(lower, upper),
+                            )
+                            if changed is not None
+                            else None
+                        )
                         old = retry_closures(
                             visible,
                             coverage,
                             horizon,
                             policy.read_max_rows,
                             older=(lower, upper),
+                            ar_changed=older_changed,
                             prepare=observed.prepare,
                         )
                         # Old work has its own small allocation after the current hour.

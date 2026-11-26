@@ -102,6 +102,25 @@ def test_older_published_partial_with_coverage_reason_is_retried_once():
     assert not retry_closures(snapshot, coverage, later, 100, older=bounds)
 
 
+def test_older_ar_waits_for_a_changed_dependency_and_retains_the_original_cut():
+    original = START + timedelta(minutes=27, seconds=42)
+    snapshot = FixtureSnapshot(
+        {
+            "productions": [prod("outgoing", original)],
+            "publication_scope_status": [scope("outgoing", original, "AR_CAVITY_UNRESOLVED")],
+        }
+    )
+    later = END + timedelta(hours=9)
+    coverage = [dict(source="LISTA_AR", origin="AV31", estado="READY")]
+    options = {"older": (START, END)}
+    assert not retry_closures(
+        snapshot, coverage, later, 100, ar_changed=lambda *_: False, **options
+    )
+    assert retry_closures(
+        snapshot, coverage, later, 100, ar_changed=lambda *_: True, **options
+    ) == [["outgoing", START.isoformat(), END.isoformat(), original.isoformat()]]
+
+
 def test_open_hour_has_no_score_and_zero_survives_for_closed_result():
     current = Window("p", "HOUR", END, END + timedelta(hours=1), LATER)
     closed = Window("p", "HOUR", START, END, END)

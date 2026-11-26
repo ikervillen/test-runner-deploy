@@ -237,6 +237,7 @@ class Worker:
             self.lane,
             self.source,
             ar_categories=self.catalogs["defect_categories"] if self.lane == "live" else None,
+            score_config_id=digest([self.score, self.catalogs]) if self.lane == "live" else None,
         )
         began_publish = monotonic()
         result = self.publish(

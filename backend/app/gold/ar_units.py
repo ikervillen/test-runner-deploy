@@ -4,6 +4,8 @@ from collections import defaultdict
 
 from .common import PendingBasis
 
+AR_UNIT_RULE = "fenix-99z-by-mould-v1"
+
 
 def mould_unit(event, production):
     plant = production.get("planta")
