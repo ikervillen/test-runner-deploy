@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 
-from app.gold.lanes import plan
+from app.gold.lanes import canonical_hour, current_slot, plan
 from app.gold.publications import chunk_delete_predicate
 
 FAMILIES = ("LISTA_DEFECTOS", "LISTA_RECH", "LISTA_AR", "CONT_ZC")
@@ -28,6 +28,39 @@ def _production(identity: str, start: datetime, end: datetime | None = None) -> 
         "fecha_inicio_operativo_zc": start,
         "fecha_fin_zf": end,
     }
+
+
+def test_zf_owner_keeps_the_closing_hour_and_other_production_keeps_its_facts():
+    six = datetime(2026, 11, 26, 6)
+    handover = six + timedelta(hours=1, minutes=27, seconds=42)
+    old = {
+        **_production("1649", six - timedelta(days=1), handover),
+        "fecha_inicio_zf": six - timedelta(days=1),
+        "id_maquina_fenix": 8,
+    }
+    new = {
+        **_production("1651", six + timedelta(minutes=10)),
+        "fecha_inicio_zf": handover,
+        "id_maquina_fenix": 8,
+    }
+    seven, eight, nine = (six + timedelta(hours=i) for i in (1, 2, 3))
+    for end, scored, expected_cutoff in (
+        (seven, "1649", seven),
+        (eight, "1649", handover),
+        (nine, "1651", nine),
+    ):
+        chunks = current_slot([new, old], end, 600)
+        assert [(c.production_id, c.cutoff) for c in chunks if not c.facts_only] == [
+            (scored, expected_cutoff)
+        ]
+        assert set(canonical_hour([new, old], end - timedelta(hours=1), end)[0]) == {scored}
+        if end == eight:
+            assert any(c.production_id == "1651" and c.facts_only for c in chunks)
+    middle = dict(new, fecha_fin_zf=handover + timedelta(minutes=4))
+    third = dict(new, id_produccion="1652", fecha_inicio_zf=middle["fecha_fin_zf"])
+    owners, ambiguous = canonical_hour([old, middle, third], seven, eight)
+    assert not owners and ambiguous
+    assert all(c.facts_only for c in current_slot([old, middle, third], eight, 600))
 
 
 def test_live_writes_only_the_open_hour_and_history_the_hour_before_the_slot():
