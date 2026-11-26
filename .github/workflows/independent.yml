@@ -15,8 +15,8 @@ permissions:
   contents: read
 
 env:
-  FRONTEND_CONTEXT_COMMIT: cb7e0f4a514a52c16761127285b029f2c72666b8
-  GOLD_CONTEXT_COMMIT: cb7e0f4a514a52c16761127285b029f2c72666b8
+  FRONTEND_CONTEXT_COMMIT: a1b9df74927d99a942a54ba0d1d2ed72aae76bcc
+  GOLD_CONTEXT_COMMIT: a1b9df74927d99a942a54ba0d1d2ed72aae76bcc
   GOLD_SOURCE_COMMIT: ad88dc3d0bdedfbc4da3de06da74e3801b9b64f7
 
 jobs:
@@ -157,14 +157,14 @@ jobs:
             --read-only --tmpfs /etc/nginx/conf.d --tmpfs /var/cache/nginx --tmpfs /var/run \
             -e BACKEND_PORT=8011 -e NGINX_ENVSUBST_TEMPLATE_DIR=/opt/fenix/templates \
             "fenix-quality:sha-$GITHUB_SHA" nginx -t
-      - name: Prepare the application-only rollout
+      - name: Prepare the tested Live rollout
         id: bundle
-        # One-shot rollout after integrating the reviewed application PR.
+        # Activate the integrated stack once, after all validation jobs pass.
         if: |
           github.repository == 'ikervillen/test-runner-deploy' && github.ref == 'refs/heads/develop' &&
           github.run_attempt == '1' &&
           ((github.event_name == 'push' && github.event.before == 'aad276c868863c8d77271aefae194a423d283f5d' &&
-            contains(github.event.head_commit.message, 'Fenix LAN and active production models')) ||
+            github.event.head_commit.message == 'Deploy integrated Fenix Live AR and coverage') ||
            (github.event_name == 'workflow_dispatch' && inputs.rollout_application))
         run: |
           set -euo pipefail
@@ -246,7 +246,7 @@ jobs:
           pattern: live-image-*
           path: ${{ runner.temp }}/fenix-image-${{ github.run_id }}-${{ github.run_attempt }}
           merge-multiple: true
-      - name: Deploy only the frontend and backend
+      - name: Deploy the compatible Live services
         shell: powershell
         env:
           FENIX_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
@@ -255,7 +255,12 @@ jobs:
         run: |
           $bundle = Join-Path $env:RUNNER_TEMP "fenix-image-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           try {
-            ./scripts/update_independent_workers.ps1 -ApplicationOnly -Bundle $bundle `
+            $mode = if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+              @{ ApplicationOnly = $true }
+            } else {
+              @{ ApplicationLive = $true; IncludeIngestion = $true }
+            }
+            ./scripts/update_independent_workers.ps1 @mode -Bundle $bundle `
               -Image $env:IMAGE -Revision $env:GITHUB_SHA -GoldRevision $env:GOLD_CONTEXT_COMMIT
           } finally {
             Remove-Item -LiteralPath (Join-Path $bundle 'image.tar.gz'), (Join-Path $bundle 'image.json') -ErrorAction SilentlyContinue

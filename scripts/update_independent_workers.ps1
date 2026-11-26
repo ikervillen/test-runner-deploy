@@ -6,6 +6,7 @@ param(
     [switch]$LiveFlowOnly,
     [switch]$FreshLive,
     [switch]$ApplicationLive,
+    [switch]$IncludeIngestion,
     [switch]$FrontendOnly,
     [switch]$ApplicationOnly,
     [switch]$GoldOnly,
@@ -25,6 +26,7 @@ $context = if ($hasSite) { $site.docker_context } else { $env:FENIX_DOCKER_CONTE
 if (-not $context) { throw 'No se ha configurado el contexto Docker.' }
 $project = $profile.project
 if ($FreshLive -and -not $LiveFlowOnly) { throw 'FreshLive requiere LiveFlowOnly.' }
+if ($IncludeIngestion -and -not $ApplicationLive) { throw 'IncludeIngestion requiere ApplicationLive.' }
 if ($FrontendOnly -or $ApplicationOnly) {
     if (($FrontendOnly -and $ApplicationOnly) -or $ApplicationLive -or $LiveFlowOnly -or $GoldOnly -or $IncludeGoldHistory -or $IncludeBackend -or $Immediate) {
         throw 'El despliegue de la aplicación no admite opciones de workers.'
@@ -36,6 +38,7 @@ if ($FrontendOnly -or $ApplicationOnly) {
         throw 'ApplicationLive conserva la generación Live existente.'
     }
     $services = @('gold-live', 'backend')
+    if ($IncludeIngestion) { $services += 'ingesta-live' }
 } elseif ($LiveFlowOnly) {
     if ($GoldOnly -or $IncludeGoldHistory -or $IncludeBackend -or $Immediate) {
         throw 'LiveFlowOnly configura el flujo completo y detiene History con drenaje.'
@@ -192,6 +195,7 @@ if (-not $activeFile -or -not (Test-Path -LiteralPath $activeFile -PathType Leaf
 $compose = Get-Content -LiteralPath $activeFile -Raw | ConvertFrom-Json
 if ($compose.name -cne $project) { throw 'El Compose activo pertenece a otro proyecto.' }
 Write-Output "Compose base: $activeFile"
+$previousServices = @{}
 $tag = "fenix-independent:sha-$Revision"
 if ($FreshLive -and @($services | Where-Object { -not $workers[$_] }).Count) {
     throw 'La generación limpia requiere un Compose anterior verificable para rollback.'
@@ -252,6 +256,18 @@ foreach ($service in $services) {
     $ownId = (Invoke-Docker image inspect $ownCompose.services.$service.image --format '{{.Id}}') -join ''
     if ($ownCompose.name -cne $project -or $ownId -cne $workers[$service].Image) {
         throw "La imagen actual de $service difiere de su Compose."
+    }
+    if ($ApplicationLive) {
+        $previousServices[$service] = @{ compose = $serviceFile; image = $ownId }
+        $definition = $ownCompose.services.$service
+        $compose.services.PSObject.Properties[$service].Value = $definition
+        $expected = @($definition.volumes | Where-Object type -eq 'volume' | ForEach-Object {
+            $volume = $ownCompose.volumes.($_.source).name
+            if ($volume -cne $compose.volumes.($_.source).name) {
+                throw "El Compose de $service pertenece a otra generación."
+            }
+            "${volume}:$($_.target)"
+        } | Sort-Object)
     }
     $mounted = @($workers[$service].Mounts | Where-Object { $_.Type -eq 'volume' } | ForEach-Object {
         "$($_.Name):$($_.Destination)"
@@ -390,6 +406,9 @@ if ($ApplicationLive) {
     if ($t0.Count -ne 1 -or $workers['backend'].Config.Env -cnotcontains $t0[0]) {
         throw 'Gold y el backend deben pertenecer a la misma generación Live.'
     }
+    if ($IncludeIngestion -and $workers['ingesta-live'].Config.Env -cnotcontains $t0[0]) {
+        throw 'Ingesta no pertenece a la misma generación Live.'
+    }
     $frontendTag = "fenix-quality:sha-$Revision"
     $frontendId = (Invoke-Docker image inspect $frontendTag --format '{{.Id}}') -join ''
     if ($frontendId -cne $proof.frontend_id -or $frontendId -cnotmatch '^sha256:[a-f0-9]{64}$') {
@@ -405,7 +424,17 @@ if ($ApplicationLive) {
     }).Count) {
         throw 'El backend debe montar exclusivamente Gold Live en lectura.'
     }
-    $hadFrontend = $null -ne $compose.services.PSObject.Properties['frontend']
+    $oldFrontend = Get-Worker 'frontend' -AllowMissing
+    $hadFrontend = $null -ne $oldFrontend
+    if ($hadFrontend) {
+        $oldFrontendFile = $oldFrontend.Config.Labels.'com.docker.compose.project.config_files'
+        $oldFrontendCompose = Get-Content -LiteralPath $oldFrontendFile -Raw | ConvertFrom-Json
+        $oldFrontendId = (Invoke-Docker image inspect $oldFrontendCompose.services.frontend.image --format '{{.Id}}') -join ''
+        if ($oldFrontendCompose.name -cne $project -or $oldFrontendId -cne $oldFrontend.Image) {
+            throw 'La imagen actual del frontend difiere de su Compose.'
+        }
+        $previousServices['frontend'] = @{ compose = $oldFrontendFile; image = $oldFrontendId }
+    }
     $ports = @(Get-FrontendBinding $workers['backend'])
     $backend.PSObject.Properties.Remove('ports')
     $portIndex = [Array]::IndexOf(@($backend.command), '--port')
@@ -434,6 +463,16 @@ $activeDirectory = Split-Path -Parent $activeFile
 $candidate = Join-Path $activeDirectory "compose.$($Revision.Substring(0, 12)).json"
 [IO.File]::WriteAllText($candidate, ($compose | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
 Invoke-Docker compose -p $project -f $candidate config --quiet
+if ($ApplicationLive) {
+    $rollbackFile = Join-Path $activeDirectory "rollback.$($Revision.Substring(0, 12)).json"
+    $rollback = @{
+        revision = $Revision; gold_revision = $GoldRevision; t0 = $t0[0]
+        project = $project; context = $context; services = $previousServices; candidate = $candidate
+        writer_activation_attempted = $false
+    }
+    [IO.File]::WriteAllText($rollbackFile, ($rollback | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+    Write-Output "Rollback acreditado: $rollbackFile"
+}
 if ($LiveFlowOnly) {
     if ($FreshLive) {
         $volumes = @{}
@@ -504,6 +543,7 @@ if ($LiveFlowOnly) {
 } elseif ($ApplicationLive) {
     $writerCutover = $false
     $writerStopped = $false
+    $ingestionUpdated = $false
     try {
         Invoke-Docker compose -p $project -f $candidate up -d --no-deps --no-build --pull never `
             --wait --wait-timeout 90 backend frontend
@@ -514,6 +554,13 @@ if ($LiveFlowOnly) {
         $preflight = 'from pathlib import Path; import json, sys; root = Path(sys.argv[1]) / ''published'' / ''operations''; assert all(json.loads(p.read_text())[''state''] == ''ACKNOWLEDGED'' for p in root.glob(''*.json'')), ''Gold still has an unfinished publication'''
         Invoke-Docker compose -p $project -f $candidate run --rm --no-deps --pull never `
             --entrypoint python gold-live -B -c $preflight $goldMount[0].target
+        if ($IncludeIngestion) {
+            $ingestionUpdated = $true
+            Invoke-Docker compose -p $project -f $candidate up -d --no-deps --no-build --pull never `
+                --timeout ([int]$site.drain_seconds) ingesta-live
+        }
+        $rollback.writer_activation_attempted = $true
+        [IO.File]::WriteAllText($rollbackFile, ($rollback | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
         $writerCutover = $true
         Invoke-Docker compose -p $project -f $candidate up -d --no-deps --no-build --pull never `
             --timeout ([int]$site.drain_seconds) gold-live
@@ -534,15 +581,19 @@ if ($LiveFlowOnly) {
         if ($activeFrontend.Image -cne $frontendId) { throw 'La imagen frontend activa difiere.' }
         Write-Output "Aplicación disponible en el puerto publicado: $($ports[0]) | $($t0[0]) | rollback: $activeFile"
     } catch {
+        if ($writerCutover) {
+            Write-Warning "Se conserva el lector compatible con el escritor nuevo. Compose: $candidate"
+            throw
+        }
         Invoke-Docker compose -p $project -f $candidate stop frontend
         $restore = @('backend')
-        if ($writerCutover) {
-            Write-Warning 'Gold conserva una revisión capaz de recuperar sus propias operaciones.'
-        } elseif ($writerStopped) {
-            $restore += 'gold-live'
-        }
+        if ($ingestionUpdated) { $restore += 'ingesta-live' }
+        if ($writerStopped) { $restore += 'gold-live' }
         if ($hadFrontend) { $restore += 'frontend' }
-        Invoke-Docker compose -p $project -f $activeFile up -d --no-deps --no-build --pull never @restore
+        foreach ($service in $restore) {
+            Invoke-Docker compose -p $project -f $previousServices[$service].compose up -d `
+                --no-deps --no-build --pull never --timeout ([int]$site.drain_seconds) $service
+        }
         throw
     }
 } elseif ($AuditArCatalog) {
