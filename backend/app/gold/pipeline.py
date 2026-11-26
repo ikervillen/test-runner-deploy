@@ -1265,6 +1265,7 @@ def build(
     current_slot_seconds: int | None = None,
     mia_reference_mode: str | None = None,
     validate_result: bool = True,
+    review_hour: lanes.HourChunk | None = None,
 ) -> tuple[SpilledTables | None, list[dict]]:
     """Score one lane. `all` is the manual full build; live and history score a chunk."""
     validate_config(config)
@@ -1342,6 +1343,10 @@ def build(
                         )
                     )
                     current_keys.add((identity, start))
+    if review_hour is not None:
+        if not isinstance(snapshot, Evidence) or review_hour.cutoff > cutoff:
+            raise IntegrityError("A dry-run hour needs pinned Gold evidence and an accredited cut")
+        hour_plan = [review_hour]
     recorded = list(checked)
     if hour_plan:
         recorded.extend(_hour_key(chunk.production_id, chunk.start) for chunk in hour_plan or [])
@@ -1390,7 +1395,9 @@ def build(
                 link_rules,
                 only_ids=chosen,
                 spans=spans,
-                current_window=(
+                current_window=(review_hour.start, review_hour.cutoff)
+                if review_hour
+                else (
                     sorted({(c.read_from or c.start, c.cutoff) for c in hour_plan or []})
                     if isinstance(snapshot, Evidence) and snapshot.document.get("retry_closures")
                     else (lanes.hour_holding(cutoff)[0], cutoff)
@@ -1516,7 +1523,10 @@ def build(
                         )
                         if current_windows:
                             published_refs, effective[cutoff] = mia_statistics.live_statistics(
-                                samples, cutoff, **parameters
+                                samples,
+                                cutoff,
+                                **parameters,
+                                reuse_cut_sample=review_hour is not None,
                             )
                         else:
                             published_refs = {"sets": [], "members": [], "values": []}
