@@ -189,6 +189,7 @@ def ar_pin(document, silver_refs):
             },
             document.get("ar_blocked_origins"),
             document.get("ar_attribution_rule"),
+            document.get("ar_reference_controls"),
         ]
     )
 

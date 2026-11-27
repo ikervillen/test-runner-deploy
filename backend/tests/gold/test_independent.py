@@ -1438,11 +1438,14 @@ def test_ar_attribution_repair_uses_published_ledger_and_recovers_same_silver_pi
     from datetime import UTC, timedelta
     from types import SimpleNamespace
 
+    from fastapi.testclient import TestClient
     from ingesta_delta_lake import associations
     from ingesta_delta_lake.config import Config
     from ingesta_delta_lake.pipeline_publications import SilverSnapshot, publish_family
     from ingesta_delta_lake.service import run as transform
 
+    from app.config import Settings
+    from app.factory import create_app
     from app.gold.common import digest, read_json
     from app.gold.evidence import attribution
     from app.gold.live_archive import archived_result
@@ -1468,6 +1471,7 @@ def test_ar_attribution_repair_uses_published_ledger_and_recovers_same_silver_pi
         plant="AV",
         input_root=input_folder.parent,
         sources=(("AV23", input_folder),),
+        line_by_origin=(("AV23", "AV23"),),
         bronze_root=tmp_path / "bronze",
         silver_root=stores.silver,
         control_root=tmp_path / "control",
@@ -1550,6 +1554,89 @@ def test_ar_attribution_repair_uses_published_ledger_and_recovers_same_silver_pi
     run(previous.root, output, confirmed_input=previous, cutoff=close, **options)
     before = Snapshot.open(output)
     assert not before.rows("ar_intervals")
+    # Exercise the production scheduler at an unchanged Silver pin beyond Live.
+    # Only the fixture's context and operational clock are supplied by adapters.
+    from ingesta_delta_lake.pipeline_view import SilverView, ViewResult
+
+    from app.gold import independent_inputs as exporter
+
+    class PinnedSilver:
+        def __init__(self):
+            self.manifest = dict(silver.manifest, controls=dict(silver.manifest["controls"]))
+            self.manifest["controls"].update(
+                ASIGNACION_PRODUCCION_RAMAL={"hash": "fixture-registry"},
+                CATALOGO_PRODUCCIONES={"hash": "fixture-catalog"},
+            )
+
+        batches = staticmethod(silver.batches)
+
+        def control(self, family):
+            if family == "ASIGNACION_PRODUCCION_RAMAL":
+                registry = doc["registry"]
+                extra = {"association": {"registry": registry, "registry_hash": digest(registry)}}
+            elif family == "CATALOGO_PRODUCCIONES":
+                extra = {"composition": doc["bundle"]["catalog_composition"]}
+            else:
+                return silver.control(family)
+            return {"extra": extra, "cases": [], "meta": {}, "control_id": family, "version": 0}
+
+    view_rows = SilverView.rows
+
+    def confirmed_rows(view, family, **kwargs):
+        if family == "LISTA_AR":
+            return view_rows(view, family, **kwargs)
+        return ViewResult(tables[family].to_pylist(), [], doc.get("lineage", {}).get(family, {}))
+
+    vector = [silver.manifest["publication_id"], None, [[], 0, 0], [], None]
+    old_export = {k: v for k, v in doc.items() if k != "silver_refs"}
+    old_export.update(source_vector=vector, sources=vector[:1], ar_attribution_rule="old-fixture")
+    save(source.root, old_export, dict(tables, observation_assignments=stale), window_seconds=600)
+    old_horizon = close + timedelta(hours=9, minutes=10)
+    plan = SimpleNamespace(
+        live=SimpleNamespace(gold=tmp_path, exchange=stores.exchange),
+        history=SimpleNamespace(gold=tmp_path / "disabled-history"),
+        policy=SimpleNamespace(
+            latency_seconds=600,
+            window_seconds=600,
+            read_max_rows=100000,
+            read_batch_rows=1000,
+            live_batch_files=32,
+        ),
+    )
+    with monkeypatch.context() as patch:
+        patch.setenv("FENIX_LIVE_T0", (close - timedelta(hours=5)).isoformat())
+        patch.setattr(SilverSnapshot, "open", lambda *args, **kwargs: PinnedSilver())
+        patch.setattr(SilverView, "rows", confirmed_rows)
+        patch.setattr(exporter, "ar_blocked_origins", lambda *args: [])
+        patch.setattr(exporter, "_source_horizon", lambda _: old_horizon)
+        patch.setattr(exporter, "recent_relations", lambda *args: None)
+        patch.setattr(exporter, "auxiliary_turn", lambda *args, **kwargs: ({}, 0, ([], 0, 0)))
+        automatic = exporter.export(
+            plan,
+            "live",
+            native_config,
+            ar_categories=doc["ar_categories"],
+            score_config_id=doc["score_config_id"],
+        )
+        assert automatic.document["source_vector"] == vector
+        assert automatic.document["silver_refs"]["LISTA_AR"]["version"] == ar_ref["version"]
+        assert automatic.document["ar_reference_controls"] == {
+            family: silver.manifest["controls"][family]["hash"] for family in exports
+        }
+        assert any(item[-1] == close.isoformat() for item in automatic.document["retry_closures"])
+        assert automatic.document["older_retry_scan"]
+        advanced = exporter.export(
+            plan,
+            "live",
+            native_config,
+            ar_categories=doc["ar_categories"],
+            score_config_id=doc["score_config_id"],
+        )
+        assert advanced.document["older_retry_before"] < automatic.document["older_retry_before"]
+        assert not any(
+            item[-1] == close.isoformat() for item in advanced.document["retry_closures"]
+        )
+
     revised = {
         **doc,
         "ar_pin": "corrected",
@@ -1630,3 +1717,21 @@ def test_ar_attribution_repair_uses_published_ledger_and_recovers_same_silver_pi
         ),
         key=lambda row: row["componente"],
     )
+    api = create_app(
+        Settings(
+            data_root=output,
+            data_backend="gold",
+            gold_root=output,
+            gold_live_timezone="Europe/Madrid",
+        )
+    )
+    with TestClient(api) as client:
+        response = client.get(f"/api/live/archive/{withdrawn.publication_id}/{key}")
+    assert response.status_code == 200, response.text
+    partial = response.json()
+    assert partial["score"]["total_penalty"] is None
+    assert partial["score"]["normalized_score"] is None
+    assert partial["score"]["reference_id"] == score["reference_id"]
+    assert sorted(
+        partial["details"]["quality_score_components"], key=lambda row: row["componente"]
+    ) == sorted(kept, key=lambda row: row["componente"])

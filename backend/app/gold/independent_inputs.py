@@ -50,6 +50,14 @@ def ar_review_intervals(cases, origin):
     return sorted(spans, key=lambda span: (span[0] or "", span[1] or ""))
 
 
+def ar_reference_controls(manifest):
+    controls = manifest.get("controls", {})
+    return {
+        name: controls.get(name, {}).get("hash")
+        for name in ("LISTA_AR", "SIP_DEFECTO", "SIP_DEFECTO_STATUS", "SIP_DEFECTO_AR")
+    }
+
+
 def ar_blocked_origins(storage, manifest, config, latency, *, now=None):
     from .common import read_json
 
@@ -57,15 +65,11 @@ def ar_blocked_origins(storage, manifest, config, latency, *, now=None):
     try:
         status = read_json(storage.exchange / "ar-intake.json")
         table = manifest["tables"].get("LISTA_AR", {})
-        controls = manifest.get("controls", {})
         pin = digest(
             [
                 table.get("table_id"),
                 table.get("version"),
-                [
-                    controls.get(name, {}).get("hash")
-                    for name in ("LISTA_AR", "SIP_DEFECTO", "SIP_DEFECTO_STATUS", "SIP_DEFECTO_AR")
-                ],
+                list(ar_reference_controls(manifest).values()),
             ]
         )
         age = (now or datetime.now(UTC)) - datetime.fromisoformat(status["discovered_at"])
@@ -183,6 +187,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
         ):
             active = pinned
             own = SilverSnapshot.open(storage, publication_id=active["target"])
+    ar_controls = ar_reference_controls(own.manifest)
 
     archive = None
     cached_archive = storage.gold / "checkpoint" / "archive-reference.json"
@@ -241,6 +246,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
         if (
             previous.document.get("source_vector") == vector
             and previous.document.get("ar_attribution_rule") == ar_attribution_rule
+            and previous.document.get("ar_reference_controls") == ar_controls
         ) and (
             lane != "live"
             or (
@@ -551,6 +557,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
         },
         "coverage": coverage,
         "ar_attribution_rule": ar_attribution_rule,
+        "ar_reference_controls": ar_controls,
     }
     window = None
     scopes = None
