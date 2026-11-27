@@ -122,6 +122,25 @@ def test_older_ar_waits_for_a_changed_dependency_and_retains_the_original_cut():
     ) == [["outgoing", START.isoformat(), END.isoformat(), original.isoformat()]]
 
 
+def test_previously_ready_close_is_revisited_only_with_new_ar_proof():
+    from app.gold.silver_coverage import required_slots
+
+    snapshot = FixtureSnapshot(
+        {
+            "productions": [prod("ready")],
+            "publication_scope_status": [scope("ready", END)],
+        }
+    )
+    options = {"older": (START, END), "ar_changed": lambda *_: True}
+    coverage = dict(source="LISTA_AR", origin="AV31", estado="READY", ar_receipts_required=True)
+    later = END + timedelta(hours=9)
+    assert not retry_closures(snapshot, [coverage], later, 100, **options)
+    coverage.update(slot_seconds=600, confirmed_slots=list(required_slots(START, END, 600)))
+    assert retry_closures(snapshot, [coverage], later, 100, **options) == [
+        ["ready", START.isoformat(), END.isoformat(), END.isoformat()]
+    ]
+
+
 def test_open_hour_has_no_score_and_zero_survives_for_closed_result():
     current = Window("p", "HOUR", END, END + timedelta(hours=1), LATER)
     closed = Window("p", "HOUR", START, END, END)

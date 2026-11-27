@@ -115,7 +115,10 @@ def retry_closures(
             continue
         reasons = set((row.get("reason_code") or "").split(";"))
         coverage_reasons = reasons & (RETRY_REASONS | COMPONENT_COVERAGE_REASONS.keys())
-        if older and not (coverage_reasons or (ar_changed and reasons & AR_REVIEW_REASONS)):
+        if older and not (
+            coverage_reasons
+            or (ar_changed and (row["estado"] == "READY" or reasons & AR_REVIEW_REASONS))
+        ):
             continue
         revised = ar_changed(row, window) if ar_changed else False
         if not revised and row["period_end"] == chunk.cutoff and not coverage_reasons:
