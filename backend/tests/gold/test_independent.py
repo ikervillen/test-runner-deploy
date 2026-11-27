@@ -1597,3 +1597,36 @@ def test_ar_attribution_repair_uses_published_ledger_and_recovers_same_silver_pi
         moment=(close + timedelta(hours=9)).replace(tzinfo=UTC),
     )["details"]
     assert any(row["affected_cavity_minutes"] > 0 for row in details["aql_score_details"])
+    key = score["id_resultado"]
+    invalidation = save(
+        source.root,
+        {
+            **revised,
+            "retry_closures": [],
+            "closed_hours": [key],
+            "ar_invalidations": [
+                [
+                    key,
+                    score["id_produccion"],
+                    "AV23",
+                    score["inicio"].isoformat(),
+                    score["corte"].isoformat(),
+                ]
+            ],
+        },
+        dict(tables, observation_assignments=good),
+        window_seconds=600,
+    )
+    run(invalidation.root, output, confirmed_input=invalidation, cutoff=later, **options)
+    withdrawn = Snapshot.open(output)
+    current = next(row for row in withdrawn.rows("quality_scores") if row["id_resultado"] == key)
+    assert current["formula_version"].endswith(":MIA,ZC")
+    kept = [row for row in withdrawn.rows("quality_score_components") if row["id_resultado"] == key]
+    assert sorted(kept, key=lambda row: row["componente"]) == sorted(
+        (
+            row
+            for row in components
+            if row["id_resultado"] == key and row["componente"] in {"MIA", "ZC"}
+        ),
+        key=lambda row: row["componente"],
+    )

@@ -1525,6 +1525,8 @@ def build(
                         "zc_score_details",
                     )
                 }
+                retained_references = set()
+                retained_zc = set()
                 for score in prior["quality_scores"]:
                     identity = score["id_resultado"]
                     partial, components = without_ar(
@@ -1539,6 +1541,8 @@ def build(
                         continue
                     owner = score["id_produccion"]
                     _store_row(store, "quality_scores", owner, partial)
+                    if partial["reference_id"]:
+                        retained_references.add(partial["reference_id"])
                     for row in components:
                         _store_row(store, "quality_score_components", owner, row)
                     retained = {r["componente"] for r in components}
@@ -1547,6 +1551,22 @@ def build(
                         for row in prior[name]:
                             if row["id_resultado"] == identity:
                                 _store_row(store, name, owner, row)
+                                if component == "ZC":
+                                    retained_zc.add(row["basis_reference"])
+                for name, column, keys in (
+                    ("mia_reference_sets", "reference_id", retained_references),
+                    ("zc_window_bases", "id_base_zc", retained_zc),
+                ):
+                    if not keys:
+                        continue
+                    values = sorted(keys)
+                    for row in previous.rows(
+                        name,
+                        expression=ds.field(column).cast("string").isin(values),
+                        file_pruning_predicate=[(column, "in", values)],
+                        max_rows=max_total_rows,
+                    ):
+                        _store_row(store, name, row.get("id_produccion"), row)
             scope_rows.extend(
                 _scope_row(
                     key,
