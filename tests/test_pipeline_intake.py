@@ -1,5 +1,6 @@
 from contextlib import closing
-from dataclasses import replace
+from dataclasses import asdict, replace
+from datetime import UTC, datetime
 
 import pytest
 
@@ -8,6 +9,7 @@ from ingesta_delta_lake.common import IntegrityError
 from ingesta_delta_lake.pipeline_intake import Intake, discover_lanes
 from ingesta_delta_lake.pipeline_policy import PipelinePolicy
 from ingesta_delta_lake.service import run
+from ingesta_delta_lake.sources import Snapshot
 
 
 @pytest.fixture
@@ -200,3 +202,41 @@ def test_idle_audit_detects_content_change_with_unchanged_size_and_mtime(config,
         result = intake.capture_live(config, policy, lanes["live"], window=window)
         assert result["captured"] == 1 and result["audited"] == 1
         assert len(list(config.bronze_root.rglob("*.csv"))) == 2
+
+
+def test_ar_partial_lot_advances_only_certified_deliveries_and_retries_once(policy, tmp_path):
+    from ingesta_delta_lake.common import canonical
+
+    clock = "2026-11-27T08:00:00"
+    now = datetime.fromisoformat("2026-11-27T07:01:00+00:00").astimezone(UTC)
+    with closing(Intake(tmp_path / "ar.sqlite", lane="live", identity="ar")) as intake:
+        intake.set("initial_frontier", clock)
+        intake.set("lot_policy", canonical(asdict(policy)))
+        accepted, waiting = [
+            intake.remember(
+                "LISTA_AR",
+                Snapshot(
+                    origin,
+                    f"/{origin}.csv",
+                    "a" * 64,
+                    "/bronze/file.csv",
+                    65536,
+                    1,
+                    now.isoformat(),
+                    clock,
+                ),
+            )
+            for origin in ("AV21", "AV22")
+        ]
+        intake.set("published_capture_sequence", "2")
+        result = {"status": "PARTIAL", "complete": False, "confirmed_input_ids": [accepted]}
+        intake.lots.record((accepted, waiting), result, None, now, policy)
+        intake.acknowledge((accepted, waiting), result, published_at=now.isoformat())
+        states = dict(intake.db.execute("SELECT input_id,state FROM inputs"))
+        assert states == {accepted: "HANDLED", waiting: "LOT_WAIT"}
+        receipts = intake.slot_receipts("LISTA_AR", [], {})
+        assert {r[1]: r[-1] for r in receipts} == {accepted: True, waiting: False}
+        assert intake.release_ar_lots("dict-v1", 1) == 1
+        intake.lots.record((waiting,), result, None, now, policy)
+        assert intake.release_ar_lots("dict-v1", 1) == 0
+        assert intake.release_ar_lots("dict-v2", 1) == 1

@@ -42,6 +42,20 @@ def read_manifest(storage, name):
     return value
 
 
+def accepted_input(result, identity):
+    return (
+        not result.get("remaining_versions", 0)
+        and not result.get("publication_error")
+        and (
+            (result.get("status") in {"APPLIED", "NO_CHANGE"} and result.get("complete", True))
+            or (
+                result.get("status") == "PARTIAL"
+                and identity in result.get("confirmed_input_ids", ())
+            )
+        )
+    )
+
+
 def publish(storage, name, value):
     root = storage.exchange / name
     root.mkdir(parents=True, exist_ok=True)
@@ -220,12 +234,6 @@ class LotJournal:
                 )
 
     def record(self, ids, result, manifest, stamp, policy):
-        complete = (
-            result.get("status") in {"APPLIED", "NO_CHANGE"}
-            and result.get("complete", True)
-            and not result.get("remaining_versions", 0)
-            and not result.get("publication_error")
-        )
         if result.get("remaining_versions", 0) and not result.get("publication_error"):
             return
         with self.db:
@@ -240,7 +248,7 @@ class LotJournal:
                 ).fetchone()
                 if not unit and not reviewed:
                     continue
-                if not complete:
+                if not accepted_input(result, identity):
                     self.db.execute(
                         "UPDATE inputs SET state='LOT_WAIT',result=? WHERE input_id=?",
                         (json.dumps(result), identity),

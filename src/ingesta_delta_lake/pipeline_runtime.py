@@ -25,7 +25,7 @@ from .pipeline_archive_queue import ArchiveQueue
 from .pipeline_handoff import BronzeHandoff
 from .pipeline_intake import Intake, discover_lanes
 from .pipeline_policy import LANES, STORES, IndependentPipelines
-from .pipeline_publications import publish_family
+from .pipeline_publications import SilverSnapshot, publish_family
 from .pipeline_retirement_queue import RetirementQueue
 from .pipeline_view import ArchiveSnapshot
 from .reviews import pending_families
@@ -371,7 +371,8 @@ class PipelineWorker:
                     family=family,
                     captured_ids=ids,
                     slot_receipts=intake.slot_receipts(family, ids, result)
-                    if self.lane == "live" and family in {"LISTA_DEFECTOS", "LISTA_RECH", "CONT_ZC"}
+                    if self.lane == "live"
+                    and family in {"LISTA_DEFECTOS", "LISTA_RECH", "CONT_ZC", "LISTA_AR"}
                     else None,
                 )
                 if family == "CONT_ZC":
@@ -469,6 +470,28 @@ class PipelineWorker:
                 self.event(
                     {"event": "RETRY_STATE_UNAVAILABLE", "family": family, "error": str(exc)}
                 )
+
+    def release_ar_references(self, intake):
+        if not intake.db.execute(
+            "SELECT 1 FROM inputs WHERE state='LOT_WAIT' AND family='LISTA_AR' LIMIT 1"
+        ).fetchone():
+            return
+        from .ar_storage import CODE_FIELDS
+
+        try:
+            manifest = SilverSnapshot.open(self.storage).manifest
+        except (OSError, ValueError, IntegrityError) as exc:
+            self.event({"event": "AR_REFERENCE_PIN_UNAVAILABLE", "error": str(exc)})
+            return
+        controls = manifest["controls"]
+        if not CODE_FIELDS.keys() <= controls.keys():
+            return
+        token = digest(["scoped-ar-dictionary-v1", {f: controls[f]["hash"] for f in CODE_FIELDS}])
+        count = intake.release_ar_lots(token, self.policy.live_batch_files)
+        if count:
+            self.event(
+                {"event": "AR_DICTIONARY_RETRY", "captures": count, "reference_token": token}
+            )
 
     def transform(self, cfg, executor):
         events = []
@@ -618,6 +641,8 @@ class PipelineWorker:
                             intake.release(dependent, "WAITING_REVIEW")
                             dirty.add(dependent)
                             dirty_since.setdefault(dependent, time.monotonic())
+                if self.lane == "live" and "LISTA_AR" in families and "LISTA_AR" not in active:
+                    self.release_ar_references(intake)
                 ready = []
                 for family in families:
                     if family in active or retry_at.get(family, 0) > time.monotonic():

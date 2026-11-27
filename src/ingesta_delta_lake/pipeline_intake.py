@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .common import CaptureError, IntegrityError, canonical, digest, now
+from .pipeline_lots import accepted_input
 from .pipeline_policy import LANES
 from .sources import Snapshot, capture, capture_identity, export_kind, parse_name, recover_capture
 
@@ -110,6 +111,8 @@ class Intake:
                 state TEXT NOT NULL, published_at TEXT, result TEXT);
             CREATE INDEX IF NOT EXISTS pending_inputs ON inputs(state, family, producer_time);
             CREATE INDEX IF NOT EXISTS intake_source_paths ON inputs(source_path);
+            CREATE INDEX IF NOT EXISTS ar_capture_slot ON inputs(origin, substr(producer_time,1,15))
+                WHERE family='LISTA_AR';
             CREATE TABLE IF NOT EXISTS receipts(
                 receipt_id TEXT PRIMARY KEY, published_at TEXT NOT NULL, result TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS failures(
@@ -287,12 +290,33 @@ class Intake:
         head = int(self.setting("published_capture_sequence") or 0)
         # Reaccredit recent accepted inputs from the existing journal on rollout.
         # Bound the indexed rowid query independently of lifetime input count.
-        rows = self.db.execute(
+        projection = (
             "SELECT i.rowid,i.input_id,i.origin,i.producer_time,i.state,r.result,i.descriptor "
             "FROM inputs i LEFT JOIN receipts r ON r.receipt_id=i.result "
-            "WHERE i.rowid>? AND i.rowid<=? AND i.family=? ORDER BY i.rowid",
-            (max(0, head - 2048), head, family),
         )
+        floor = max(0, head - 2048)
+        rows = self.db.execute(
+            projection + "WHERE i.rowid>? AND i.rowid<=? AND i.family=? ORDER BY i.rowid",
+            (floor, head, family),
+        ).fetchall()
+        if family == "LISTA_AR" and ids:
+            # Retrying an older delivery must be able to prove it, but must not
+            # resurrect it if a newer Bronze revision of the same slot exists.
+            touched = self.db.execute(
+                "SELECT DISTINCT origin,substr(producer_time,1,15) FROM inputs "
+                "WHERE input_id IN (SELECT value FROM json_each(?)) AND rowid<=? "
+                "AND family='LISTA_AR' AND length(producer_time)=19",
+                (canonical(ids), floor),
+            )
+            for origin, prefix in touched:
+                newest = self.db.execute(
+                    projection + "WHERE i.family='LISTA_AR' AND i.origin=? "
+                    "AND substr(i.producer_time,1,15)=? AND i.rowid<=? "
+                    "ORDER BY i.rowid DESC LIMIT 1",
+                    (origin, prefix, head),
+                ).fetchone()
+                if newest is not None:
+                    rows.append(newest)
         applied = set(ids) if self.accepted_result(result) else set()
         latest = {}
         from .common import slot_stamp
@@ -302,32 +326,47 @@ class Intake:
             if slot is None:
                 continue
             snapshot = json.loads(descriptor)
-            accepted = snapshot["size"] <= 4096 and (
-                identity in applied
-                or (state == "HANDLED" and receipt and self.accepted_result(json.loads(receipt)))
-            )
-            latest[origin, slot] = [sequence, identity, origin, stamp, bool(accepted)]
+            prior = json.loads(receipt) if state == "HANDLED" and receipt else {}
+            if family == "LISTA_AR":
+                accepted = (
+                    identity in ids
+                    and identity in result.get("confirmed_input_ids", ())
+                    and accepted_input(result, identity)
+                ) or prior.get("ar_slot_confirmed", False)
+            else:
+                accepted = snapshot["size"] <= 4096 and (
+                    identity in applied or self.accepted_result(prior)
+                )
+            key = origin, slot
+            if key not in latest or sequence >= latest[key][0]:
+                latest[key] = [sequence, identity, origin, stamp, bool(accepted)]
         return list(latest.values())
 
     def acknowledge(self, ids, result, *, published_at):
-        if not self.accepted_result(result):
-            return
         summary = {
             k: result[k]
             for k in ("status", "delta_version", "batch_id", "operation_id")
             if k in result
         }
-        receipt = digest([list(ids), summary])
         with self.db:
-            self.db.execute(
-                "INSERT OR IGNORE INTO receipts VALUES(?,?,?)",
-                (receipt, published_at, canonical(summary)),
-            )
-            self.db.executemany(
-                "UPDATE inputs SET state='HANDLED', published_at=?, result=? "
-                "WHERE input_id=? AND state='CAPTURED'",
-                [(published_at, receipt, identity) for identity in ids],
-            )
+            certified = set(result.get("confirmed_input_ids", ()))
+            eligible = [identity for identity in ids if accepted_input(result, identity)]
+            for group, payload in (
+                ([i for i in eligible if i not in certified], summary),
+                ([i for i in eligible if i in certified], {**summary, "ar_slot_confirmed": True}),
+            ):
+                if not group:
+                    continue
+                receipt = digest([group, payload])
+                self.db.execute(
+                    "INSERT OR IGNORE INTO receipts VALUES(?,?,?)",
+                    (receipt, published_at, canonical(payload)),
+                )
+                self.db.executemany(
+                    "UPDATE inputs SET state='HANDLED', published_at=?, result=? "
+                    "WHERE input_id=? AND state='CAPTURED'",
+                    [(published_at, receipt, identity) for identity in group],
+                )
 
     def defer(self, ids, result):
         if result.get("status") in {"RETRY_WAIT", "PAUSED_RETRY_EXHAUSTED"}:
@@ -349,6 +388,36 @@ class Intake:
             self.db.execute(
                 "UPDATE inputs SET state='CAPTURED' WHERE family=? AND state=?", (family, state)
             )
+
+    def release_ar_lots(self, reference_token, limit):
+        """Give each waiting capture one bounded retry per confirmed dictionary state."""
+        setting = "live_ar_dictionary_retry"
+        prior = json.loads(self.setting(setting) or "{}")
+        if prior.get("token") == reference_token and prior.get("done"):
+            return 0
+        cursor = prior.get("cursor", 0) if prior.get("token") == reference_token else 0
+        rows = self.db.execute(
+            "SELECT rowid FROM inputs WHERE state='LOT_WAIT' AND family='LISTA_AR' "
+            "AND rowid>? ORDER BY rowid LIMIT ?",
+            (cursor, limit),
+        ).fetchall()
+        with self.db:
+            self.db.executemany("UPDATE inputs SET state='CAPTURED' WHERE rowid=?", rows)
+            self.db.execute(
+                "INSERT INTO settings VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (
+                    setting,
+                    canonical(
+                        {
+                            "token": reference_token,
+                            "cursor": rows[-1][0] if rows else cursor,
+                            "done": len(rows) < limit,
+                        }
+                    ),
+                ),
+            )
+        return len(rows)
 
     def capture_turn(
         self, config, policy, candidates, *, clock=time.monotonic, cursor_key="cursor"
