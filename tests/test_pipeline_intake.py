@@ -234,8 +234,11 @@ def test_ar_partial_lot_advances_only_certified_deliveries_and_retries_once(poli
         intake.acknowledge((accepted, waiting), result, published_at=now.isoformat())
         states = dict(intake.db.execute("SELECT input_id,state FROM inputs"))
         assert states == {accepted: "HANDLED", waiting: "LOT_WAIT"}
-        receipts = intake.slot_receipts("LISTA_AR", [], {})
-        assert {r[1]: r[-1] for r in receipts} == {accepted: True, waiting: False}
+        assert intake.db.execute(
+            "SELECT receipt_id FROM inputs JOIN receipts ON inputs.result=receipts.receipt_id "
+            "WHERE input_id=?",
+            (accepted,),
+        ).fetchone()
         assert intake.release_ar_lots("dict-v1", 1) == 1
         intake.lots.record((waiting,), result, None, now, policy)
         assert intake.release_ar_lots("dict-v1", 1) == 0

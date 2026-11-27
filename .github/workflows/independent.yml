@@ -10,13 +10,17 @@ on:
         description: Activate the application-only deployment from develop
         type: boolean
         default: false
+      rollout_live:
+        description: Activate the coordinated Ingesta, Gold and application Live deployment
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 env:
   FRONTEND_CONTEXT_COMMIT: a1b9df74927d99a942a54ba0d1d2ed72aae76bcc
-  GOLD_CONTEXT_COMMIT: 6eb1676b72c3b2cc62846fb7daad728067d157ab
+  GOLD_CONTEXT_COMMIT: 9028d87710930ca703c19b81d0324bb33b404429
   GOLD_SOURCE_COMMIT: ad88dc3d0bdedfbc4da3de06da74e3801b9b64f7
 
 jobs:
@@ -165,7 +169,7 @@ jobs:
           github.run_attempt == '1' &&
           ((github.event_name == 'push' && github.event.before == 'aad276c868863c8d77271aefae194a423d283f5d' &&
             github.event.head_commit.message == 'Deploy integrated Fenix Live AR and coverage') ||
-           (github.event_name == 'workflow_dispatch' && inputs.rollout_application))
+           (github.event_name == 'workflow_dispatch' && (inputs.rollout_application != inputs.rollout_live)))
         run: |
           set -euo pipefail
           mkdir -p bundle
@@ -252,10 +256,11 @@ jobs:
           FENIX_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
           FENIX_DOCKER_CONTEXT: ${{ vars.INGESTA_DOCKER_CONTEXT }}
           IMAGE: ${{ needs.publish-live.outputs.digest }}
+          FULL_LIVE: ${{ inputs.rollout_live }}
         run: |
           $bundle = Join-Path $env:RUNNER_TEMP "fenix-image-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           try {
-            $mode = if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $mode = if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and $env:FULL_LIVE -ne 'true') {
               @{ ApplicationOnly = $true }
             } else {
               @{ ApplicationLive = $true; IncludeIngestion = $true }
@@ -265,3 +270,10 @@ jobs:
           } finally {
             Remove-Item -LiteralPath (Join-Path $bundle 'image.tar.gz'), (Join-Path $bundle 'image.json') -ErrorAction SilentlyContinue
           }
+      - name: Verify recovered AR on the running Live generation
+        if: github.event_name == 'workflow_dispatch' && inputs.rollout_live
+        shell: powershell
+        env:
+          FENIX_SITE: ${{ vars.INGESTA_SITE_CONFIG }}
+          FENIX_DOCKER_CONTEXT: ${{ vars.INGESTA_DOCKER_CONTEXT }}
+        run: ./scripts/verify_live_ar.ps1

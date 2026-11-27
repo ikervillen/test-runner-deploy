@@ -15,6 +15,7 @@ from pathlib import Path
 
 import portalocker
 
+from .ar_storage import ar_silver_pin
 from .catalog_storage import historical_mp9
 from .common import IntegrityError, canonical, digest, now
 from .config import load_config
@@ -30,7 +31,7 @@ from .pipeline_retirement_queue import RetirementQueue
 from .pipeline_view import ArchiveSnapshot
 from .reviews import pending_families
 from .runtime import atomic_json
-from .sources import SILVER_EXPORTS
+from .sources import SILVER_EXPORTS, export_kind
 from .workers import PHASES, run_phase
 
 
@@ -105,6 +106,8 @@ class PipelineWorker:
         self.guard = threading.Lock()
         self.archive_context = {}
         self.discovery_cache = {}
+        self.ar_discovery = None
+        self.ar_result = (None, set())
 
     def prepare(self):
         marker = self.storage.checkpoint / "identity.json"
@@ -246,15 +249,54 @@ class PipelineWorker:
                 captured[key] += review_capture[key] + (priority[key] if priority else 0)
         else:
             captured = intake.capture_live(self.source, self.policy, candidates, window=window)
+        bronze_failed = False
         try:
             intake.publish_captures(
                 self.storage.exchange, limit=getattr(self.policy, f"{self.lane}_batch_files")
             )
         except Exception as exc:
+            bronze_failed = True
             self.event({"event": "BRONZE_PUBLICATION_FAILED", "error": str(exc)})
+        if self.lane == "live":
+            blocked = set(captured.get("ar_capture_pending", ()))
+            for failure in failures:
+                origin = failure["origin"]
+                path = Path(failure["path"])
+                if (
+                    path == dict(self.source.sources)[origin]
+                    or export_kind(path.name) == "LISTA_AR"
+                ):
+                    blocked.add(origin)
+            if bronze_failed:
+                blocked.update(dict(self.source.sources))
+            self.ar_discovery = (stamp.isoformat(), blocked)
+            self.publish_ar_intake(intake)
         intake.lots.publish(self.storage)
         self.event({"event": "BRONZE_CAPTURE", **captured})
         return window, captured
+
+    def publish_ar_intake(self, intake):
+        if self.lane != "live" or self.ar_discovery is None:
+            return
+        stamp, blocked = self.ar_discovery
+        pending = intake.db.execute(
+            "SELECT DISTINCT origin FROM inputs AS i WHERE family='LISTA_AR' AND "
+            "state IN ('CAPTURED','WAITING_REVIEW','WAITING_RETRY','LOT_WAIT','TRANSFERRED') "
+            "AND NOT EXISTS (SELECT 1 FROM inputs AS newer WHERE "
+            "newer.source_path=i.source_path AND newer.family=i.family AND newer.rowid>i.rowid)"
+        )
+        pin, invalid_references = self.ar_result
+        atomic_json(
+            self.storage.exchange / "ar-intake.json",
+            {
+                "identity": self.identity,
+                "pin": pin,
+                "discovered_at": stamp,
+                "blocked_origins": sorted(
+                    blocked | invalid_references | {row[0] for row in pending}
+                ),
+            },
+        )
 
     def selected_config(self, intake, family, window, *, reviews_only=False):
         ids = intake.pending(family, getattr(self.policy, f"{self.lane}_batch_files"))
@@ -355,6 +397,9 @@ class PipelineWorker:
             and not cfg.scheduled_lot_attempt
         ):
             intake.defer(ids, result)
+            if family == "LISTA_AR":
+                self.ar_result = (None, set())
+                self.publish_ar_intake(intake)
             self.event({"family": family, "result": result, "seconds": seconds})
             return
         if (
@@ -371,8 +416,7 @@ class PipelineWorker:
                     family=family,
                     captured_ids=ids,
                     slot_receipts=intake.slot_receipts(family, ids, result)
-                    if self.lane == "live"
-                    and family in {"LISTA_DEFECTOS", "LISTA_RECH", "CONT_ZC", "LISTA_AR"}
+                    if self.lane == "live" and family in {"LISTA_DEFECTOS", "LISTA_RECH", "CONT_ZC"}
                     else None,
                 )
                 if family == "CONT_ZC":
@@ -409,6 +453,14 @@ class PipelineWorker:
             intake.lots.finish_reviews(self.storage)
         else:
             intake.lots.publish(self.storage)
+            if family == "LISTA_AR":
+                self.ar_result = (
+                    ar_silver_pin(manifest)
+                    if manifest and not result.get("publication_error")
+                    else None,
+                    set(result.get("reference_pending_origins", ())),
+                )
+                self.publish_ar_intake(intake)
         self.event({"family": family, "result": result, "seconds": seconds})
 
     def maintenance_config(self, intake, active, dirty, reviews):

@@ -1,57 +1,31 @@
 """Ingesta de tramos AR; referencias persistentes y cierres sin cálculo de minutos."""
 
 import hashlib
-from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import __version__
 from . import lista_ar as ar
 from .ar_storage import ArStore, load_references
-from .common import IntegrityError, digest, slot_stamp
+from .common import IntegrityError, digest
 from .service import _apply
 from .sources import capture_identity, capture_inputs
 
 
-def _confirmed_inputs(snapshots, cases, invalid_references):
-    """Certify each delivery only when unresolved AR could not affect its slot."""
-    confirmed = []
-    for snapshot in snapshots:
-        slot = slot_stamp(snapshot.producer_time)
-        if slot is None:
-            continue
-        end = datetime.fromisoformat(slot)
-        start = end - timedelta(minutes=10)
-        if any(_blocks_slot(case, snapshot, start, end) for case in cases) or any(
-            _blocks_slot(row, snapshot, start, end) for row in invalid_references
-        ):
-            continue
-        confirmed.append(capture_identity("LISTA_AR", snapshot))
-    return confirmed
-
-
-def _blocks_slot(case, snapshot, start, end):
-    evidence = case.get("evidence", ())
-    if isinstance(evidence, dict):
-        evidence = [evidence]
-    origins = {item.get("origin") for item in evidence}
-    # Even a malformed event dated outside its delivery cannot certify that delivery.
-    if any(
-        item.get("origin") == snapshot.origin and item.get("sha256") == snapshot.sha256
-        for item in evidence
-    ):
-        return True
-    for row in case.get("candidates") or [case.get("candidate", case)]:
-        origin = row.get("origen_fenix")
-        if origin is not None and origin != snapshot.origin:
-            continue
-        if origin is None and origins and None not in origins and snapshot.origin not in origins:
-            continue
-        on, off = row.get("FECHA_ON"), row.get("FECHA_OFF")
-        if not on or (
-            datetime.fromisoformat(on) < end and (not off or datetime.fromisoformat(off) > start)
-        ):
-            return True
-    return False
+def _confirmed_inputs(snapshots, issues):
+    """Acknowledge exact event files with no unresolved rows in this attempt."""
+    blocked = set()
+    for case in issues:
+        evidence = case.get("evidence", ())
+        if isinstance(evidence, dict):
+            evidence = [evidence]
+        if not evidence:
+            return []
+        blocked.update((item.get("origin"), item.get("sha256")) for item in evidence)
+    return [
+        capture_identity("LISTA_AR", snapshot)
+        for snapshot in snapshots
+        if (snapshot.origin, snapshot.sha256) not in blocked
+    ]
 
 
 def process(config, control, attempt):
@@ -165,13 +139,7 @@ def process(config, control, attempt):
         raise IntegrityError("Lote AR confirmado exige nuevas escrituras")
     control.resolve_dependencies(merged, references, batch_id)
     counts = control.counts()
-    confirmed_inputs = (
-        _confirmed_inputs(
-            snapshots, [payload for _, _, _, payload in control.cases()], invalid_references
-        )
-        if config.scheduled_lot_attempt
-        else []
-    )
+    confirmed_inputs = _confirmed_inputs(snapshots, issues) if config.scheduled_lot_attempt else []
     complete = not (counts["open_dependencies"] or counts["open_reviews"] or reference_pending)
     status = (
         ("APPLIED" if wrote else "NO_CHANGE" if snapshots or restored else "NO_INPUTS")
@@ -197,6 +165,7 @@ def process(config, control, attempt):
         "confirmed_input_ids": confirmed_inputs,
         "published_records": len(merged),
         "accepted_reference_pending": reference_pending,
+        "reference_pending_origins": sorted({r["origen_fenix"] for r in invalid_references}),
         "published_with_group": sum(r["ID_Agrupación"] is not None for r in merged.values()),
         "published_without_group": sum(r["ID_Agrupación"] is None for r in merged.values()),
         "recovered_operations": recovered,

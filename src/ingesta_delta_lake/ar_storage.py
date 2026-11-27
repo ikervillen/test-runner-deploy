@@ -24,6 +24,19 @@ CODE_FIELDS = {
 }
 
 
+def ar_silver_pin(manifest):
+    """Only changes to the AR table or its control invalidate the intake projection."""
+    table = manifest["tables"].get("LISTA_AR", {})
+    controls = manifest.get("controls", {})
+    return digest(
+        [
+            table.get("table_id"),
+            table.get("version"),
+            [controls.get(name, {}).get("hash") for name in ("LISTA_AR", *CODE_FIELDS)],
+        ]
+    )
+
+
 def reference_reviews(cases, code_field, accepted_by_id):
     """Index conflicts whose complete set of affected codes is established."""
     scoped, global_reviews = defaultdict(list), []

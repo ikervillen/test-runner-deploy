@@ -111,8 +111,6 @@ class Intake:
                 state TEXT NOT NULL, published_at TEXT, result TEXT);
             CREATE INDEX IF NOT EXISTS pending_inputs ON inputs(state, family, producer_time);
             CREATE INDEX IF NOT EXISTS intake_source_paths ON inputs(source_path);
-            CREATE INDEX IF NOT EXISTS ar_capture_slot ON inputs(origin, substr(producer_time,1,15))
-                WHERE family='LISTA_AR';
             CREATE TABLE IF NOT EXISTS receipts(
                 receipt_id TEXT PRIMARY KEY, published_at TEXT NOT NULL, result TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS failures(
@@ -290,33 +288,12 @@ class Intake:
         head = int(self.setting("published_capture_sequence") or 0)
         # Reaccredit recent accepted inputs from the existing journal on rollout.
         # Bound the indexed rowid query independently of lifetime input count.
-        projection = (
+        rows = self.db.execute(
             "SELECT i.rowid,i.input_id,i.origin,i.producer_time,i.state,r.result,i.descriptor "
             "FROM inputs i LEFT JOIN receipts r ON r.receipt_id=i.result "
+            "WHERE i.rowid>? AND i.rowid<=? AND i.family=? ORDER BY i.rowid",
+            (max(0, head - 2048), head, family),
         )
-        floor = max(0, head - 2048)
-        rows = self.db.execute(
-            projection + "WHERE i.rowid>? AND i.rowid<=? AND i.family=? ORDER BY i.rowid",
-            (floor, head, family),
-        ).fetchall()
-        if family == "LISTA_AR" and ids:
-            # Retrying an older delivery must be able to prove it, but must not
-            # resurrect it if a newer Bronze revision of the same slot exists.
-            touched = self.db.execute(
-                "SELECT DISTINCT origin,substr(producer_time,1,15) FROM inputs "
-                "WHERE input_id IN (SELECT value FROM json_each(?)) AND rowid<=? "
-                "AND family='LISTA_AR' AND length(producer_time)=19",
-                (canonical(ids), floor),
-            )
-            for origin, prefix in touched:
-                newest = self.db.execute(
-                    projection + "WHERE i.family='LISTA_AR' AND i.origin=? "
-                    "AND substr(i.producer_time,1,15)=? AND i.rowid<=? "
-                    "ORDER BY i.rowid DESC LIMIT 1",
-                    (origin, prefix, head),
-                ).fetchone()
-                if newest is not None:
-                    rows.append(newest)
         applied = set(ids) if self.accepted_result(result) else set()
         latest = {}
         from .common import slot_stamp
@@ -326,20 +303,11 @@ class Intake:
             if slot is None:
                 continue
             snapshot = json.loads(descriptor)
-            prior = json.loads(receipt) if state == "HANDLED" and receipt else {}
-            if family == "LISTA_AR":
-                accepted = (
-                    identity in ids
-                    and identity in result.get("confirmed_input_ids", ())
-                    and accepted_input(result, identity)
-                ) or prior.get("ar_slot_confirmed", False)
-            else:
-                accepted = snapshot["size"] <= 4096 and (
-                    identity in applied or self.accepted_result(prior)
-                )
-            key = origin, slot
-            if key not in latest or sequence >= latest[key][0]:
-                latest[key] = [sequence, identity, origin, stamp, bool(accepted)]
+            accepted = snapshot["size"] <= 4096 and (
+                identity in applied
+                or (state == "HANDLED" and receipt and self.accepted_result(json.loads(receipt)))
+            )
+            latest[origin, slot] = [sequence, identity, origin, stamp, bool(accepted)]
         return list(latest.values())
 
     def acknowledge(self, ids, result, *, published_at):
@@ -348,25 +316,20 @@ class Intake:
             for k in ("status", "delta_version", "batch_id", "operation_id")
             if k in result
         }
+        eligible = [identity for identity in ids if accepted_input(result, identity)]
+        if not eligible:
+            return
+        receipt = digest([eligible, summary])
         with self.db:
-            certified = set(result.get("confirmed_input_ids", ()))
-            eligible = [identity for identity in ids if accepted_input(result, identity)]
-            for group, payload in (
-                ([i for i in eligible if i not in certified], summary),
-                ([i for i in eligible if i in certified], {**summary, "ar_slot_confirmed": True}),
-            ):
-                if not group:
-                    continue
-                receipt = digest([group, payload])
-                self.db.execute(
-                    "INSERT OR IGNORE INTO receipts VALUES(?,?,?)",
-                    (receipt, published_at, canonical(payload)),
-                )
-                self.db.executemany(
-                    "UPDATE inputs SET state='HANDLED', published_at=?, result=? "
-                    "WHERE input_id=? AND state='CAPTURED'",
-                    [(published_at, receipt, identity) for identity in group],
-                )
+            self.db.execute(
+                "INSERT OR IGNORE INTO receipts VALUES(?,?,?)",
+                (receipt, published_at, canonical(summary)),
+            )
+            self.db.executemany(
+                "UPDATE inputs SET state='HANDLED', published_at=?, result=? "
+                "WHERE input_id=? AND state='CAPTURED'",
+                [(published_at, receipt, identity) for identity in eligible],
+            )
 
     def defer(self, ids, result):
         if result.get("status") in {"RETRY_WAIT", "PAUSED_RETRY_EXHAUSTED"}:
@@ -456,9 +419,11 @@ class Intake:
             if previous is None or snapshot.sha256 != previous.sha256:
                 self.remember(item.family, snapshot)
             counts["captured" if self.db.total_changes > before else "unchanged"] += 1
+            return True
         except (OSError, CaptureError, IntegrityError) as exc:
             self.failure(item.path, str(exc))
             counts["failed"] += 1
+            return False
 
     def capture_live(self, config, policy, candidates, *, window, clock=time.monotonic):
         if self.lane != "live":
@@ -496,6 +461,13 @@ class Intake:
             "audited": 0,
         }
         cursors = json.loads(self.setting("live_capture_cursors") or "{}")
+        ar_pending = {
+            str(item.path): item.origin
+            for tier in ("current", "unseen")
+            for item in tiers[tier]
+            if item.family == "LISTA_AR"
+        }
+        ar_failed = json.loads(self.setting("live_ar_failed_captures") or "{}")
         last, attempts = None, 0
         for tier, items in tiers.items():
             cursor = cursors.setdefault(tier, {})
@@ -507,13 +479,20 @@ class Intake:
                 ):
                     break
                 prior = known[str(item.path)]
-                self._capture_item(
+                accepted = self._capture_item(
                     config,
                     policy,
                     item,
                     counts,
                     previous=Snapshot(**json.loads(prior)) if prior else None,
                 )
+                if item.family == "LISTA_AR":
+                    path = str(item.path)
+                    if accepted:
+                        ar_pending.pop(path, None)
+                        ar_failed.pop(path, None)
+                    else:
+                        ar_failed[path] = item.origin
                 if audit:
                     counts["audited"] += 1
                 attempts += 1
@@ -523,6 +502,9 @@ class Intake:
         if last is not None:
             self.set("live_capture_cursors", canonical(cursors))
             self.set("cursor", canonical(last))
+        if ar_failed or self.setting("live_ar_failed_captures"):
+            self.set("live_ar_failed_captures", canonical(ar_failed))
+        counts["ar_capture_pending"] = sorted(set(ar_pending.values()) | set(ar_failed.values()))
         return counts
 
 

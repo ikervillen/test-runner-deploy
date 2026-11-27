@@ -203,8 +203,6 @@ def _publish_family(
     (root / "controls").mkdir(exist_ok=True)
     immutable_json(root / "controls" / (proof + ".json"), control_payload)
     controls[family] = {"hash": proof, "uri": "controls/" + proof + ".json"}
-    if family == "LISTA_AR" and table is None and slot_receipts is not None:
-        controls[family]["slot_receipts"] = slot_receipts
     if table is not None:
         previous_ref = refs.get(family, {})
         owner_confirmed_at = confirmed_at
