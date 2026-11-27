@@ -12,6 +12,7 @@ from .common import IntegrityError, digest
 from .evidence import Evidence
 from .lanes import _clip, canonical_hour, hour_holding
 from .metrics import Window
+from .silver_coverage import COVERAGE_RULE
 
 RETRY_REASONS = {"SOURCE_COVERAGE_PENDING", "MIA_SOURCE_COVERAGE_PENDING"}
 AR_REVIEW_REASONS = {
@@ -148,6 +149,7 @@ def ar_pin(document, silver_refs):
         key: silver_refs.get(key)
         for key in (
             "LISTA_AR",
+            "SIP_DEFECTO",
             "SIP_DEFECTO_STATUS",
             "SIP_DEFECTO_AR",
             "MP9_CAMBIO_MODELO",
@@ -162,6 +164,7 @@ def ar_pin(document, silver_refs):
             document["association_cases"],
             document["bundle"]["catalog_composition"],
             document["bundle"]["cases"].get("LISTA_AR", []),
+            document.get("ar_receipts_hash"),
         ]
     )
 
@@ -256,8 +259,9 @@ def ar_revisions(root, visible, document, current, cutoff, budget, *, bounds=Non
         identity = scope.get("evidence_reference")
         if not identity:
             return False
-        key = digest(["ar-window-v2", window.identity, window.cutoff, identity])
+        key = digest(["ar-window-v3", window.identity, window.cutoff, identity])
         before = baseline.get(key)
+        requires_review = False
         if before is None:
             try:
                 prior = inputs(identity)
@@ -268,20 +272,29 @@ def ar_revisions(root, visible, document, current, cutoff, budget, *, bounds=Non
                 pinned_config and pinned_config != document.get("score_config_id")
             ):
                 return False
+            legacy_coverage = prior.document.get("coverage_rule") != COVERAGE_RULE
             pinned = prior.document.get("ar_categories", legacy_categories)
             old_rule = prior.document.get("ar_unit_rule")
             if (
                 prior.document.get("ar_pin") == document["ar_pin"]
                 and pinned == document["ar_categories"]
                 and old_rule == document.get("ar_unit_rule")
+                and not legacy_coverage
             ):
                 return False
-            before = digest(
-                _ar_window(
-                    old_assignments(identity)[window.production_id], pinned, window, old_rule
-                )
+            prior_events = _ar_window(
+                old_assignments(identity)[window.production_id], pinned, window, old_rule
             )
-        if remembered is not None:
+            before = digest(prior_events)
+            # A former zero with no AR events lacked proof of complete coverage.
+            # retry_closures still requires the new certificates before revising it.
+            requires_review = (
+                bool(pinned_config)
+                and legacy_coverage
+                and scope["estado"] == "READY"
+                and not prior_events
+            )
+        if remembered is not None and not requires_review:
             remembered[key] = before
         after = _ar_window(
             current_assignments()[window.production_id],
@@ -290,7 +303,7 @@ def ar_revisions(root, visible, document, current, cutoff, budget, *, bounds=Non
             document.get("ar_unit_rule"),
         )
         fingerprint = digest(after)
-        if before == fingerprint:
+        if before == fingerprint and not requires_review:
             return False
         revisions[window.identity] = {
             "previous_evidence": identity,

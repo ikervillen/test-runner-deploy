@@ -84,6 +84,21 @@ def _coverage_ready(snapshot, p, window, pending, required=None):
         return False
     for family in required:
         matching = [r for r in scopes if r["source"] == family and r["estado"] == "READY"]
+        if family == "LISTA_AR" and (
+            snapshot.manifest.get("lane") == "live"
+            or any(r.get("ar_receipts_required") for r in matching)
+        ):
+            if not any(
+                covers(r, coverage_window)
+                and not any(
+                    (left is None or context.stamp(left) < coverage_window.cutoff)
+                    and (right is None or context.stamp(right) > coverage_window.start)
+                    for left, right in r.get("ar_review_intervals", ())
+                )
+                for r in matching
+            ):
+                return False
+            continue
         if not any(
             covers(r, coverage_window)
             if "confirmed_slots" in r

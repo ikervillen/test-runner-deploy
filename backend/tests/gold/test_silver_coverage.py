@@ -88,12 +88,13 @@ def test_an_empty_slot_needs_both_bronze_bytes_and_owner_confirmation(monkeypatc
                 (2, "missing-silver", "AV21", b""),
                 (3, "not-blank", "AV23", b"25/11/2026 07:50:00;old"),
                 (4, "new-revision", "AV22", b""),
+                (5, "ar-accepted", "AV31", b"x" * 5000),
             )
             for sequence, identity, origin, data in entries:
                 if not limits["after"] < sequence <= limits["after"] + limits["limit"]:
                     continue
                 yield SimpleNamespace(
-                    family=FAMILY,
+                    family="LISTA_AR" if sequence == 5 else FAMILY,
                     input_id=identity,
                     sequence=sequence,
                     snapshot=SimpleNamespace(
@@ -138,3 +139,56 @@ def test_an_empty_slot_needs_both_bronze_bytes_and_owner_confirmation(monkeypatc
     assert confirmed_blanks(
         None, snapshot, SimpleNamespace(live_batch_files=64, window_seconds=600), after=8999
     )[1] == {(FAMILY, "AV32", slot): "confirmed", (FAMILY, "AV23", slot): None}
+    snapshot.manifest["controls"] = {
+        "LISTA_AR": {"slot_receipts": [[5, "ar-accepted", "AV31", clock, True]]}
+    }
+    assert (
+        confirmed_blanks(
+            None, snapshot, SimpleNamespace(live_batch_files=64, window_seconds=600), after=8999
+        )[1]["LISTA_AR", "AV31", slot]
+        == "ar-accepted"
+    )
+
+
+def test_ar_with_events_requires_exact_receipts_and_ignores_unrelated_review(tmp_path):
+    from types import SimpleNamespace
+
+    from app.gold.pipeline import _coverage_ready
+
+    family = "LISTA_AR"
+    row = dict(
+        source=family,
+        origin="AV21",
+        estado="READY",
+        reason_code="MANUAL_REVIEW",
+        ar_receipts_required=True,
+        ar_review_intervals=[(None, START.isoformat())],
+    )
+    evidence = SimpleNamespace(manifest={"lane": "live", "coverage": [row]})
+    prod = dict(origen_fenix="AV21", id_produccion="p")
+    end = START + 6 * STEP
+    hour = Window("p", "HOUR", START, end, end)
+    receipts = BlankReceipts(tmp_path, 600)
+    slots = [(family, "AV21", slot_number(START + STEP * i, 600)) for i in range(1, 7)]
+    seen = {key: (i, f"ar-{i}") for i, key in enumerate(slots, 1)}
+    assert not _coverage_ready(evidence, prod, hour, [], {family})
+
+    def prepare():
+        row.pop("confirmed_slots", None)
+        SlotCoverage(
+            [row], seconds=600, indexed={}, tables={}, index=None, receipts=receipts
+        ).prepare(START, end)
+
+    verified = {k: capture for k, (_, capture) in seen.items()}
+    receipts.update(seen, {k: v for k, v in verified.items() if k != slots[0]})
+    prepare()
+    assert not _coverage_ready(evidence, prod, hour, [], {family})
+    receipts.update(seen, verified)
+    prepare()
+    assert _coverage_ready(evidence, prod, hour, [], {family})
+    row["ar_review_intervals"] = [((START - STEP).isoformat(), None)]
+    assert not _coverage_ready(evidence, prod, hour, [], {family})
+    row["ar_review_intervals"] = []
+    receipts.update({slots[0]: (7, "revision-pending")}, {})
+    prepare()
+    assert not _coverage_ready(evidence, prod, hour, [], {family})

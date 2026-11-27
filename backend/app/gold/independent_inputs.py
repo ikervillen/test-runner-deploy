@@ -18,16 +18,36 @@ from .producer import FAMILIES, _apply_horizon, _apply_live, auxiliary
 from .series_handover import RELATION, apply_series_handover, recent_relations
 from .silver_coverage import (
     COVERAGE_RULE,
-    SLOT_FAMILIES,
+    RECEIPT_FAMILIES,
     BlankReceipts,
     SlotCoverage,
     confirmed_blanks,
+    slot_receipts,
 )
 from .silver_incremental import FullReadRequired, references
 
 AUXILIARY = frozenset(
     {"MP9_PARAM_MODELO", "SIP_NUMERO_GOTAS_SIMULTANEAS", "SIP_MAQUINA_MOLDEO", "MP9_LISTA_RECH_ZC"}
 )
+
+
+def ar_review_intervals(cases, origin):
+    spans = set()
+    for case in cases:
+        payload = case["payload"]
+        evidence = payload.get("evidence", ())
+        if isinstance(evidence, dict):
+            evidence = [evidence]
+        candidates = payload.get("candidates") or [payload.get("candidate", payload)]
+        for row in candidates:
+            source = row.get("origen_fenix")
+            if source is not None and source != origin:
+                continue
+            origins = {item.get("origin") for item in evidence}
+            if source is None and origins and None not in origins and origin not in origins:
+                continue
+            spans.add((row.get("FECHA_ON"), row.get("FECHA_OFF")))
+    return sorted(spans, key=lambda span: (span[0] or "", span[1] or ""))
 
 
 def auxiliary_turn(pipelines, lane, *, encoding):
@@ -77,7 +97,7 @@ def auxiliary_turn(pipelines, lane, *, encoding):
             )
         if capture.family == RELATION:
             relation_cursor = capture.sequence
-        if capture.family in SLOT_FAMILIES and "T" in (capture.snapshot.producer_time or ""):
+        if capture.family in RECEIPT_FAMILIES and "T" in (capture.snapshot.producer_time or ""):
             slot_cursor = capture.sequence
         cursor = capture.sequence
     tables = auxiliary(root, (), captures=captures, initial=initial, encoding=encoding)
@@ -399,6 +419,11 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                 "quality_hash": digest(cases[family]),
                 "last_successful_discovery": ref.get("owner_confirmed_at"),
             }
+            if family == "LISTA_AR" and lane == "live":
+                row["ar_receipts_required"] = True
+                row["ar_review_intervals"] = ar_review_intervals(cases[family], origin)
+                if any(item[2] == origin and item[4] for item in slot_receipts(own, family)):
+                    row["estado"] = "READY"
             instants = (
                 ()
                 if lane == "live"
@@ -534,9 +559,9 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                     [
                         [
                             family,
-                            own.manifest["tables"].get(family, {}).get("slot_receipts"),
+                            slot_receipts(own, family),
                         ]
-                        for family in sorted(SLOT_FAMILIES)
+                        for family in sorted(RECEIPT_FAMILIES)
                     ],
                 ]
             )
@@ -579,6 +604,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                 from .live_hours import ar_pin
 
                 doc["ar_categories"] = ar_categories
+                doc["ar_receipts_hash"] = digest(slot_receipts(own, "LISTA_AR"))
                 doc["ar_pin"] = ar_pin(doc, silver_refs)
             if (published / "current.json").exists():
                 from .live_hours import ar_revisions, retry_closures
@@ -596,6 +622,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                         review.get("ar_pin") != doc["ar_pin"]
                         or review.get("ar_categories") != ar_categories
                         or review.get("ar_unit_rule") != AR_UNIT_RULE
+                        or review.get("coverage_rule") != COVERAGE_RULE
                         or review.get("more_hourly_revisions")
                         or review.get("ar_review_waiting")
                     ):
