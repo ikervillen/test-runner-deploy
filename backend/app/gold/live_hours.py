@@ -184,7 +184,7 @@ def ar_pin(document, silver_refs):
             document["association_cases"],
             document["bundle"]["catalog_composition"],
             document["bundle"]["cases"].get("LISTA_AR", []),
-            document.get("ar_receipts_hash"),
+            document.get("ar_blocked_origins"),
         ]
     )
 
@@ -293,6 +293,13 @@ def ar_revisions(root, visible, document, current, cutoff, budget, *, bounds=Non
             ):
                 return False
             legacy_coverage = prior.document.get("coverage_rule") != COVERAGE_RULE
+            prior_origin = scope.get("origin")
+            prior_blocked = any(
+                row["source"] == "LISTA_AR"
+                and row.get("origin") in {None, prior_origin}
+                and (row.get("estado") != "READY" or row.get("reason_code") == "MANUAL_REVIEW")
+                for row in prior.document.get("coverage", ())
+            )
             pinned = prior.document.get("ar_categories", legacy_categories)
             old_rule = prior.document.get("ar_unit_rule")
             if (
@@ -306,11 +313,11 @@ def ar_revisions(root, visible, document, current, cutoff, budget, *, bounds=Non
                 old_assignments(identity)[window.production_id], pinned, window, old_rule
             )
             before = digest(prior_events)
-            # A former zero with no AR events lacked proof of complete coverage.
-            # retry_closures still requires the new certificates before revising it.
+            # Prior workers could publish a zero although the pinned AR intake was blocked.
             requires_review = (
                 bool(pinned_config)
                 and legacy_coverage
+                and prior_blocked
                 and scope["estado"] == "READY"
                 and not scope.get("reason_code")
                 and not prior_events

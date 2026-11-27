@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import suppress
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from functools import cache
 from json import loads
 
@@ -48,6 +48,39 @@ def ar_review_intervals(cases, origin):
                 continue
             spans.add((row.get("FECHA_ON"), row.get("FECHA_OFF")))
     return sorted(spans, key=lambda span: (span[0] or "", span[1] or ""))
+
+
+def ar_blocked_origins(storage, manifest, config, latency, *, now=None):
+    from .common import read_json
+
+    origins = sorted(dict(config.sources))
+    try:
+        status = read_json(storage.exchange / "ar-intake.json")
+        table = manifest["tables"].get("LISTA_AR", {})
+        controls = manifest.get("controls", {})
+        pin = digest(
+            [
+                table.get("table_id"),
+                table.get("version"),
+                [
+                    controls.get(name, {}).get("hash")
+                    for name in ("LISTA_AR", "SIP_DEFECTO", "SIP_DEFECTO_STATUS", "SIP_DEFECTO_AR")
+                ],
+            ]
+        )
+        age = (now or datetime.now(UTC)) - datetime.fromisoformat(status["discovered_at"])
+        blocked = status["blocked_origins"]
+        if (
+            status["identity"] == manifest["identity"]
+            and status["pin"] == pin
+            and isinstance(blocked, list)
+            and all(origin in origins for origin in blocked)
+            and 0 <= age.total_seconds() < latency
+        ):
+            return sorted(set(blocked))
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return origins
 
 
 def auxiliary_turn(pipelines, lane, *, encoding):
@@ -187,11 +220,17 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
         historical_gold = None
     if active is not None:
         historical_gold = active["history"]
+    ar_blocked = (
+        ar_blocked_origins(storage, own.manifest, config, policy.latency_seconds)
+        if lane == "live"
+        else None
+    )
     vector = [s.manifest["publication_id"] for s in snapshots]
     vector.extend(
         [
             archive.manifest["publication_id"] if archive else None,
             list(auxiliary_version) if lane == "live" else cursor,
+            ar_blocked,
             historical_gold,
         ]
     )
@@ -420,12 +459,11 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                 "last_successful_discovery": ref.get("owner_confirmed_at"),
             }
             if family == "LISTA_AR" and lane == "live":
-                # An owner receipt confirms the bytes it processed. Fenix has
-                # not established that these receipts delimit a complete clock interval.
-                row["ar_receipts_required"] = True
+                row["ar_event_source"] = True
                 row["ar_review_intervals"] = ar_review_intervals(cases[family], origin)
-                if any(item[2] == origin and item[4] for item in slot_receipts(own, family)):
-                    row["estado"] = "READY"
+                row["estado"] = "WAITING_INPUT" if origin in ar_blocked else "READY"
+                if origin in ar_blocked:
+                    row["reason_code"] = "AR_INGESTION_PENDING"
             instants = (
                 ()
                 if lane == "live"
@@ -606,7 +644,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                 from .live_hours import ar_pin
 
                 doc["ar_categories"] = ar_categories
-                doc["ar_receipts_hash"] = digest(slot_receipts(own, "LISTA_AR"))
+                doc["ar_blocked_origins"] = ar_blocked
                 doc["ar_pin"] = ar_pin(doc, silver_refs)
             if (published / "current.json").exists():
                 from .live_hours import ar_revisions, retry_closures

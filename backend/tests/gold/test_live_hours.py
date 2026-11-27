@@ -123,8 +123,6 @@ def test_older_ar_waits_for_a_changed_dependency_and_retains_the_original_cut():
 
 
 def test_previously_ready_close_is_revisited_only_with_new_ar_proof():
-    from app.gold.silver_coverage import required_slots
-
     snapshot = FixtureSnapshot(
         {
             "productions": [prod("ready")],
@@ -132,14 +130,14 @@ def test_previously_ready_close_is_revisited_only_with_new_ar_proof():
         }
     )
     options = {"older": (START, END), "ar_changed": lambda *_: True}
-    coverage = dict(source="LISTA_AR", origin="AV31", estado="READY", ar_receipts_required=True)
+    coverage = dict(source="LISTA_AR", origin="AV31", estado="WAITING_INPUT", ar_event_source=True)
     later = END + timedelta(hours=9)
     invalidations = []
     assert not retry_closures(snapshot, [coverage], later, 100, invalidate=invalidations, **options)
     assert invalidations == [
         [scope("ready", END)["scope_id"], "ready", "AV31", START.isoformat(), END.isoformat()]
     ]
-    coverage.update(slot_seconds=600, confirmed_slots=list(required_slots(START, END, 600)))
+    coverage["estado"] = "READY"
     assert retry_closures(snapshot, [coverage], later, 100, **options) == [
         ["ready", START.isoformat(), END.isoformat(), END.isoformat()]
     ]

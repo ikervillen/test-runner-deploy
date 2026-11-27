@@ -147,7 +147,7 @@ def test_an_empty_slot_needs_both_bronze_bytes_and_owner_confirmation(monkeypatc
     )[1]
 
 
-def test_ar_with_events_requires_exact_receipts_and_ignores_unrelated_review(tmp_path):
+def test_event_source_accepts_silence_but_rejects_actual_intake_and_review_gaps():
     from types import SimpleNamespace
 
     from app.gold.pipeline import _coverage_ready
@@ -158,37 +158,40 @@ def test_ar_with_events_requires_exact_receipts_and_ignores_unrelated_review(tmp
         origin="AV21",
         estado="READY",
         reason_code="MANUAL_REVIEW",
-        ar_receipts_required=True,
+        ar_event_source=True,
         ar_review_intervals=[(None, START.isoformat())],
     )
     evidence = SimpleNamespace(manifest={"lane": "live", "coverage": [row]})
     prod = dict(origen_fenix="AV21", id_produccion="p")
     end = START + 6 * STEP
     hour = Window("p", "HOUR", START, end, end)
-    receipts = BlankReceipts(tmp_path, 600)
-    slots = [(family, "AV21", slot_number(START + STEP * i, 600)) for i in range(1, 7)]
-    seen = {key: (i, f"ar-{i}") for i, key in enumerate(slots, 1)}
-    assert not _coverage_ready(evidence, prod, hour, [], {family})
-
-    def prepare():
-        row.pop("confirmed_slots", None)
-        SlotCoverage(
-            [row], seconds=600, indexed={}, tables={}, index=None, receipts=receipts
-        ).prepare(START, end)
-
-    verified = {k: capture for k, (_, capture) in seen.items()}
-    receipts.update(seen, {k: v for k, v in verified.items() if k != slots[0]})
-    prepare()
-    assert not _coverage_ready(evidence, prod, hour, [], {family})
-    receipts.update(seen, verified)
-    prepare()
-    # Six accepted deliveries still do not establish the producer's temporal contract.
-    assert not _coverage_ready(evidence, prod, hour, [], {family})
-    row.update(confirmed_slots=[key[2] for key in slots], slot_seconds=600)
     assert _coverage_ready(evidence, prod, hour, [], {family})
     row["ar_review_intervals"] = [((START - STEP).isoformat(), None)]
     assert not _coverage_ready(evidence, prod, hour, [], {family})
     row["ar_review_intervals"] = []
-    receipts.update({slots[0]: (7, "revision-pending")}, {})
-    prepare()
+    row.update(estado="WAITING_INPUT", reason_code="AR_INGESTION_PENDING")
     assert not _coverage_ready(evidence, prod, hour, [], {family})
+
+
+def test_event_intake_health_uses_discovery_age_and_silver_pin_not_csv_age(tmp_path):
+    from datetime import UTC
+    from types import SimpleNamespace
+
+    from app.gold.common import atomic_json, digest
+    from app.gold.independent_inputs import ar_blocked_origins
+
+    storage = SimpleNamespace(exchange=tmp_path)
+    config = SimpleNamespace(sources=[("AV21", None), ("AV23", None)])
+    manifest = {"identity": "worker", "tables": {"LISTA_AR": {"table_id": "ar", "version": 230}}}
+    clock = START.replace(tzinfo=UTC)
+    status = {
+        "identity": "worker",
+        "pin": digest(["ar", 230, [None] * 4]),
+        "discovered_at": clock.isoformat(),
+        "blocked_origins": ["AV23"],
+    }
+    atomic_json(tmp_path / "ar-intake.json", status)
+    assert ar_blocked_origins(storage, manifest, config, 300, now=clock) == ["AV23"]
+    assert ar_blocked_origins(storage, manifest, config, 300, now=clock + STEP) == ["AV21", "AV23"]
+    manifest["tables"]["LISTA_AR"]["version"] = 231
+    assert ar_blocked_origins(storage, manifest, config, 300, now=clock) == ["AV21", "AV23"]

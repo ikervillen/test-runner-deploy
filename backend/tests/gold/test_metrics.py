@@ -88,6 +88,31 @@ def test_open_ar_contributes_45_minutes_without_fabricating_a_close():
     )
 
 
+def test_event_source_scores_three_hours_from_one_open_close_without_periodic_files():
+    from types import SimpleNamespace
+
+    from app.gold.pipeline import _coverage_ready
+
+    source = dict(source="LISTA_AR", origin="AV21", estado="READY", ar_event_source=True)
+    snapshot = SimpleNamespace(manifest={"coverage": [source]})
+    production = dict(id_produccion="p", origen_fenix="AV21")
+    row = event(START + timedelta(minutes=30), START + timedelta(hours=2, minutes=30))
+    exposure = []
+    for hour in range(4):
+        left = START + timedelta(hours=hour)
+        right = left + timedelta(hours=1)
+        score_window = Window("p", "HOUR", left, right, right)
+        assert _coverage_ready(snapshot, production, score_window, [], {"LISTA_AR"})
+        amounts = ar_bases([row], capacity(), score_window)["amounts"]
+        exposure.append({r["ambito"]: r["tiempo_afectado_us"] // 60_000_000 for r in amounts})
+    assert exposure == [
+        {"CATEGORY": minutes, "DAR_GROUP": minutes, "DAR_TOTAL": minutes}
+        for minutes in (30, 60, 30)
+    ] + [{}]
+    source["estado"] = "WAITING_INPUT"
+    assert not _coverage_ready(snapshot, production, score_window, [], {"LISTA_AR"})
+
+
 def test_an_unresolved_non_dar_event_only_blocks_its_aql_category():
     row = {**event(START, None), "cavidad": "99Z", "grupo_dar": None}
     result = ar_bases([row], capacity(), window(), independent=True)

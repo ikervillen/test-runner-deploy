@@ -8,7 +8,7 @@ from .evidence import OPERATIONS
 from .fragment_delta import EPOCH
 
 SLOT_FAMILIES = OPERATIONS - {"LISTA_AR"}
-COVERAGE_RULE = "confirmed-slots-v4"
+COVERAGE_RULE = "ar-events-v1"
 
 
 def slot_receipts(snapshot, family):
