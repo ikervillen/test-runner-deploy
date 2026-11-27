@@ -22,6 +22,39 @@ const labels: Record<string, string> = {
   open: "En curso",
 };
 
+const reasons: Record<string, string> = {
+  AR_CAVITY_UNRESOLVED: "Cavidad AR sin identificar",
+  AR_MOULD_IDENTITY_PENDING: "Identidad del molde AR pendiente",
+  AR_MOULD_ATTRIBUTION_PENDING: "Atribución del molde AR en conflicto",
+  AR_SOURCE_COVERAGE_PENDING: "Cobertura Silver de avisos AR pendiente",
+  CAPACITY_COVERAGE_GAP: "Intervalo sin capacidad acreditada",
+  HOURLY_HANDOVER_AMBIGUOUS: "Relevo sin un cierre horario inequívoco",
+  LISTA_RECH_BASE_MISSING: "Base de inspecciones MIA pendiente",
+  MIA_REFERENCE_PENDING: "Referencia estadística MIA pendiente",
+  MIA_SOURCE_COVERAGE_PENDING: "Cobertura Silver de MIA pendiente",
+  MIA_TRANSITION_SAMPLE_UNRESOLVED:
+    "Muestra de inspección cruza el corte del relevo",
+  SOURCE_COVERAGE_PENDING: "Cobertura Silver pendiente",
+  ZC_SOURCE_COVERAGE_PENDING: "Cobertura Silver de ZC pendiente",
+  ZC_THEORETICAL_BASE_MISSING: "Base teórica ZC pendiente",
+  ZC_TRANSITION_SAMPLE_UNRESOLVED: "Muestra ZC cruza el corte del relevo",
+};
+
+function closureDescription(row: LiveResult) {
+  const codes = row.reason?.split(";").filter(Boolean) ?? [];
+  return [
+    row.model,
+    row.production,
+    row.cutoff && `${stamp(row.start)}–${stamp(row.cutoff)}`,
+    ...codes.map((code) => {
+      const label = reasons[code.split(":")[0]];
+      return label ? `${label} (${code})` : code;
+    }),
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
 const details: Record<string, string> = {
   quality_score_components: "Componentes",
   mia_score_details: "MIA",
@@ -389,6 +422,22 @@ export function LiveView({ historyOnly = false }: { historyOnly?: boolean }) {
       {view &&
         !historyOnly &&
         positions.map(([line, machine, label]) => {
+          const active = view.active_productions?.find(
+            (item) => item.line === line && item.machine === machine,
+          );
+          const modelLabel = view.stale
+            ? "Modelo sin actualizar"
+            : active?.state === "ambiguous"
+              ? "Producción sin confirmar"
+              : active?.zf_ambiguous
+                ? `ZC · ${active.model ?? "sin confirmar"} | ZF · sin confirmar`
+                : active?.zf_model && active.zf_model !== active.model
+                  ? `ZC · ${active.model ?? "sin confirmar"} | ZF · ${active.zf_model}`
+                  : active?.model
+                    ? `Modelo ${active.model}`
+                    : active || !view.active_productions
+                      ? "Modelo no disponible"
+                      : "Sin producción activa acreditada";
           const rows = view.hours.map((hour) =>
             hour.state === "open"
               ? []
@@ -417,9 +466,17 @@ export function LiveView({ historyOnly = false }: { historyOnly?: boolean }) {
               className="border-b border-[#dce4e0] py-5"
             >
               <div className="mb-3 flex items-baseline justify-between gap-3">
-                <h2 className="text-4xl font-semibold tracking-tight md:text-[44px]">
-                  {label}
-                  <span className="sr-only"> · Máquina {machine}</span>
+                <h2 className="flex min-w-0 items-baseline gap-3">
+                  <span className="shrink-0 text-4xl font-semibold tracking-tight md:text-[44px]">
+                    {label}
+                  </span>
+                  <span
+                    className="truncate text-sm font-medium text-[#496357] md:text-base"
+                    title={modelLabel}
+                  >
+                    {modelLabel}
+                  </span>
+                  <span className="sr-only">Máquina {machine}</span>
                 </h2>
                 <p
                   className="text-4xl font-semibold tabular-nums md:text-[44px]"
@@ -431,6 +488,16 @@ export function LiveView({ historyOnly = false }: { historyOnly?: boolean }) {
                     Penalización total publicada:{" "}
                   </span>
                   {headline ? number.format(headline.total_penalty!) : "—"}
+                  {headline?.model &&
+                    active?.production &&
+                    headline.production !== active.production && (
+                      <span
+                        className="ml-2 inline-block max-w-32 truncate align-middle text-xs font-medium"
+                        title={`Score del modelo ${headline.model}`}
+                      >
+                        Modelo {headline.model}
+                      </span>
+                    )}
                   {headline && (
                     <span className="sr-only">
                       {" "}
@@ -540,18 +607,9 @@ export function LiveView({ historyOnly = false }: { historyOnly?: boolean }) {
                                 <th
                                   scope="row"
                                   className="px-1 font-normal"
-                                  title={row.reason ?? row.production}
+                                  title={closureDescription(row)}
                                 >
                                   {stamp(hour.end)}
-                                  {entries.length > 1 && (
-                                    <span className="block text-[11px] leading-tight text-[#53645d]">
-                                      {row.production.slice(
-                                        row.production.lastIndexOf(":") + 1,
-                                      )}{" "}
-                                      · {stamp(row.start)}–
-                                      {stamp(row.cutoff ?? hour.end)}
-                                    </span>
-                                  )}
                                   {state && (
                                     <span className="block text-[11px] leading-tight text-[#53645d]">
                                       {state}
@@ -561,9 +619,23 @@ export function LiveView({ historyOnly = false }: { historyOnly?: boolean }) {
                                 {components.map(([code, title, detail]) => {
                                   const value = row.contributions?.[code];
                                   return (
-                                    <td key={code} className="px-1 text-right">
+                                    <td
+                                      key={code}
+                                      className="px-1 text-right"
+                                      title={
+                                        row.component_states?.[code] ===
+                                        "WAITING_DEPENDENCY"
+                                          ? closureDescription(row)
+                                          : undefined
+                                      }
+                                    >
                                       {value === undefined || !row.result_id ? (
-                                        "—"
+                                        row.component_states?.[code] ===
+                                        "NOT_APPLICABLE" ? (
+                                          <abbr title="No aplicable">N/A</abbr>
+                                        ) : (
+                                          "—"
+                                        )
                                       ) : (
                                         <button
                                           type="button"

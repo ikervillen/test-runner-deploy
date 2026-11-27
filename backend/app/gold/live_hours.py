@@ -12,6 +12,7 @@ from .common import IntegrityError, digest
 from .evidence import Evidence
 from .lanes import _clip, canonical_hour, hour_holding
 from .metrics import Window
+from .silver_coverage import COVERAGE_RULE
 
 RETRY_REASONS = {"SOURCE_COVERAGE_PENDING", "MIA_SOURCE_COVERAGE_PENDING"}
 AR_REVIEW_REASONS = {
@@ -24,8 +25,9 @@ AR_REVIEW_REASONS = {
     "MODEL_SEGMENT_DAR_PROFILE_PENDING",
     "CAPACITY_COVERAGE_GAP",
 }
+AR_COVERAGE_PENDING = "AR_SOURCE_COVERAGE_PENDING"
 COMPONENT_COVERAGE_REASONS = {
-    "AR_SOURCE_COVERAGE_PENDING": {"LISTA_AR"},
+    AR_COVERAGE_PENDING: {"LISTA_AR"},
     "ZC_SOURCE_COVERAGE_PENDING": {"CONT_ZC"},
 }
 
@@ -39,6 +41,7 @@ def retry_closures(
     closed=None,
     ar_changed=None,
     waiting=None,
+    invalidate=None,
     prepare=None,
     older=None,
 ):
@@ -114,7 +117,10 @@ def retry_closures(
             continue
         reasons = set((row.get("reason_code") or "").split(";"))
         coverage_reasons = reasons & (RETRY_REASONS | COMPONENT_COVERAGE_REASONS.keys())
-        if older and not (coverage_reasons or (ar_changed and reasons & AR_REVIEW_REASONS)):
+        if older and not (
+            coverage_reasons
+            or (ar_changed and (row["estado"] == "READY" or reasons & AR_REVIEW_REASONS))
+        ):
             continue
         revised = ar_changed(row, window) if ar_changed else False
         if not revised and row["period_end"] == chunk.cutoff and not coverage_reasons:
@@ -137,6 +143,21 @@ def retry_closures(
                 waiting.append(window.identity)
             if closed is not None and row["estado"] == "READY":
                 closed.append(window.identity)
+            if (
+                invalidate is not None
+                and row["estado"] == "READY"
+                and not row.get("reason_code")
+                and not _coverage_ready(probe, production, window, [], {"LISTA_AR"})
+            ):
+                invalidate.append(
+                    [
+                        window.identity,
+                        identity,
+                        production["origen_fenix"],
+                        left.isoformat(),
+                        window.cutoff.isoformat(),
+                    ]
+                )
         if len(result) == 12 and closed is None and not ar_changed and not older:
             break
     return result
@@ -148,6 +169,7 @@ def ar_pin(document, silver_refs):
         key: silver_refs.get(key)
         for key in (
             "LISTA_AR",
+            "SIP_DEFECTO",
             "SIP_DEFECTO_STATUS",
             "SIP_DEFECTO_AR",
             "MP9_CAMBIO_MODELO",
@@ -161,7 +183,13 @@ def ar_pin(document, silver_refs):
             document["registry"],
             document["association_cases"],
             document["bundle"]["catalog_composition"],
-            document["bundle"]["cases"].get("LISTA_AR", []),
+            {
+                family: document["bundle"]["cases"].get(family, [])
+                for family in ("LISTA_AR", "SIP_DEFECTO", "SIP_DEFECTO_STATUS", "SIP_DEFECTO_AR")
+            },
+            document.get("ar_blocked_origins"),
+            document.get("ar_attribution_rule"),
+            document.get("ar_reference_controls"),
         ]
     )
 
@@ -246,7 +274,10 @@ def ar_revisions(root, visible, document, current, cutoff, budget, *, bounds=Non
         work += sum(counts["rows_decoded"] for counts in evidence.read_stats.values())
         if work >= budget:
             raise IntegrityError("Hourly AR revision exceeds its explicit row budget")
-        return _ar_by_production(rows, decisions)
+        reviewed = {r["source_id"] for r in decisions if r["status"] == "SOURCE_REVIEW"}
+        return _ar_by_production(rows, decisions), [
+            row for row in rows if source_id("LISTA_AR", row) in reviewed
+        ]
 
     @cache
     def current_assignments():
@@ -256,8 +287,17 @@ def ar_revisions(root, visible, document, current, cutoff, budget, *, bounds=Non
         identity = scope.get("evidence_reference")
         if not identity:
             return False
-        key = digest(["ar-window-v2", window.identity, window.cutoff, identity])
+        key = digest(
+            [
+                "ar-window-v4",
+                document.get("ar_attribution_rule"),
+                window.identity,
+                window.cutoff,
+                identity,
+            ]
+        )
         before = baseline.get(key)
+        requires_review = False
         if before is None:
             try:
                 prior = inputs(identity)
@@ -268,20 +308,48 @@ def ar_revisions(root, visible, document, current, cutoff, budget, *, bounds=Non
                 pinned_config and pinned_config != document.get("score_config_id")
             ):
                 return False
+            legacy_coverage = prior.document.get("coverage_rule") != COVERAGE_RULE
+            prior_origin = scope.get("origin")
+            prior_blocked = any(
+                row["source"] == "LISTA_AR"
+                and row.get("origin") in {None, prior_origin}
+                and (row.get("estado") != "READY" or row.get("reason_code") == "MANUAL_REVIEW")
+                for row in prior.document.get("coverage", ())
+            )
             pinned = prior.document.get("ar_categories", legacy_categories)
             old_rule = prior.document.get("ar_unit_rule")
             if (
                 prior.document.get("ar_pin") == document["ar_pin"]
                 and pinned == document["ar_categories"]
                 and old_rule == document.get("ar_unit_rule")
+                and prior.document.get("ar_attribution_rule") == document.get("ar_attribution_rule")
+                and not legacy_coverage
             ):
                 return False
-            before = digest(
-                _ar_window(
-                    old_assignments(identity)[window.production_id], pinned, window, old_rule
+            assigned, reviewed = old_assignments(identity)
+            prior_events = _ar_window(assigned[window.production_id], pinned, window, old_rule)
+            before = digest(prior_events)
+            # Prior workers could publish a zero although the pinned AR intake was blocked.
+            requires_review = (
+                bool(pinned_config)
+                and (
+                    (legacy_coverage and prior_blocked)
+                    or (
+                        prior.document.get("ar_attribution_rule")
+                        != document.get("ar_attribution_rule")
+                        and any(
+                            event["origen_fenix"] == prior_origin
+                            and event["FECHA_ON"] < window.cutoff
+                            and (event["FECHA_OFF"] is None or event["FECHA_OFF"] > window.start)
+                            for event in reviewed
+                        )
+                    )
                 )
+                and scope["estado"] == "READY"
+                and not scope.get("reason_code")
+                and not prior_events
             )
-        if remembered is not None:
+        if remembered is not None and not requires_review:
             remembered[key] = before
         after = _ar_window(
             current_assignments()[window.production_id],
@@ -290,7 +358,7 @@ def ar_revisions(root, visible, document, current, cutoff, budget, *, bounds=Non
             document.get("ar_unit_rule"),
         )
         fingerprint = digest(after)
-        if before == fingerprint:
+        if before == fingerprint and not requires_review:
             return False
         revisions[window.identity] = {
             "previous_evidence": identity,

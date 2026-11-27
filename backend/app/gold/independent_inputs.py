@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import suppress
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from functools import cache
 from json import loads
 
@@ -22,12 +22,69 @@ from .silver_coverage import (
     BlankReceipts,
     SlotCoverage,
     confirmed_blanks,
+    slot_receipts,
 )
 from .silver_incremental import FullReadRequired, references
 
 AUXILIARY = frozenset(
     {"MP9_PARAM_MODELO", "SIP_NUMERO_GOTAS_SIMULTANEAS", "SIP_MAQUINA_MOLDEO", "MP9_LISTA_RECH_ZC"}
 )
+
+
+def ar_review_intervals(cases, origin):
+    spans = set()
+    for case in cases:
+        payload = case["payload"]
+        evidence = payload.get("evidence", ())
+        if isinstance(evidence, dict):
+            evidence = [evidence]
+        candidates = payload.get("candidates") or [payload.get("candidate", payload)]
+        for row in candidates:
+            source = row.get("origen_fenix")
+            if source is not None and source != origin:
+                continue
+            origins = {item.get("origin") for item in evidence}
+            if source is None and origins and None not in origins and origin not in origins:
+                continue
+            spans.add((row.get("FECHA_ON"), row.get("FECHA_OFF")))
+    return sorted(spans, key=lambda span: (span[0] or "", span[1] or ""))
+
+
+def ar_reference_controls(manifest):
+    controls = manifest.get("controls", {})
+    return {
+        name: controls.get(name, {}).get("hash")
+        for name in ("LISTA_AR", "SIP_DEFECTO", "SIP_DEFECTO_STATUS", "SIP_DEFECTO_AR")
+    }
+
+
+def ar_blocked_origins(storage, manifest, config, latency, *, now=None):
+    from .common import read_json
+
+    origins = sorted(dict(config.sources))
+    try:
+        status = read_json(storage.exchange / "ar-intake.json")
+        table = manifest["tables"].get("LISTA_AR", {})
+        pin = digest(
+            [
+                table.get("table_id"),
+                table.get("version"),
+                list(ar_reference_controls(manifest).values()),
+            ]
+        )
+        age = (now or datetime.now(UTC)) - datetime.fromisoformat(status["discovered_at"])
+        blocked = status["blocked_origins"]
+        if (
+            status["identity"] == manifest["identity"]
+            and status["pin"] == pin
+            and isinstance(blocked, list)
+            and all(origin in origins for origin in blocked)
+            and 0 <= age.total_seconds() < latency
+        ):
+            return sorted(set(blocked))
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return origins
 
 
 def auxiliary_turn(pipelines, lane, *, encoding):
@@ -113,6 +170,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
 
     storage, policy = getattr(pipelines, lane), pipelines.policy
     own = SilverSnapshot.open(storage)
+    ar_attribution_rule = getattr(native, "AR_ATTRIBUTION_RULE", None)
     from ingesta_delta_lake.common import IntegrityError as NativeIntegrityError
 
     from .common import atomic_json, immutable_json, live_epoch, read_json
@@ -129,6 +187,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
         ):
             active = pinned
             own = SilverSnapshot.open(storage, publication_id=active["target"])
+    ar_controls = ar_reference_controls(own.manifest)
 
     archive = None
     cached_archive = storage.gold / "checkpoint" / "archive-reference.json"
@@ -167,18 +226,28 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
         historical_gold = None
     if active is not None:
         historical_gold = active["history"]
+    ar_blocked = (
+        ar_blocked_origins(storage, own.manifest, config, policy.latency_seconds)
+        if lane == "live"
+        else None
+    )
     vector = [s.manifest["publication_id"] for s in snapshots]
     vector.extend(
         [
             archive.manifest["publication_id"] if archive else None,
             list(auxiliary_version) if lane == "live" else cursor,
+            ar_blocked,
             historical_gold,
         ]
     )
     previous = None
     if (storage.gold / "inputs" / "current.json").exists():
         previous = Evidence.open(storage.gold / "inputs")
-        if previous.document.get("source_vector") == vector and (
+        if (
+            previous.document.get("source_vector") == vector
+            and previous.document.get("ar_attribution_rule") == ar_attribution_rule
+            and previous.document.get("ar_reference_controls") == ar_controls
+        ) and (
             lane != "live"
             or (
                 previous.document.get("coverage_rule") == COVERAGE_RULE
@@ -399,6 +468,12 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                 "quality_hash": digest(cases[family]),
                 "last_successful_discovery": ref.get("owner_confirmed_at"),
             }
+            if family == "LISTA_AR" and lane == "live":
+                row["ar_event_source"] = True
+                row["ar_review_intervals"] = ar_review_intervals(cases[family], origin)
+                row["estado"] = "WAITING_INPUT" if origin in ar_blocked else "READY"
+                if origin in ar_blocked:
+                    row["reason_code"] = "AR_INGESTION_PENDING"
             instants = (
                 ()
                 if lane == "live"
@@ -481,10 +556,14 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
             **({"historical_mp9_closures": historical_closures} if historical_closures else {}),
         },
         "coverage": coverage,
+        "ar_attribution_rule": ar_attribution_rule,
+        "ar_reference_controls": ar_controls,
     }
     window = None
     scopes = None
     if lane == "live":
+        doc["ar_unit_rule"] = AR_UNIT_RULE
+        doc["score_config_id"] = score_config_id
         full_families = OPERATIONS - incremental_families
         retained = bool(
             incremental_families and previous and previous.document.get("retained_live")
@@ -532,7 +611,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                     [
                         [
                             family,
-                            own.manifest["tables"].get(family, {}).get("slot_receipts"),
+                            slot_receipts(own, family),
                         ]
                         for family in sorted(SLOT_FAMILIES)
                     ],
@@ -577,9 +656,8 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                 from .live_hours import ar_pin
 
                 doc["ar_categories"] = ar_categories
+                doc["ar_blocked_origins"] = ar_blocked
                 doc["ar_pin"] = ar_pin(doc, silver_refs)
-            doc["ar_unit_rule"] = AR_UNIT_RULE
-            doc["score_config_id"] = score_config_id
             if (published / "current.json").exists():
                 from .live_hours import ar_revisions, retry_closures
                 from .publications import Snapshot
@@ -596,7 +674,10 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                         review.get("ar_pin") != doc["ar_pin"]
                         or review.get("ar_categories") != ar_categories
                         or review.get("ar_unit_rule") != AR_UNIT_RULE
+                        or review.get("ar_attribution_rule") != ar_attribution_rule
+                        or review.get("coverage_rule") != COVERAGE_RULE
                         or review.get("more_hourly_revisions")
+                        or review.get("older_retry_scan")
                         or review.get("ar_review_waiting")
                     ):
 
@@ -640,6 +721,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                             storage.gold, visible, doc, current_ar, horizon, policy.read_max_rows
                         )
                 waiting = []
+                invalidations = []
                 retries = retry_closures(
                     visible,
                     coverage,
@@ -648,15 +730,17 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                     closed=doc["closed_hours"],
                     ar_changed=changed,
                     waiting=waiting,
+                    invalidate=invalidations,
                     prepare=observed.prepare,
                 )
                 doc["retry_closures"] = retries[:12]
+                doc["ar_invalidations"] = invalidations[:12]
                 doc["ar_review_waiting"] = bool(
                     waiting
                     or (changed is None and previous and previous.document.get("ar_review_waiting"))
                 )
                 # Exclude revised but deferred hours from current-slot calculation as well.
-                if len(retries) > 12:
+                if len(retries) > 12 or len(invalidations) > 12:
                     doc["more_hourly_revisions"] = True
                     from .metrics import Window
 
@@ -693,6 +777,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                             if changed is not None
                             else None
                         )
+                        old_invalidations = []
                         old = retry_closures(
                             visible,
                             coverage,
@@ -701,12 +786,15 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                             older=(lower, upper),
                             ar_changed=older_changed,
                             prepare=observed.prepare,
+                            invalidate=old_invalidations,
                         )
                         # Old work has its own small allocation after the current hour.
                         doc["retry_closures"].extend(old[:2])
-                        doc["older_retry_before"] = (upper if len(old) > 2 else lower).isoformat()
-                        doc["older_retry_scan"] = len(old) > 2 or lower > first_hour
-                        if len(old) > 2:
+                        doc["ar_invalidations"].extend(old_invalidations[:2])
+                        more_old = len(old) > 2 or len(old_invalidations) > 2
+                        doc["older_retry_before"] = (upper if more_old else lower).isoformat()
+                        doc["older_retry_scan"] = more_old or lower > first_hour
+                        if more_old:
                             doc["more_hourly_revisions"] = True
                 if doc["retry_closures"]:
                     scopes = [

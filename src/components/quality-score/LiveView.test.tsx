@@ -45,6 +45,24 @@ it("shows zero for a closed result, excludes the open score and pins detail", as
     published_at: "2026-11-24T14:01:00Z",
     stale: false,
     mia_provisional: true,
+    active_productions: [
+      {
+        line: "AV31",
+        machine: 7,
+        state: "active",
+        production: "p2",
+        model: "1048-A",
+        start: row.cutoff,
+      },
+      {
+        line: "AV31",
+        machine: 8,
+        state: "active",
+        production: "p3",
+        model: "2019-B",
+        start: row.cutoff,
+      },
+    ],
     hours: [
       { start: row.start, end: row.cutoff!, state: "closed", results: [row] },
       {
@@ -62,6 +80,15 @@ it("shows zero for a closed result, excludes the open score and pins detail", as
   const result = await screen.findByRole("button", {
     name: /AV31A.*15:00.*86,08.*Bueno/,
   });
+  expect(
+    screen.getByRole("heading", { name: /AV31A.*Modelo 1048-A/ }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("heading", { name: /AV31B.*Modelo 2019-B/ }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("heading", { name: /AV32A.*Sin producción activa/ }),
+  ).toBeInTheDocument();
   expect(
     screen.getAllByRole("img", { name: /Evolución horaria/ }),
   ).toHaveLength(7);
@@ -112,7 +139,7 @@ it("shows zero for a closed result, excludes the open score and pins detail", as
   vi.restoreAllMocks();
 });
 
-it("keeps both handover results with missing components and shows all hour states", async () => {
+it("shows the selected handover close without presenting partial components as a total", async () => {
   const old: LiveResult = {
     production: "fenix:old",
     line: "AV32",
@@ -122,9 +149,12 @@ it("keeps both handover results with missing components and shows all hour state
     state: "partial",
     reason: "MIA_REFERENCE_PENDING",
     result_id: "p1",
-    total_penalty: 4,
-    normalized_score: 1,
-    classification: "observed",
+    total_penalty: null,
+    normalized_score: null,
+    classification: null,
+    partial_subtotal: 4,
+    model: "2939/577",
+    component_states: { ZC: "NOT_APPLICABLE", MIA: "WAITING_DEPENDENCY" },
     contributions: { Grave: 4 },
   };
   const incoming: LiveResult = {
@@ -136,6 +166,7 @@ it("keeps both handover results with missing components and shows all hour state
     reason: null,
     result_id: "p2",
     total_penalty: 2,
+    component_states: {},
     contributions: { MIA: 2 },
   };
   vi.spyOn(api, "getLiveArchive").mockRejectedValue(new Error("unavailable"));
@@ -155,7 +186,7 @@ it("keeps both handover results with missing components and shows all hour state
         start: old.start,
         end: incoming.cutoff!,
         state: "closed",
-        results: [incoming, old],
+        results: [old],
       },
       {
         start: incoming.cutoff!,
@@ -183,8 +214,22 @@ it("keeps both handover results with missing components and shows all hour state
   const table = await screen.findByRole("table", {
     name: "Desglose horario de AV32B",
   });
-  expect(within(table).getByText("old · 14:00–14:20")).toBeInTheDocument();
-  expect(within(table).getByText("new · 14:20–15:00")).toBeInTheDocument();
+  expect(
+    within(table).getAllByRole("rowheader", { name: /^15:00/ }),
+  ).toHaveLength(1);
+  expect(
+    within(table).getByRole("rowheader", { name: /^15:00/ }),
+  ).toHaveAttribute(
+    "title",
+    expect.stringContaining("2939/577 · fenix:old · 14:00–14:20"),
+  );
+  expect(within(table).getByText("N/A")).toBeInTheDocument();
+  expect(
+    within(table).getByRole("button", { name: /Detalle Grav./ }),
+  ).toHaveTextContent("4");
+  expect(
+    within(table).queryByRole("button", { name: /Ver desglose/ }),
+  ).not.toBeInTheDocument();
   for (const state of ["Anterior a T0", "Parcial", "Pendiente", "En curso"]) {
     expect(within(table).getByText(state)).toBeInTheDocument();
   }

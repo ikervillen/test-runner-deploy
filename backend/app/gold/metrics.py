@@ -6,8 +6,10 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from .ar_units import affected_unit, continuity
+from .ar_units import affected_intervals, continuity
 from .common import IntegrityError, PendingBasis, digest
+
+AR_CATEGORIES = ("Critico", "Grave", "Mayor", "Menor", "Leve")
 
 
 @dataclass(frozen=True)
@@ -202,7 +204,13 @@ def merged_duration(intervals: list[tuple[datetime, datetime]]) -> tuple[int, in
 
 
 def ar_bases(
-    events: list[dict], capacities: list[dict], window: Window, *, production=None, conflicts=()
+    events: list[dict],
+    capacities: list[dict],
+    window: Window,
+    *,
+    production=None,
+    conflicts=(),
+    independent=False,
 ) -> dict:
     pieces = sorted(
         [
@@ -212,10 +220,17 @@ def ar_bases(
         ],
         key=lambda r: r["vigente_desde"],
     )
-    cursor, available = window.start, 0
+    production = production or {}
+    accredited_starts = [
+        value
+        for name in ("fecha_inicio_operativo_zc", "fecha_inicio_zf")
+        if (value := production.get(name)) is not None
+    ]
+    left_limit = max(window.start, min(accredited_starts)) if accredited_starts else window.start
+    cursor, available = left_limit, 0
     for row in pieces:
         left, right = (
-            max(window.start, row["vigente_desde"]),
+            max(left_limit, row["vigente_desde"]),
             min(window.cutoff, row["vigente_hasta"] or window.cutoff),
         )
         if left >= right:
@@ -234,27 +249,42 @@ def ar_bases(
         )
     by = defaultdict(list)
     by_defect = defaultdict(list)
-    production = production or {}
+    pending = {}
     own = [event for event in events if event["id_produccion"] == window.production_id]
     joined = continuity(own, production) if any(event["cavidad"] == "99Z" for event in own) else {}
     for event in own:
-        left, right = (
-            max(window.start, event["fecha_on"]),
-            min(window.cutoff, event["fecha_off"] or window.cutoff),
-        )
+        zone = str(event.get("zona", "")).lower()
+        start = production.get(f"fecha_inicio_{zone}") or left_limit
+        end = production.get(f"fecha_fin_{zone}") or window.cutoff
+        left = max(left_limit, start, event["fecha_on"])
+        right = min(window.cutoff, end, event["fecha_off"] or window.cutoff)
         if left >= right:
             continue
-        unit = affected_unit(event, production, joined, conflicts)
-        if event["categoria"] is None:
-            raise PendingBasis(
-                "AR_CATEGORY_UNRESOLVED", "An affecting AR event has no accepted severity category"
-            )
-        by[("CATEGORY", event["categoria"], unit)].append((left, right))
-        if event.get("codigo_defecto") is not None:
-            by_defect[(event["categoria"], event["codigo_defecto"], unit)].append((left, right))
-        if event["grupo_dar"]:
-            by[("DAR_GROUP", event["grupo_dar"], unit)].append((left, right))
-            by[("DAR_TOTAL", "DAR", unit)].append((left, right))
+        category = event["categoria"]
+        if category is None:
+            if not independent:
+                raise PendingBasis(
+                    "AR_CATEGORY_UNRESOLVED",
+                    "An affecting AR event has no accepted severity category",
+                )
+            pending.update(dict.fromkeys(AR_CATEGORIES, "AR_CATEGORY_UNRESOLVED"))
+        try:
+            intervals = affected_intervals(event, production, joined, conflicts, left, right)
+        except PendingBasis as exc:
+            if not independent:
+                raise
+            pending.update(dict.fromkeys((category,) if category else AR_CATEGORIES, exc.code))
+            if event["grupo_dar"]:
+                pending["DAR"] = exc.code
+            continue
+        for unit, first, last in intervals:
+            if category is not None:
+                by[("CATEGORY", category, unit)].append((first, last))
+                if event.get("codigo_defecto") is not None:
+                    by_defect[(category, event["codigo_defecto"], unit)].append((first, last))
+            if event["grupo_dar"]:
+                by[("DAR_GROUP", event["grupo_dar"], unit)].append((first, last))
+                by[("DAR_TOTAL", "DAR", unit)].append((first, last))
     amounts: defaultdict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
     for (kind, code, _), intervals in by.items():
         count, duration = merged_duration(intervals)
@@ -269,6 +299,7 @@ def ar_bases(
         codes = sorted(code for c, code in defect_totals if c == category)
         top_defects[category] = max(codes, key=lambda code: defect_totals[(category, code)])
     return {
+        "pending_by_component": pending,
         "top_defects": top_defects,
         "exposure": {**window.key, "capacity_basis_id": basis, "tiempo_disponible_us": available},
         "amounts": [

@@ -16,7 +16,7 @@ jobs:
       - name: Check out the confirmed native Fenix contracts
         uses: actions/checkout@v4
         with:
-          ref: f769fc7a02d315b9ef7c7f4e90766e77d32b9c42
+          ref: 2ea9b092b32b43c658d43280b5494e5f975f9b2c
           path: .fenix-contracts
           persist-credentials: false
       - uses: astral-sh/setup-uv@v5

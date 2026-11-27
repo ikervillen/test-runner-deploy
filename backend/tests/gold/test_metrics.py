@@ -88,6 +88,64 @@ def test_open_ar_contributes_45_minutes_without_fabricating_a_close():
     )
 
 
+def test_event_source_scores_three_hours_from_one_open_close_without_periodic_files():
+    from types import SimpleNamespace
+
+    from app.gold.pipeline import _coverage_ready
+
+    source = dict(source="LISTA_AR", origin="AV21", estado="READY", ar_event_source=True)
+    snapshot = SimpleNamespace(manifest={"coverage": [source]})
+    production = dict(id_produccion="p", origen_fenix="AV21")
+    row = event(START + timedelta(minutes=30), START + timedelta(hours=2, minutes=30))
+    exposure = []
+    for hour in range(4):
+        left = START + timedelta(hours=hour)
+        right = left + timedelta(hours=1)
+        score_window = Window("p", "HOUR", left, right, right)
+        assert _coverage_ready(snapshot, production, score_window, [], {"LISTA_AR"})
+        amounts = ar_bases([row], capacity(), score_window)["amounts"]
+        exposure.append({r["ambito"]: r["tiempo_afectado_us"] // 60_000_000 for r in amounts})
+    assert exposure == [
+        {"CATEGORY": minutes, "DAR_GROUP": minutes, "DAR_TOTAL": minutes}
+        for minutes in (30, 60, 30)
+    ] + [{}]
+    source["estado"] = "WAITING_INPUT"
+    assert not _coverage_ready(snapshot, production, score_window, [], {"LISTA_AR"})
+
+
+def test_ar_withdrawal_retains_mia_zc_values_and_original_mia_reference():
+    from app.gold.scoring import has_official_total, without_ar
+
+    old = dict(id_resultado="r", reference_id="pin-mia", total_penalty=46.1)
+    components = [
+        dict(componente="MIA", contribucion=2.1, peso=2.0),
+        dict(componente="Grave", contribucion=40.0, peso=1.0),
+        dict(componente="ZC", contribucion=4.0, peso=1.0),
+    ]
+    partial, retained = without_ar(old, components)
+    assert retained == [components[0], components[2]]
+    assert partial["reference_id"] == "pin-mia"
+    assert partial["id_resultado"] == "r"
+    assert partial["total_penalty"] == 6.1
+    assert not has_official_total(partial["formula_version"])
+    assert old["total_penalty"] == 46.1
+
+
+def test_an_unresolved_non_dar_event_only_blocks_its_aql_category():
+    row = {**event(START, None), "cavidad": "99Z", "grupo_dar": None}
+    result = ar_bases([row], capacity(), window(), independent=True)
+    assert result["pending_by_component"] == {"Grave": "AR_MOULD_IDENTITY_PENDING"}
+    assert not result["amounts"]
+
+
+def test_ar_on_the_outgoing_hot_zone_stops_at_the_accredited_zone_end():
+    hot_end = START + timedelta(minutes=3)
+    old = {"fecha_inicio_zf": START - timedelta(days=1), "fecha_fin_zc": hot_end}
+    row = {**event(START, None), "zona": "ZC"}
+    result = ar_bases([row], capacity(), window(), production=old)
+    assert result["amounts"][0]["tiempo_afectado_us"] == 3 * 60_000_000
+
+
 def test_overlap_is_union_and_closure_recalculates_without_extra_event():
     rows = [
         event(START, START + timedelta(minutes=30)),

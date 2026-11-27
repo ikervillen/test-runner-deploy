@@ -57,6 +57,25 @@ def has_official_total(formula: str | None) -> bool:
     )
 
 
+def without_ar(score, components):
+    """Retain confirmed components when only the AR result has lost accreditation."""
+    components = [r for r in components if r["componente"] in {"MIA", "ZC"}]
+    if not components:
+        return None, components
+    names = sorted(r["componente"] for r in components)
+    total = round(sum(r["contribucion"] for r in components), 4)
+    weight = round(sum(r["peso"] for r in components), 4)
+    return {
+        **score,
+        "formula_version": PARTIAL_FORMULA_PREFIX + ",".join(names),
+        "reference_id": score["reference_id"] if "MIA" in names else None,
+        "total_penalty": total,
+        "normalized_score": round(total / weight, 4) if weight else 0.0,
+        "evaluated_weight": weight,
+        "estado_interpretacion": "partial",
+    }, components
+
+
 def calculate(
     window: Window,
     *,
@@ -80,6 +99,7 @@ def calculate(
     validate_config(config)
     independent = component_coverage is not None
     blockers = component_coverage or {}
+    ar_components = ar.get("pending_by_component", {}) if independent and ar else {}
     ar_pending = [blockers["AR"]] if "AR" in blockers else []
     dar_pending, zc_pending = [], [blockers["ZC"]] if "ZC" in blockers else []
     if not profile_confirmed:
@@ -100,7 +120,7 @@ def calculate(
         stat = stats.get((rate["espacio_defecto"], rate["codigo_defecto"]))
         if stat is None or stat["estado"] != "READY":
             mia_pending.append(f"MIA_REFERENCE_PENDING:{rate['codigo_defecto']}")
-    pending = ar_pending + dar_pending + zc_pending
+    pending = ar_pending + dar_pending + zc_pending + list(ar_components.values())
     if not coverage_ready:
         pending.append("SOURCE_COVERAGE_PENDING")
     reasons = tuple(sorted(set(pending + mia_pending)))
@@ -175,6 +195,8 @@ def calculate(
         available = ar["exposure"]["tiempo_disponible_us"]
         by = {(r["ambito"], r["codigo_ambito"]): r for r in ar["amounts"]}
         for category in SEVERITIES:
+            if category in ar_components:
+                continue
             affected = by.get(("CATEGORY", category), {}).get("tiempo_afectado_us", 0)
             exposure = affected / available * 100
             limit = float(config["aql"]["category_limits_percent"][category])
@@ -200,7 +222,7 @@ def calculate(
                     "top_defect_code": ar.get("top_defects", {}).get(category),
                 }
             )
-        if not dar_pending:
+        if not dar_pending and "DAR" not in ar_components:
             dar_amount = by.get(("DAR_TOTAL", "DAR"), {}).get("tiempo_afectado_us", 0)
             dar_value = _dar_score(dar_amount / available * 100, config["dar"])
             component(

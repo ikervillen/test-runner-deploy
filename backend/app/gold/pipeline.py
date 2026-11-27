@@ -84,6 +84,18 @@ def _coverage_ready(snapshot, p, window, pending, required=None):
         return False
     for family in required:
         matching = [r for r in scopes if r["source"] == family and r["estado"] == "READY"]
+        if family == "LISTA_AR" and any(r.get("ar_event_source") for r in matching):
+            if not any(
+                r.get("ar_event_source")
+                and not any(
+                    (left is None or context.stamp(left) < coverage_window.cutoff)
+                    and (right is None or context.stamp(right) > coverage_window.start)
+                    for left, right in r.get("ar_review_intervals", ())
+                )
+                for r in matching
+            ):
+                return False
+            continue
         if not any(
             covers(r, coverage_window)
             if "confirmed_slots" in r
@@ -562,6 +574,7 @@ def _score_job(payload: dict) -> dict:
                 last_discovery=payload["last_discovery"],
                 windows=payload.get("windows"),
                 ar_conflicts=payload.get("ar_conflicts", ()),
+                mia_facts=(fact_rows["mia_inspections"], fact_rows["mia_rejections"]),
                 live_mia="mia_reference" in payload,
                 production_clock=clock,
                 windows_timing=windows_timing,
@@ -657,6 +670,7 @@ def _score_production(
     last_discovery,
     windows=None,
     ar_conflicts=(),
+    mia_facts=(),
     live_mia=False,
     production_clock,
     windows_timing,
@@ -678,7 +692,12 @@ def _score_production(
         try:
             with clock.stage("ar_bases"):
                 a = ar_bases(
-                    tables["ar_intervals"], capacities, w, production=p, conflicts=ar_conflicts
+                    tables["ar_intervals"],
+                    capacities,
+                    w,
+                    production=p,
+                    conflicts=ar_conflicts,
+                    independent=live_mia,
                 )
         except PendingBasis as exc:
             a = None
@@ -691,6 +710,14 @@ def _score_production(
         tables.setdefault("zc_window_bases", []).extend(z)
         with clock.stage("coverage"):
             component_coverage = _component_coverage(snapshot, p, w, pending) if live_mia else None
+            if component_coverage is not None and w.cutoff < w.end:
+                for component, groups in (("MIA", mia_facts), ("ZC", (tables["zc_observations"],))):
+                    if component not in component_coverage and any(
+                        row["periodo_inicio"] < w.cutoff < row["periodo_fin"]
+                        for rows in groups
+                        for row in rows
+                    ):
+                        component_coverage[component] = f"{component}_TRANSITION_SAMPLE_UNRESOLVED"
             ready = live_mia or _coverage_ready(snapshot, p, w, pending)
         if (
             not live_mia
@@ -793,6 +820,7 @@ class SpilledTables(dict):
         self.hours: tuple[tuple[str, datetime], ...] | None = None
         self.fact_bounds: tuple[tuple[str, datetime, datetime], ...] | None = None
         self.result_ids: tuple[str, ...] | None = None
+        self.withdrawn_scores: tuple[str, ...] = ()
 
     def mark(self, name: str) -> None:
         self.spilled.add(name)
@@ -1473,6 +1501,87 @@ def build(
         config_id = digest([config, bundle])
         catalog_version = digest(catalog_bundle)
         scope_rows: list[dict] = []
+        if lane == "live" and isinstance(snapshot, Evidence):
+            from .live_hours import AR_COVERAGE_PENDING
+            from .scoring import without_ar
+
+            invalidations = snapshot.document.get("ar_invalidations", ())
+            published.withdrawn_scores = tuple(row[0] for row in invalidations)
+            if previous is not None and invalidations:
+                import pyarrow.dataset as ds
+
+                ids = list(published.withdrawn_scores)
+                prior = {
+                    name: previous.rows(
+                        name,
+                        expression=ds.field("id_resultado").cast("string").isin(ids),
+                        file_pruning_predicate=[("id_resultado", "in", ids)],
+                        max_rows=max_total_rows,
+                    )
+                    for name in (
+                        "quality_scores",
+                        "quality_score_components",
+                        "mia_score_details",
+                        "zc_score_details",
+                    )
+                }
+                retained_references = set()
+                retained_zc = set()
+                for score in prior["quality_scores"]:
+                    identity = score["id_resultado"]
+                    partial, components = without_ar(
+                        score,
+                        [
+                            r
+                            for r in prior["quality_score_components"]
+                            if r["id_resultado"] == identity
+                        ],
+                    )
+                    if partial is None:
+                        continue
+                    owner = score["id_produccion"]
+                    _store_row(store, "quality_scores", owner, partial)
+                    if partial["reference_id"]:
+                        retained_references.add(partial["reference_id"])
+                    for row in components:
+                        _store_row(store, "quality_score_components", owner, row)
+                    retained = {r["componente"] for r in components}
+                    for component in retained:
+                        name = f"{component.lower()}_score_details"
+                        for row in prior[name]:
+                            if row["id_resultado"] == identity:
+                                _store_row(store, name, owner, row)
+                                if component == "ZC":
+                                    retained_zc.add(row["basis_reference"])
+                for name, column, keys in (
+                    ("mia_reference_sets", "reference_id", retained_references),
+                    ("zc_window_bases", "id_base_zc", retained_zc),
+                ):
+                    if not keys:
+                        continue
+                    values = sorted(keys)
+                    for row in previous.rows(
+                        name,
+                        expression=ds.field(column).cast("string").isin(values),
+                        file_pruning_predicate=[(column, "in", values)],
+                        max_rows=max_total_rows,
+                    ):
+                        _store_row(store, name, row.get("id_produccion"), row)
+            scope_rows.extend(
+                _scope_row(
+                    key,
+                    identity,
+                    "quality_scores",
+                    origin,
+                    datetime.fromisoformat(left),
+                    datetime.fromisoformat(right),
+                    "WAITING_DEPENDENCY",
+                    AR_COVERAGE_PENDING,
+                    snapshot.publication_id,
+                    last_discovery,
+                )
+                for key, identity, origin, left, right in invalidations
+            )
         score_windows = defaultdict(list)
         for chunk in hour_plan or ():
             if not chunk.facts_only:

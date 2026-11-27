@@ -37,6 +37,11 @@ export type LiveResult = {
   total_penalty: number | null;
   normalized_score: number | null;
   classification: string | null;
+  partial_subtotal?: number | null;
+  evaluated_weight?: number | null;
+  component_states?: Partial<
+    Record<string, "READY" | "WAITING_DEPENDENCY" | "NOT_APPLICABLE">
+  >;
   model?: string | null;
   contributions: Partial<Record<string, number>>;
 };
@@ -46,6 +51,17 @@ export type LiveScores = {
   published_at: string;
   stale: boolean;
   mia_provisional: boolean;
+  active_productions?: {
+    line: string;
+    machine: number;
+    state: "active" | "ambiguous" | "unavailable";
+    production: string | null;
+    model: string | null;
+    start: string | null;
+    zf_production?: string | null;
+    zf_model?: string | null;
+    zf_ambiguous?: boolean;
+  }[];
   hours: { start: string; end: string; state: string; results: LiveResult[] }[];
 };
 
