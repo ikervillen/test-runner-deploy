@@ -192,6 +192,43 @@ def parse(snapshots, encoding):
     return result
 
 
+CODE_FIELDS = {
+    "SIP_DEFECTO": "codigo_aviso_rechazo",
+    "SIP_DEFECTO_STATUS": "codigo_status",
+    "SIP_DEFECTO_AR": "codigo_tipo_ar",
+}
+
+
+def reference_reviews(cases, code_field, accepted_by_id):
+    """Index conflicts whose complete set of affected codes is established."""
+    scoped, global_reviews = defaultdict(list), []
+    for case in cases:
+        payload = case.get("payload", {})
+        issue_id = case.get("issue_id") or digest(case)
+        try:
+            if case.get("reason") == "ASSOCIATION_CONFLICT":
+                codes = {
+                    payload[code_field],
+                    *(row[code_field] for row in payload["accepted"]),
+                    *(value[0] for value in payload["values_for_id"]),
+                }
+            elif case.get("reason") == "INVALID_VALUE":
+                raw = payload["evidence"]["raw"]
+                identifier, code = parse_int64(raw[0]), parse_int64(raw[1])
+                codes = {code, accepted_by_id.get(identifier, code)}
+            else:
+                global_reviews.append(issue_id)
+                continue
+            if any(type(code) is not int for code in codes):
+                raise ValueError("Invalid conflict code")
+        except (KeyError, IndexError, TypeError, ValueError):
+            global_reviews.append(issue_id)
+            continue
+        for code in codes:
+            scoped[code].append(issue_id)
+    return dict(scoped), global_reviews
+
+
 def reference_gaps(row, references):
     gaps = []
     for field_name, family in REFERENCES.items():

@@ -197,6 +197,7 @@ def _process(config, control, attempt, *, physical=False):
         **({"observation_window": list(observation_window)} if observation_window else {}),
         **({"live_handover": "mp9_topology_v1", "live_handover_from": floor} if live else {}),
         "ar_interpretation_rules": a.ar_interpretation_rules(),
+        **({"ar_attribution_rule": a.AR_ATTRIBUTION_RULE} if not physical else {}),
         "transformer_version": __version__,
         "timestamp_policy": config.timestamp_policy,
         "manifest": {
@@ -335,7 +336,12 @@ def _process(config, control, attempt, *, physical=False):
     complete = not (
         remaining
         or pending
-        or any(bundle["cases"].values())
+        or any(
+            cases
+            for family, cases in bundle["cases"].items()
+            if family not in a.lista_ar.CODE_FIELDS
+        )
+        or any(ref["global_reviews"] for ref in index.reviews["_ar_references"].values())
         or bundle["catalog_diagnostics"]["pending_candidates"]
     )
     inserts = [r for identity, r in projected.items() if identity not in previous]
