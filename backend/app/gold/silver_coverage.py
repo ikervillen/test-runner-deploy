@@ -8,8 +8,7 @@ from .evidence import OPERATIONS
 from .fragment_delta import EPOCH
 
 SLOT_FAMILIES = OPERATIONS - {"LISTA_AR"}
-RECEIPT_FAMILIES = SLOT_FAMILIES | {"LISTA_AR"}
-COVERAGE_RULE = "confirmed-slots-v3"
+COVERAGE_RULE = "confirmed-slots-v4"
 
 
 def slot_receipts(snapshot, family):
@@ -48,7 +47,7 @@ def confirmed_blanks(storage, snapshot, policy, *, receipts=None, after=None, th
     if feed.identity != snapshot.manifest["identity"] or not feed.sequence:
         return {}, {}
     latest, accepted, captures = {}, {}, {}
-    for family in RECEIPT_FAMILIES:
+    for family in SLOT_FAMILIES:
         for seq, identity, origin, stamp, confirmed in slot_receipts(snapshot, family):
             key = family, origin, slot_number(datetime.fromisoformat(stamp), policy.window_seconds)
             latest[key] = seq, identity
@@ -62,7 +61,7 @@ def confirmed_blanks(storage, snapshot, policy, *, receipts=None, after=None, th
     changes = feed.captures(after=after, limit=through - after) if through > after else ()
     for captured in changes:
         item = captured.snapshot
-        if captured.family not in RECEIPT_FAMILIES or "T" not in (item.producer_time or ""):
+        if captured.family not in SLOT_FAMILIES or "T" not in (item.producer_time or ""):
             continue
         slot = slot_number(datetime.fromisoformat(item.producer_time), policy.window_seconds)
         key = captured.family, item.origin, slot
@@ -87,14 +86,11 @@ def confirmed_blanks(storage, snapshot, policy, *, receipts=None, after=None, th
                 and captured.family == key[0]
                 and captured.snapshot.origin == key[1]
                 and captured.snapshot.producer_time == stamp
+                and captured.snapshot.size <= 4096
             ):
-                if key[0] == "LISTA_AR":
-                    # Silver has already checked and processed these exact immutable bytes.
-                    verified[key] = identity
-                elif captured.snapshot.size <= 4096:
-                    verified[key] = (
-                        identity if blank_input(feed.read(captured, max_file_bytes=4096)) else None
-                    )
+                verified[key] = (
+                    identity if blank_input(feed.read(captured, max_file_bytes=4096)) else None
+                )
         except FileNotFoundError:
             continue
     return latest, verified
@@ -152,7 +148,7 @@ class SlotCoverage:
         self.coverage = {
             (row["source"], row["origin"]): row
             for row in coverage
-            if row["source"] in RECEIPT_FAMILIES and row["estado"] == "READY"
+            if row["source"] in SLOT_FAMILIES and row["estado"] == "READY"
         }
         self.receipts = receipts
         for name in SLOT_FAMILIES:

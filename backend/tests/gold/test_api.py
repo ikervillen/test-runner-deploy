@@ -260,6 +260,71 @@ def test_live_bulk_reads_weighted_contributions_from_the_pinned_delta(gold_api, 
         assert isclose(sum(row.contributions.values()), row.total_penalty, abs_tol=0.0001)
 
 
+def test_withdrawal_updates_current_delta_and_hides_pending_score_on_old_pin(
+    gold_api, calculation, monkeypatch
+):
+    from datetime import UTC, timedelta
+    from types import SimpleNamespace
+
+    from app.domain.errors import ApplicationError
+    from app.gold.live_archive import archive, archived_result
+    from app.gold.live_hours import AR_COVERAGE_PENDING
+    from app.gold.pipeline import SCORE_TABLES
+    from app.gold.publications import Publisher, Snapshot
+    from app.infrastructure.cache import LruCache
+
+    _, root = gold_api
+    source, _ = calculation
+    original = Snapshot.open(root, require_gold_contract=True)
+    scores = original.rows("quality_scores")
+    target = max((r for r in scores if r["tipo_ventana"] == "HOUR"), key=lambda r: r["fin"])
+    identity = target["id_resultado"]
+    ready = next(r for r in original.rows("publication_scope_status") if r["scope_id"] == identity)
+    pending = {**ready, "estado": "WAITING_DEPENDENCY", "reason_code": AR_COVERAGE_PENDING}
+
+    class Withdrawal(dict):
+        spilled = frozenset()
+        withdrawn_scores = (identity,)
+
+    rows = Withdrawal(
+        {**{table: [] for table in SCORE_TABLES}, "publication_scope_status": [pending]}
+    )
+    publisher = Publisher(root, environment="test", plant="AV")
+    options = dict(config_id="withdrawal", cutoff=CUTOFF.isoformat(), coverage=[], fact_bounds=())
+    publisher.publish(source, rows, **options)
+    current = Snapshot.open(root, require_gold_contract=True)
+    for table in SCORE_TABLES:
+        assert current.rows(table) == [
+            r for r in original.rows(table) if r["id_resultado"] != identity
+        ]
+    assert pending in current.rows("publication_scope_status")
+    assert publisher.publish(source, rows, **options)["status"] == "UNCHANGED"
+
+    t0 = target["inicio"] - timedelta(hours=1)
+    monkeypatch.setattr("app.gold.live_archive.live_epoch", lambda: t0)
+    monkeypatch.setattr("app.gold.live_view.live_epoch", lambda: t0)
+    settings = SimpleNamespace(
+        resolved_gold_root=root,
+        gold_query_max_rows=100000,
+        gold_query_total_rows=300000,
+        gold_live_timezone="Europe/Madrid",
+    )
+    moment = (target["fin"] + timedelta(hours=7)).replace(tzinfo=UTC)
+    with pytest.raises(ApplicationError, match="pendiente de cobertura AR"):
+        archived_result(settings, original.publication_id, identity, moment=moment)
+    old_page = archive(settings, LruCache(4), moment=moment, publication_id=original.publication_id)
+    results = [
+        result
+        for shift in old_page["shifts"]
+        for hour in shift["hours"]
+        for result in hour["results"]
+    ]
+    assert all(row["result_id"] != identity for row in results)
+    assert any(
+        row["reason"] == AR_COVERAGE_PENDING and row["total_penalty"] is None for row in results
+    )
+
+
 def test_archive_uses_existing_delta_pins_preserves_t0_and_applies_exact_age(
     gold_api, monkeypatch, calculation
 ):

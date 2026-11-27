@@ -689,12 +689,16 @@ class Publisher:
         self.failpoint("prepared")
         prior_refs = {r["name"]: r for r in previous["tables"]} if previous else {}
         writes = {}
+        withdrawn_scores = getattr(rows, "withdrawn_scores", ())
         for name in names:
             table_start = time.perf_counter()
             timings = {}
             strategy = "recovered"
             target = self.root / "tables" / name
-            scoped_hash = digest([hashes[name], scope])
+            withdrawals = withdrawn_scores if "id_resultado" in SCHEMAS[name].names else ()
+            scoped_hash = digest(
+                [hashes[name], scope, withdrawals] if withdrawals else [hashes[name], scope]
+            )
             ref = state["receipts"].get(name)
             if ref is None:
                 current = DeltaTable(str(target)) if (target / "_delta_log").exists() else None
@@ -702,6 +706,12 @@ class Publisher:
                 delete_predicate = chunk_delete_predicate(
                     name, replace_ids, hours, result_ids, fact_bounds
                 )
+                if withdrawals:
+                    withdrawn = _sql_in("id_resultado", list(withdrawals))
+                    if delete_predicate is None:
+                        delete_predicate = withdrawn
+                    elif delete_predicate:
+                        delete_predicate = f"({delete_predicate}) OR ({withdrawn})"
                 full_scope_snapshot = not scope and fact_bounds is None
                 if current is not None and last.get("gold_operation_id") != operation:
                     accepted = prior_refs.get(name)

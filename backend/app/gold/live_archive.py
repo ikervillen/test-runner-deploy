@@ -9,7 +9,8 @@ from app.domain.errors import ApplicationError
 from app.domain.shifts import SHIFT_HOURS, SHIFT_STARTS
 
 from .common import digest, live_epoch, read_json
-from .live_view import _project, _rows, query_live, result_details
+from .live_hours import AR_COVERAGE_PENDING
+from .live_view import _project, _rows, ensure_hour_not_withdrawn, query_live, result_details
 
 PAGE_SHIFTS = 6
 ARCHIVE_AGE = timedelta(hours=8)
@@ -50,7 +51,12 @@ def archive(settings, cache, before=None, *, moment=None, publication_id=None):
         raise ApplicationError(
             "INVALID_ARCHIVE_PUBLICATION", "Publicación inválida.", status_code=422
         )
-    q = query_live(settings, publication_id)
+    latest = query_live(settings)
+    q = (
+        query_live(settings, publication_id)
+        if publication_id != latest.snapshot.publication_id and publication_id
+        else latest
+    )
 
     def page():
         previous = q.snapshot.manifest.get("previous_publication_id")
@@ -66,7 +72,19 @@ def archive(settings, cache, before=None, *, moment=None, publication_id=None):
         span = timedelta(hours=SHIFT_HOURS)
         last = shift_start(end - timedelta(microseconds=1))
         first = max(shift_start(floor), last - (PAGE_SHIFTS - 1) * span)
-        projected = _project(q, end, now, archive_start=first)
+        withdrawals = (
+            _rows(
+                latest,
+                "publication_scope_status",
+                (ds.field("period_start") >= first)
+                & (ds.field("period_start") < end)
+                & (ds.field("reason_code").cast("string") == AR_COVERAGE_PENDING),
+                [("period_start", ">=", first), ("period_start", "<", end)],
+            )
+            if q is not latest
+            else None
+        )
+        projected = _project(q, end, now, archive_start=first, withdrawals=withdrawals)
         by_start = {hour.start: hour for hour in projected.hours}
         shifts = []
         start = first
@@ -97,7 +115,10 @@ def archive(settings, cache, before=None, *, moment=None, publication_id=None):
             next_before=first if first > shift_start(floor) else None,
         )
 
-    return cache.get_or_compute(("archive", q.snapshot.publication_id, end, cutoff, floor), page)[0]
+    return cache.get_or_compute(
+        ("archive", q.snapshot.publication_id, latest.snapshot.publication_id, end, cutoff, floor),
+        page,
+    )[0]
 
 
 def valid_id(value):
@@ -115,6 +136,7 @@ def archived_result(settings, publication, result, *, moment=None):
     floor = live_epoch()
     now = moment or datetime.now(UTC)
     q = query_live(settings, publication)
+    ensure_hour_not_withdrawn(settings, q, result)
     field = ds.field
     scores = _rows(
         q,

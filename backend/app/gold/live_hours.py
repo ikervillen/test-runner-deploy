@@ -25,8 +25,9 @@ AR_REVIEW_REASONS = {
     "MODEL_SEGMENT_DAR_PROFILE_PENDING",
     "CAPACITY_COVERAGE_GAP",
 }
+AR_COVERAGE_PENDING = "AR_SOURCE_COVERAGE_PENDING"
 COMPONENT_COVERAGE_REASONS = {
-    "AR_SOURCE_COVERAGE_PENDING": {"LISTA_AR"},
+    AR_COVERAGE_PENDING: {"LISTA_AR"},
     "ZC_SOURCE_COVERAGE_PENDING": {"CONT_ZC"},
 }
 
@@ -40,6 +41,7 @@ def retry_closures(
     closed=None,
     ar_changed=None,
     waiting=None,
+    invalidate=None,
     prepare=None,
     older=None,
 ):
@@ -141,6 +143,21 @@ def retry_closures(
                 waiting.append(window.identity)
             if closed is not None and row["estado"] == "READY":
                 closed.append(window.identity)
+            if (
+                invalidate is not None
+                and row["estado"] == "READY"
+                and not row.get("reason_code")
+                and not _coverage_ready(probe, production, window, [], {"LISTA_AR"})
+            ):
+                invalidate.append(
+                    [
+                        window.identity,
+                        identity,
+                        production["origen_fenix"],
+                        left.isoformat(),
+                        window.cutoff.isoformat(),
+                    ]
+                )
         if len(result) == 12 and closed is None and not ar_changed and not older:
             break
     return result
@@ -295,6 +312,7 @@ def ar_revisions(root, visible, document, current, cutoff, budget, *, bounds=Non
                 bool(pinned_config)
                 and legacy_coverage
                 and scope["estado"] == "READY"
+                and not scope.get("reason_code")
                 and not prior_events
             )
         if remembered is not None and not requires_review:

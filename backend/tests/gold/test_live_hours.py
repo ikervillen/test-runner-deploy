@@ -134,7 +134,11 @@ def test_previously_ready_close_is_revisited_only_with_new_ar_proof():
     options = {"older": (START, END), "ar_changed": lambda *_: True}
     coverage = dict(source="LISTA_AR", origin="AV31", estado="READY", ar_receipts_required=True)
     later = END + timedelta(hours=9)
-    assert not retry_closures(snapshot, [coverage], later, 100, **options)
+    invalidations = []
+    assert not retry_closures(snapshot, [coverage], later, 100, invalidate=invalidations, **options)
+    assert invalidations == [
+        [scope("ready", END)["scope_id"], "ready", "AV31", START.isoformat(), END.isoformat()]
+    ]
     coverage.update(slot_seconds=600, confirmed_slots=list(required_slots(START, END, 600)))
     assert retry_closures(snapshot, [coverage], later, 100, **options) == [
         ["ready", START.isoformat(), END.isoformat(), END.isoformat()]

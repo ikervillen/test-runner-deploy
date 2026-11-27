@@ -18,7 +18,7 @@ from .producer import FAMILIES, _apply_horizon, _apply_live, auxiliary
 from .series_handover import RELATION, apply_series_handover, recent_relations
 from .silver_coverage import (
     COVERAGE_RULE,
-    RECEIPT_FAMILIES,
+    SLOT_FAMILIES,
     BlankReceipts,
     SlotCoverage,
     confirmed_blanks,
@@ -97,7 +97,7 @@ def auxiliary_turn(pipelines, lane, *, encoding):
             )
         if capture.family == RELATION:
             relation_cursor = capture.sequence
-        if capture.family in RECEIPT_FAMILIES and "T" in (capture.snapshot.producer_time or ""):
+        if capture.family in SLOT_FAMILIES and "T" in (capture.snapshot.producer_time or ""):
             slot_cursor = capture.sequence
         cursor = capture.sequence
     tables = auxiliary(root, (), captures=captures, initial=initial, encoding=encoding)
@@ -420,6 +420,8 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                 "last_successful_discovery": ref.get("owner_confirmed_at"),
             }
             if family == "LISTA_AR" and lane == "live":
+                # An owner receipt confirms the bytes it processed. Fenix has
+                # not established that these receipts delimit a complete clock interval.
                 row["ar_receipts_required"] = True
                 row["ar_review_intervals"] = ar_review_intervals(cases[family], origin)
                 if any(item[2] == origin and item[4] for item in slot_receipts(own, family)):
@@ -561,7 +563,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                             family,
                             slot_receipts(own, family),
                         ]
-                        for family in sorted(RECEIPT_FAMILIES)
+                        for family in sorted(SLOT_FAMILIES)
                     ],
                 ]
             )
@@ -624,6 +626,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                         or review.get("ar_unit_rule") != AR_UNIT_RULE
                         or review.get("coverage_rule") != COVERAGE_RULE
                         or review.get("more_hourly_revisions")
+                        or review.get("older_retry_scan")
                         or review.get("ar_review_waiting")
                     ):
 
@@ -667,6 +670,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                             storage.gold, visible, doc, current_ar, horizon, policy.read_max_rows
                         )
                 waiting = []
+                invalidations = []
                 retries = retry_closures(
                     visible,
                     coverage,
@@ -675,15 +679,17 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                     closed=doc["closed_hours"],
                     ar_changed=changed,
                     waiting=waiting,
+                    invalidate=invalidations,
                     prepare=observed.prepare,
                 )
                 doc["retry_closures"] = retries[:12]
+                doc["ar_invalidations"] = invalidations[:12]
                 doc["ar_review_waiting"] = bool(
                     waiting
                     or (changed is None and previous and previous.document.get("ar_review_waiting"))
                 )
                 # Exclude revised but deferred hours from current-slot calculation as well.
-                if len(retries) > 12:
+                if len(retries) > 12 or len(invalidations) > 12:
                     doc["more_hourly_revisions"] = True
                     from .metrics import Window
 
@@ -720,6 +726,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                             if changed is not None
                             else None
                         )
+                        old_invalidations = []
                         old = retry_closures(
                             visible,
                             coverage,
@@ -728,12 +735,15 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                             older=(lower, upper),
                             ar_changed=older_changed,
                             prepare=observed.prepare,
+                            invalidate=old_invalidations,
                         )
                         # Old work has its own small allocation after the current hour.
                         doc["retry_closures"].extend(old[:2])
-                        doc["older_retry_before"] = (upper if len(old) > 2 else lower).isoformat()
-                        doc["older_retry_scan"] = len(old) > 2 or lower > first_hour
-                        if len(old) > 2:
+                        doc["ar_invalidations"].extend(old_invalidations[:2])
+                        more_old = len(old) > 2 or len(old_invalidations) > 2
+                        doc["older_retry_before"] = (upper if more_old else lower).isoformat()
+                        doc["older_retry_scan"] = more_old or lower > first_hour
+                        if more_old:
                             doc["more_hourly_revisions"] = True
                 if doc["retry_closures"]:
                     scopes = [

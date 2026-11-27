@@ -142,12 +142,9 @@ def test_an_empty_slot_needs_both_bronze_bytes_and_owner_confirmation(monkeypatc
     snapshot.manifest["controls"] = {
         "LISTA_AR": {"slot_receipts": [[5, "ar-accepted", "AV31", clock, True]]}
     }
-    assert (
-        confirmed_blanks(
-            None, snapshot, SimpleNamespace(live_batch_files=64, window_seconds=600), after=8999
-        )[1]["LISTA_AR", "AV31", slot]
-        == "ar-accepted"
-    )
+    assert ("LISTA_AR", "AV31", slot) not in confirmed_blanks(
+        None, snapshot, SimpleNamespace(live_batch_files=64, window_seconds=600), after=8999
+    )[1]
 
 
 def test_ar_with_events_requires_exact_receipts_and_ignores_unrelated_review(tmp_path):
@@ -185,6 +182,9 @@ def test_ar_with_events_requires_exact_receipts_and_ignores_unrelated_review(tmp
     assert not _coverage_ready(evidence, prod, hour, [], {family})
     receipts.update(seen, verified)
     prepare()
+    # Six accepted deliveries still do not establish the producer's temporal contract.
+    assert not _coverage_ready(evidence, prod, hour, [], {family})
+    row.update(confirmed_slots=[key[2] for key in slots], slot_seconds=600)
     assert _coverage_ready(evidence, prod, hour, [], {family})
     row["ar_review_intervals"] = [((START - STEP).isoformat(), None)]
     assert not _coverage_ready(evidence, prod, hour, [], {family})
