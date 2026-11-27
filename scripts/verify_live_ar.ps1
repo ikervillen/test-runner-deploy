@@ -36,7 +36,9 @@ with sqlite3.connect((root / 'checkpoint/intake.sqlite').as_uri() + '?mode=ro', 
                         AND n.source_path=i.source_path AND n.rowid>i.rowid)
         GROUP BY state
     """))
-print(json.dumps(dict(table=ar.get('table_id'), version=ar.get('version'), pending=pending,
+names = ('LISTA_AR', 'SIP_DEFECTO', 'SIP_DEFECTO_STATUS', 'SIP_DEFECTO_AR')
+controls = {name: ss.manifest['controls'].get(name, {}).get('hash') for name in names}
+print(json.dumps(dict(table=ar.get('table_id'), version=ar.get('version'), controls=controls, pending=pending,
                       pending_count=sum(pending.values()), blocked=status['blocked_origins'],
                       pin_ok=status['identity']==ss.manifest['identity']
                       and status['pin']==ar_silver_pin(ss.manifest))))
@@ -60,7 +62,10 @@ do {
         $g = $scores | ConvertFrom-Json
         if ($s.pin_ok -and $s.pending_count -eq 0 -and @($s.blocked).Count -eq 0 -and
             $s.table -eq $g.table -and $s.version -eq $g.version -and
-            $g.attribution_rule -eq 'ar-reference-scope-v1') {
+            $g.gold_controls_verified -and
+            @($s.controls.PSObject.Properties | Where-Object {
+                !$_.Value -or $_.Value -cne $g.controls.($_.Name)
+            }).Count -eq 0) {
             if ($g.reference_checks_ok) { $stage = 'REFERENCE_CASES_VERIFIED'; break }
             if (!$Casos) { break }
         }

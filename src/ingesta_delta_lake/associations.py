@@ -135,8 +135,9 @@ def blocked(bundle, family, row, index=None):
 
 def ar_reference_index(bundle):
     references = {}
+    sources = bundle.get("sources", {})
     for family, field in lista_ar.CODE_FIELDS.items():
-        rows = bundle["sources"].get(family, ())
+        rows = sources.get(family, ())
         codes = {r[field]: r for r in rows}
         scoped, global_cases = lista_ar.reference_reviews(
             bundle["cases"].get(family, ()),
