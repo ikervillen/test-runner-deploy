@@ -50,6 +50,14 @@ def ar_review_intervals(cases, origin):
     return sorted(spans, key=lambda span: (span[0] or "", span[1] or ""))
 
 
+def ar_reference_controls(manifest):
+    controls = manifest.get("controls", {})
+    return {
+        name: controls.get(name, {}).get("hash")
+        for name in ("LISTA_AR", "SIP_DEFECTO", "SIP_DEFECTO_STATUS", "SIP_DEFECTO_AR")
+    }
+
+
 def ar_blocked_origins(storage, manifest, config, latency, *, now=None):
     from .common import read_json
 
@@ -57,15 +65,11 @@ def ar_blocked_origins(storage, manifest, config, latency, *, now=None):
     try:
         status = read_json(storage.exchange / "ar-intake.json")
         table = manifest["tables"].get("LISTA_AR", {})
-        controls = manifest.get("controls", {})
         pin = digest(
             [
                 table.get("table_id"),
                 table.get("version"),
-                [
-                    controls.get(name, {}).get("hash")
-                    for name in ("LISTA_AR", "SIP_DEFECTO", "SIP_DEFECTO_STATUS", "SIP_DEFECTO_AR")
-                ],
+                list(ar_reference_controls(manifest).values()),
             ]
         )
         age = (now or datetime.now(UTC)) - datetime.fromisoformat(status["discovered_at"])
@@ -166,6 +170,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
 
     storage, policy = getattr(pipelines, lane), pipelines.policy
     own = SilverSnapshot.open(storage)
+    ar_attribution_rule = getattr(native, "AR_ATTRIBUTION_RULE", None)
     from ingesta_delta_lake.common import IntegrityError as NativeIntegrityError
 
     from .common import atomic_json, immutable_json, live_epoch, read_json
@@ -182,6 +187,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
         ):
             active = pinned
             own = SilverSnapshot.open(storage, publication_id=active["target"])
+    ar_controls = ar_reference_controls(own.manifest)
 
     archive = None
     cached_archive = storage.gold / "checkpoint" / "archive-reference.json"
@@ -237,7 +243,11 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
     previous = None
     if (storage.gold / "inputs" / "current.json").exists():
         previous = Evidence.open(storage.gold / "inputs")
-        if previous.document.get("source_vector") == vector and (
+        if (
+            previous.document.get("source_vector") == vector
+            and previous.document.get("ar_attribution_rule") == ar_attribution_rule
+            and previous.document.get("ar_reference_controls") == ar_controls
+        ) and (
             lane != "live"
             or (
                 previous.document.get("coverage_rule") == COVERAGE_RULE
@@ -546,6 +556,8 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
             **({"historical_mp9_closures": historical_closures} if historical_closures else {}),
         },
         "coverage": coverage,
+        "ar_attribution_rule": ar_attribution_rule,
+        "ar_reference_controls": ar_controls,
     }
     window = None
     scopes = None
@@ -662,6 +674,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                         review.get("ar_pin") != doc["ar_pin"]
                         or review.get("ar_categories") != ar_categories
                         or review.get("ar_unit_rule") != AR_UNIT_RULE
+                        or review.get("ar_attribution_rule") != ar_attribution_rule
                         or review.get("coverage_rule") != COVERAGE_RULE
                         or review.get("more_hourly_revisions")
                         or review.get("older_retry_scan")

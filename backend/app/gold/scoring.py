@@ -57,6 +57,25 @@ def has_official_total(formula: str | None) -> bool:
     )
 
 
+def without_ar(score, components):
+    """Retain confirmed components when only the AR result has lost accreditation."""
+    components = [r for r in components if r["componente"] in {"MIA", "ZC"}]
+    if not components:
+        return None, components
+    names = sorted(r["componente"] for r in components)
+    total = round(sum(r["contribucion"] for r in components), 4)
+    weight = round(sum(r["peso"] for r in components), 4)
+    return {
+        **score,
+        "formula_version": PARTIAL_FORMULA_PREFIX + ",".join(names),
+        "reference_id": score["reference_id"] if "MIA" in names else None,
+        "total_penalty": total,
+        "normalized_score": round(total / weight, 4) if weight else 0.0,
+        "evaluated_weight": weight,
+        "estado_interpretacion": "partial",
+    }, components
+
+
 def calculate(
     window: Window,
     *,

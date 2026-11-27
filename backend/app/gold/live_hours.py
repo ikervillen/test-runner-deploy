@@ -183,8 +183,13 @@ def ar_pin(document, silver_refs):
             document["registry"],
             document["association_cases"],
             document["bundle"]["catalog_composition"],
-            document["bundle"]["cases"].get("LISTA_AR", []),
+            {
+                family: document["bundle"]["cases"].get(family, [])
+                for family in ("LISTA_AR", "SIP_DEFECTO", "SIP_DEFECTO_STATUS", "SIP_DEFECTO_AR")
+            },
             document.get("ar_blocked_origins"),
+            document.get("ar_attribution_rule"),
+            document.get("ar_reference_controls"),
         ]
     )
 
@@ -269,7 +274,10 @@ def ar_revisions(root, visible, document, current, cutoff, budget, *, bounds=Non
         work += sum(counts["rows_decoded"] for counts in evidence.read_stats.values())
         if work >= budget:
             raise IntegrityError("Hourly AR revision exceeds its explicit row budget")
-        return _ar_by_production(rows, decisions)
+        reviewed = {r["source_id"] for r in decisions if r["status"] == "SOURCE_REVIEW"}
+        return _ar_by_production(rows, decisions), [
+            row for row in rows if source_id("LISTA_AR", row) in reviewed
+        ]
 
     @cache
     def current_assignments():
@@ -279,7 +287,15 @@ def ar_revisions(root, visible, document, current, cutoff, budget, *, bounds=Non
         identity = scope.get("evidence_reference")
         if not identity:
             return False
-        key = digest(["ar-window-v3", window.identity, window.cutoff, identity])
+        key = digest(
+            [
+                "ar-window-v4",
+                document.get("ar_attribution_rule"),
+                window.identity,
+                window.cutoff,
+                identity,
+            ]
+        )
         before = baseline.get(key)
         requires_review = False
         if before is None:
@@ -306,18 +322,29 @@ def ar_revisions(root, visible, document, current, cutoff, budget, *, bounds=Non
                 prior.document.get("ar_pin") == document["ar_pin"]
                 and pinned == document["ar_categories"]
                 and old_rule == document.get("ar_unit_rule")
+                and prior.document.get("ar_attribution_rule") == document.get("ar_attribution_rule")
                 and not legacy_coverage
             ):
                 return False
-            prior_events = _ar_window(
-                old_assignments(identity)[window.production_id], pinned, window, old_rule
-            )
+            assigned, reviewed = old_assignments(identity)
+            prior_events = _ar_window(assigned[window.production_id], pinned, window, old_rule)
             before = digest(prior_events)
             # Prior workers could publish a zero although the pinned AR intake was blocked.
             requires_review = (
                 bool(pinned_config)
-                and legacy_coverage
-                and prior_blocked
+                and (
+                    (legacy_coverage and prior_blocked)
+                    or (
+                        prior.document.get("ar_attribution_rule")
+                        != document.get("ar_attribution_rule")
+                        and any(
+                            event["origen_fenix"] == prior_origin
+                            and event["FECHA_ON"] < window.cutoff
+                            and (event["FECHA_OFF"] is None or event["FECHA_OFF"] > window.start)
+                            for event in reviewed
+                        )
+                    )
+                )
                 and scope["estado"] == "READY"
                 and not scope.get("reason_code")
                 and not prior_events

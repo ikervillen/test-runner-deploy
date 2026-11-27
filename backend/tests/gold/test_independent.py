@@ -70,6 +70,22 @@ def test_independent_bridge_reads_no_active_sqlite(independent, monkeypatch):
     assert export(plan, "live", cfg).publication_id == result.publication_id
 
 
+def test_ar_rule_changes_evidence_with_same_silver_pin(independent, monkeypatch):
+    from ingesta_delta_lake import associations
+
+    from app.gold.independent_inputs import export
+
+    plan, cfg = independent
+    monkeypatch.setattr(associations, "AR_ATTRIBUTION_RULE", "old-test", raising=False)
+    before = export(plan, "live", cfg)
+    monkeypatch.setattr(associations, "AR_ATTRIBUTION_RULE", "new-test")
+    after = export(plan, "live", cfg)
+    assert after.document["source_vector"] == before.document["source_vector"]
+    assert after.publication_id != before.publication_id
+    assert after.document["ar_attribution_rule"] == "new-test"
+    assert export(plan, "live", cfg).publication_id == after.publication_id
+
+
 def test_evidence_verifies_bytes_and_rejects_unbounded_read(tmp_path, native):
     evidence = save(tmp_path, {}, {"rows": pa.table({"a": [1, 2]})})
     with pytest.raises(IntegrityError, match="budget"):
@@ -1413,3 +1429,309 @@ def test_ar_category_revision_recovers_pinned_hour_in_real_delta(tmp_path, nativ
         for r in current.rows("publication_scope_status")
         if r["source"] == "quality_scores"
     )
+
+
+def test_ar_attribution_repair_uses_published_ledger_and_recovers_same_silver_pin(
+    tmp_path, native, monkeypatch
+):
+    from dataclasses import replace
+    from datetime import UTC, timedelta
+    from types import SimpleNamespace
+
+    from fastapi.testclient import TestClient
+    from ingesta_delta_lake import associations
+    from ingesta_delta_lake.config import Config
+    from ingesta_delta_lake.pipeline_publications import SilverSnapshot, publish_family
+    from ingesta_delta_lake.service import run as transform
+
+    from app.config import Settings
+    from app.factory import create_app
+    from app.gold.common import digest, read_json
+    from app.gold.evidence import attribution
+    from app.gold.live_archive import archived_result
+    from app.gold.live_hours import ar_revisions, retry_closures
+    from app.gold.pipeline import run
+    from app.gold.publications import Snapshot
+
+    from .test_pipeline import CUTOFF, bundle
+
+    close = CUTOFF - timedelta(hours=1)
+    later = close + timedelta(minutes=10)
+    source = industrial_evidence(
+        tmp_path / "inputs", "live", recent=True, native=native, horizon=later, window_seconds=600
+    )
+    doc = {k: v for k, v in source.document.items() if k not in {"tables", "schema_id"}}
+    tables = {
+        r["name"]: source.table(r["name"], max_rows=100000) for r in source.document["tables"]
+    }
+    input_folder = tmp_path / "fenix" / "AV23"
+    input_folder.mkdir(parents=True)
+    stores = SimpleNamespace(silver=tmp_path / "silver", exchange=tmp_path / "exchange")
+    native_config = Config(
+        plant="AV",
+        input_root=input_folder.parent,
+        sources=(("AV23", input_folder),),
+        line_by_origin=(("AV23", "AV23"),),
+        bronze_root=tmp_path / "bronze",
+        silver_root=stores.silver,
+        control_root=tmp_path / "control",
+        timestamp_policy="local_naive_test_v1",
+        stable_wait_seconds=0.01,
+    )
+
+    def ar_line(row):
+        values = dict(row)
+        for field in ("FECHA_ON", "FECHA_OFF"):
+            value = values[field]
+            values[field] = value.strftime("%d/%m/%Y %H:%M:%S") if value else ""
+        return (
+            ";".join(
+                str(values[key]) if values[key] is not None else ""
+                for key in associations.lista_ar.FIELDS
+            )
+            + ";\n"
+        )
+
+    exports = {
+        "SIP_DEFECTO": "9;53;Oval mouth;Oval;0;\n",
+        "SIP_DEFECTO_STATUS": "1;1;Alert;1;A;2;1;\n",
+        "SIP_DEFECTO_AR": "1;1;INSPECTION ZF;1;\n",
+        "LISTA_AR": "".join(ar_line(row) for row in tables["LISTA_AR"].to_pylist()),
+    }
+    for family, text in exports.items():
+        (input_folder / f"{family}.csv").write_text(text, encoding="utf-8")
+        cfg = replace(native_config, family=family)
+        explanation = transform(cfg)
+        assert explanation["status"] == "APPLIED", explanation
+        publish_family(cfg, stores, lane="live", identity="fixture", family=family)
+    silver = SilverSnapshot.open(stores)
+    tables["LISTA_AR"] = pa.Table.from_batches(list(silver.batches("LISTA_AR", batch_size=32)))
+    ar_ref = silver.manifest["tables"]["LISTA_AR"]
+    cases = [
+        {
+            "issue_id": str(identifier),
+            "reason": "ASSOCIATION_CONFLICT",
+            "payload": {
+                "codigo_aviso_rechazo": candidate,
+                "accepted": [{"codigo_aviso_rechazo": confirmed}],
+                "values_for_id": [[confirmed], [candidate]],
+            },
+        }
+        for identifier, confirmed, candidate in ((50, 510, 9510), (172, 500, 510))
+    ]
+    doc["bundle"]["cases"]["SIP_DEFECTO"] = cases
+    config = read_json(Path(__file__).parents[3] / "config/customer_score.json")
+    catalog = bundle()
+    doc.update(
+        score_config_id=digest([config, catalog]),
+        ar_categories=catalog["defect_categories"],
+        ar_pin="original",
+        silver_refs={"LISTA_AR": {"table_id": ar_ref["table_id"], "version": ar_ref["version"]}},
+    )
+    good = attribution(doc, tables)["observation_assignments"]
+    stale = pa.Table.from_pylist(
+        [
+            dict(row, status="SOURCE_REVIEW", productions=[])
+            if row["source_family"] == "LISTA_AR"
+            else row
+            for row in good.to_pylist()
+        ],
+        schema=good.schema,
+    )
+    previous = save(
+        source.root, doc, dict(tables, observation_assignments=stale), window_seconds=600
+    )
+    output = tmp_path / "published"
+    options = dict(
+        config=config,
+        bundle=catalog,
+        environment="test",
+        plant="AV",
+        lane="live",
+        current_slot_seconds=600,
+        mia_reference_mode="live",
+    )
+    run(previous.root, output, confirmed_input=previous, cutoff=close, **options)
+    before = Snapshot.open(output)
+    assert not before.rows("ar_intervals")
+    # Exercise the production scheduler at an unchanged Silver pin beyond Live.
+    # Only the fixture's context and operational clock are supplied by adapters.
+    from ingesta_delta_lake.pipeline_view import SilverView, ViewResult
+
+    from app.gold import independent_inputs as exporter
+
+    class PinnedSilver:
+        def __init__(self):
+            self.manifest = dict(silver.manifest, controls=dict(silver.manifest["controls"]))
+            self.manifest["controls"].update(
+                ASIGNACION_PRODUCCION_RAMAL={"hash": "fixture-registry"},
+                CATALOGO_PRODUCCIONES={"hash": "fixture-catalog"},
+            )
+
+        batches = staticmethod(silver.batches)
+
+        def control(self, family):
+            if family == "ASIGNACION_PRODUCCION_RAMAL":
+                registry = doc["registry"]
+                extra = {"association": {"registry": registry, "registry_hash": digest(registry)}}
+            elif family == "CATALOGO_PRODUCCIONES":
+                extra = {"composition": doc["bundle"]["catalog_composition"]}
+            else:
+                return silver.control(family)
+            return {"extra": extra, "cases": [], "meta": {}, "control_id": family, "version": 0}
+
+    view_rows = SilverView.rows
+
+    def confirmed_rows(view, family, **kwargs):
+        if family == "LISTA_AR":
+            return view_rows(view, family, **kwargs)
+        return ViewResult(tables[family].to_pylist(), [], doc.get("lineage", {}).get(family, {}))
+
+    vector = [silver.manifest["publication_id"], None, [[], 0, 0], [], None]
+    old_export = {k: v for k, v in doc.items() if k != "silver_refs"}
+    old_export.update(source_vector=vector, sources=vector[:1], ar_attribution_rule="old-fixture")
+    save(source.root, old_export, dict(tables, observation_assignments=stale), window_seconds=600)
+    old_horizon = close + timedelta(hours=9, minutes=10)
+    plan = SimpleNamespace(
+        live=SimpleNamespace(gold=tmp_path, exchange=stores.exchange),
+        history=SimpleNamespace(gold=tmp_path / "disabled-history"),
+        policy=SimpleNamespace(
+            latency_seconds=600,
+            window_seconds=600,
+            read_max_rows=100000,
+            read_batch_rows=1000,
+            live_batch_files=32,
+        ),
+    )
+    with monkeypatch.context() as patch:
+        patch.setenv("FENIX_LIVE_T0", (close - timedelta(hours=5)).isoformat())
+        patch.setattr(SilverSnapshot, "open", lambda *args, **kwargs: PinnedSilver())
+        patch.setattr(SilverView, "rows", confirmed_rows)
+        patch.setattr(exporter, "ar_blocked_origins", lambda *args: [])
+        patch.setattr(exporter, "_source_horizon", lambda _: old_horizon)
+        patch.setattr(exporter, "recent_relations", lambda *args: None)
+        patch.setattr(exporter, "auxiliary_turn", lambda *args, **kwargs: ({}, 0, ([], 0, 0)))
+        automatic = exporter.export(
+            plan,
+            "live",
+            native_config,
+            ar_categories=doc["ar_categories"],
+            score_config_id=doc["score_config_id"],
+        )
+        assert automatic.document["source_vector"] == vector
+        assert automatic.document["silver_refs"]["LISTA_AR"]["version"] == ar_ref["version"]
+        assert automatic.document["ar_reference_controls"] == {
+            family: silver.manifest["controls"][family]["hash"] for family in exports
+        }
+        assert any(item[-1] == close.isoformat() for item in automatic.document["retry_closures"])
+        assert automatic.document["older_retry_scan"]
+        advanced = exporter.export(
+            plan,
+            "live",
+            native_config,
+            ar_categories=doc["ar_categories"],
+            score_config_id=doc["score_config_id"],
+        )
+        assert advanced.document["older_retry_before"] < automatic.document["older_retry_before"]
+        assert not any(
+            item[-1] == close.isoformat() for item in advanced.document["retry_closures"]
+        )
+
+    revised = {
+        **doc,
+        "ar_pin": "corrected",
+        "ar_attribution_rule": getattr(associations, "AR_ATTRIBUTION_RULE", "test"),
+    }
+    changes = ar_revisions(
+        tmp_path,
+        before,
+        revised,
+        lambda window: (source.rows("LISTA_AR", window=window), good.to_pylist()),
+        later,
+        100000,
+    )
+    revised["retry_closures"] = retry_closures(
+        before, doc["coverage"], later, 100000, closed=[], ar_changed=changes
+    )
+    assert any(item[-1] == close.isoformat() for item in revised["retry_closures"])
+    new = save(source.root, revised, dict(tables, observation_assignments=good), window_seconds=600)
+    assert new.document["silver_refs"] == previous.document["silver_refs"]
+    run(new.root, output, confirmed_input=new, cutoff=later, **options)
+    after = Snapshot.open(output)
+    assert after.rows("ar_intervals")
+    assert any(row["tiempo_afectado_us"] > 0 for row in after.rows("ar_window_bases"))
+    score = next(row for row in after.rows("quality_scores") if row["corte"] == close)
+    components = after.rows("quality_score_components")
+    assert {
+        row["componente"] for row in components if row["id_resultado"] == score["id_resultado"]
+    } >= {
+        "Grave",
+        "DAR",
+        "MIA",
+        "ZC",
+    }
+    settings = SimpleNamespace(
+        resolved_gold_root=output,
+        gold_query_max_rows=100000,
+        gold_query_total_rows=300000,
+        gold_live_timezone="Europe/Madrid",
+    )
+    monkeypatch.setattr("app.gold.live_archive.live_epoch", lambda: close - timedelta(hours=2))
+    details = archived_result(
+        settings,
+        after.publication_id,
+        score["id_resultado"],
+        moment=(close + timedelta(hours=9)).replace(tzinfo=UTC),
+    )["details"]
+    assert any(row["affected_cavity_minutes"] > 0 for row in details["aql_score_details"])
+    key = score["id_resultado"]
+    invalidation = save(
+        source.root,
+        {
+            **revised,
+            "retry_closures": [],
+            "closed_hours": [key],
+            "ar_invalidations": [
+                [
+                    key,
+                    score["id_produccion"],
+                    "AV23",
+                    score["inicio"].isoformat(),
+                    score["corte"].isoformat(),
+                ]
+            ],
+        },
+        dict(tables, observation_assignments=good),
+        window_seconds=600,
+    )
+    run(invalidation.root, output, confirmed_input=invalidation, cutoff=later, **options)
+    withdrawn = Snapshot.open(output)
+    current = next(row for row in withdrawn.rows("quality_scores") if row["id_resultado"] == key)
+    assert current["formula_version"].endswith(":MIA,ZC")
+    kept = [row for row in withdrawn.rows("quality_score_components") if row["id_resultado"] == key]
+    assert sorted(kept, key=lambda row: row["componente"]) == sorted(
+        (
+            row
+            for row in components
+            if row["id_resultado"] == key and row["componente"] in {"MIA", "ZC"}
+        ),
+        key=lambda row: row["componente"],
+    )
+    api = create_app(
+        Settings(
+            data_root=output,
+            data_backend="gold",
+            gold_root=output,
+            gold_live_timezone="Europe/Madrid",
+        )
+    )
+    with TestClient(api) as client:
+        response = client.get(f"/api/live/archive/{withdrawn.publication_id}/{key}")
+    assert response.status_code == 200, response.text
+    partial = response.json()
+    assert partial["score"]["total_penalty"] is None
+    assert partial["score"]["normalized_score"] is None
+    assert partial["score"]["reference_id"] == score["reference_id"]
+    assert sorted(
+        partial["details"]["quality_score_components"], key=lambda row: row["componente"]
+    ) == sorted(kept, key=lambda row: row["componente"])
