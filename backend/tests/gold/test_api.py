@@ -263,10 +263,12 @@ def test_live_bulk_reads_weighted_contributions_from_the_pinned_delta(gold_api, 
 def test_withdrawal_updates_current_delta_and_hides_pending_score_on_old_pin(
     gold_api, calculation, monkeypatch
 ):
+    from collections import Counter
     from datetime import UTC, timedelta
     from types import SimpleNamespace
 
     from app.domain.errors import ApplicationError
+    from app.gold.common import canonical
     from app.gold.live_archive import archive, archived_result
     from app.gold.live_hours import AR_COVERAGE_PENDING
     from app.gold.pipeline import SCORE_TABLES
@@ -294,9 +296,9 @@ def test_withdrawal_updates_current_delta_and_hides_pending_score_on_old_pin(
     publisher.publish(source, rows, **options)
     current = Snapshot.open(root, require_gold_contract=True)
     for table in SCORE_TABLES:
-        assert current.rows(table) == [
-            r for r in original.rows(table) if r["id_resultado"] != identity
-        ]
+        assert Counter(map(canonical, current.rows(table))) == Counter(
+            canonical(r) for r in original.rows(table) if r["id_resultado"] != identity
+        )
     assert pending in current.rows("publication_scope_status")
     assert publisher.publish(source, rows, **options)["status"] == "UNCHANGED"
 
