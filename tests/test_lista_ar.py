@@ -396,6 +396,42 @@ def test_dictionary_review_marks_even_absent_accepted_event_as_incomplete(
     assert not result["complete"] and files(config) == before
 
 
+def test_dictionary_conflict_blocks_only_affected_codes_and_keeps_replay_idempotent(
+    config, source, dictionaries
+):
+    path = dictionaries["SIP_DEFECTO"]
+    path.write_text(path.read_text(encoding="utf-8") + "502;112;Otro;Otro;0;\n", encoding="utf-8")
+    dictionary = replace(config, family="SIP_DEFECTO")
+    assert run(dictionary)["status"] == "APPLIED"
+    path.write_text("501;129;Conflicto;Pliegue;0;\n", encoding="utf-8")
+    assert run(dictionary)["status"] == "BLOCKED"
+    source.write_text(line(code=129) + line(code=112, cavity="3D"), encoding="utf-8")
+    first = run(config)
+    assert first["status"] == "PARTIAL"
+    assert not first["complete"] and first["inserted_this_attempt"] == 1
+    assert [r["COD_AR"] for r in rows(config).values()] == [112]
+    gap = json.loads(query(config, "SELECT payload_json FROM issues")[0][0])["references"][0]
+    assert gap["code"] == 129 and gap["cause"] == "DICTIONARY_REVIEW"
+    assert len(gap["dictionary_issue_ids"]) == 1
+    again = run(config)
+    assert again["delta_version"] == first["delta_version"]
+    assert again["inserted_this_attempt"] == 0
+    with sqlite3.connect(dictionary.control_path) as db:
+        db.execute("UPDATE issues SET status='RESOLVED'")
+    recovered = run(config)
+    assert recovered["complete"] and recovered["inserted_this_attempt"] == 1
+    assert {r["COD_AR"] for r in rows(config).values()} == {112, 129}
+
+
+def test_open_event_before_t0_is_kept_but_finished_event_is_not(config, source, monkeypatch):
+    monkeypatch.setenv("FENIX_LIVE_T0", "2026-10-14T10:20:00")
+    source.write_text(
+        line(cavity="3D") + line(cavity="2D", off="14/10/2026 10:00:00"), encoding="utf-8"
+    )
+    assert run(config)["inserted_this_attempt"] == 1
+    assert [r["CAVIDAD"] for r in rows(config).values()] == ["3D"]
+
+
 @pytest.mark.parametrize("phase", ["before", "after", "ack"])
 @pytest.mark.parametrize("closing", [False, True])
 def test_insert_and_close_recovery_confirms_once(config, source, monkeypatch, phase, closing):

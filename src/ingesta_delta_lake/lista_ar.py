@@ -5,12 +5,13 @@ import hashlib
 import io
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import pyarrow as pa
 
 from .common import IntegrityError, blank_input, canonical, digest, parse_int64
-from .live_epoch import before_epoch, epoch
+from .live_epoch import epoch
 from .mp9 import timestamp
 
 CONTRACT = "lista_ar_v1"
@@ -128,8 +129,6 @@ def parse(snapshots, encoding):
             for raw in reader:
                 if not raw:
                     continue
-                if before_epoch(raw, FIELDS.index("FECHA_ON"), floor):
-                    continue
                 result.rows_read += 1
                 tokens = raw[:-1] if len(raw) == 13 and raw[-1] == "" else raw
                 ref = {**evidence, "row": reader.line_num, "raw": list(raw)}
@@ -145,6 +144,12 @@ def parse(snapshots, encoding):
                     column = "FECHA_OFF"
                     if row[column] is not None and row[column] < row["FECHA_ON"]:
                         raise ValueError("FECHA_OFF anterior a FECHA_ON")
+                    if (
+                        floor is not None
+                        and row[column]
+                        and datetime.fromisoformat(row[column]) <= floor
+                    ):
+                        continue
                 except ValueError as exc:
                     result.invalid_rows += 1
                     issue = {
@@ -188,16 +193,24 @@ def parse(snapshots, encoding):
 
 
 def reference_gaps(row, references):
-    return [
-        {
-            "field": f,
-            "family": family,
-            "code": row[f],
-            "cause": "DICTIONARY_REVIEW" if references[family]["reviews"] else "CODE_MISSING",
-        }
-        for f, family in REFERENCES.items()
-        if references[family]["reviews"] or row[f] not in references[family]["codes"]
-    ]
+    gaps = []
+    for field_name, family in REFERENCES.items():
+        ref, code = references[family], row[field_name]
+        reviews = [
+            *ref["global_reviews"],
+            *ref["scoped_reviews"].get(code, ()),
+        ]
+        if reviews or code not in ref["codes"]:
+            gap = {
+                "field": field_name,
+                "family": family,
+                "code": code,
+                "cause": "DICTIONARY_REVIEW" if reviews else "CODE_MISSING",
+            }
+            if reviews:
+                gap["dictionary_issue_ids"] = reviews
+            gaps.append(gap)
+    return gaps
 
 
 def decide(parsed, existing, references, held):

@@ -8,7 +8,24 @@ from . import lista_ar as ar
 from .ar_storage import ArStore, load_references
 from .common import IntegrityError, digest
 from .service import _apply
-from .sources import capture_inputs
+from .sources import capture_identity, capture_inputs
+
+
+def _confirmed_inputs(snapshots, issues):
+    """Acknowledge exact event files with no unresolved rows in this attempt."""
+    blocked = set()
+    for case in issues:
+        evidence = case.get("evidence", ())
+        if isinstance(evidence, dict):
+            evidence = [evidence]
+        if not evidence:
+            return []
+        blocked.update((item.get("origin"), item.get("sha256")) for item in evidence)
+    return [
+        capture_identity("LISTA_AR", snapshot)
+        for snapshot in snapshots
+        if (snapshot.origin, snapshot.sha256) not in blocked
+    ]
 
 
 def process(config, control, attempt):
@@ -38,14 +55,20 @@ def process(config, control, attempt):
     input_variants = len(parsed.entries)
     descriptors = [s.descriptor() for s in snapshots]
     restored = 0
+    checked = set()
     for pending in control.dependency_candidates():
+        if config.scheduled_lot_attempt and ar.reference_gaps(pending["candidate"], references):
+            continue
         for ref in pending["evidence"]:
             path = Path(ref["bronze_path"]).resolve()
-            if (
-                not path.is_relative_to(config.bronze_root)
-                or hashlib.sha256(path.read_bytes()).hexdigest() != ref["sha256"]
-            ):
-                raise IntegrityError("Evidencia de dependencia AR alterada o fuera de Bronze")
+            identity = path, ref["sha256"]
+            if identity not in checked:
+                if (
+                    not path.is_relative_to(config.bronze_root)
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != ref["sha256"]
+                ):
+                    raise IntegrityError("Evidencia de dependencia AR alterada o fuera de Bronze")
+                checked.add(identity)
             descriptors.append(
                 {k: ref[k] for k in ("origin", "source_path", "bronze_path", "sha256")}
             )
@@ -59,7 +82,8 @@ def process(config, control, attempt):
         **existing,
         **{ar.key(r): {f: r[f] for f in ar.SCHEMA.names} for r in [*inserts, *updates]},
     }
-    reference_pending = sum(bool(ar.reference_gaps(r, references)) for r in merged.values())
+    invalid_references = [r for r in merged.values() if ar.reference_gaps(r, references)]
+    reference_pending = len(invalid_references)
     stats = {
         "rows_read": parsed.rows_read,
         "normalized_variants": len(parsed.entries),
@@ -115,6 +139,7 @@ def process(config, control, attempt):
         raise IntegrityError("Lote AR confirmado exige nuevas escrituras")
     control.resolve_dependencies(merged, references, batch_id)
     counts = control.counts()
+    confirmed_inputs = _confirmed_inputs(snapshots, issues) if config.scheduled_lot_attempt else []
     complete = not (counts["open_dependencies"] or counts["open_reviews"] or reference_pending)
     status = (
         ("APPLIED" if wrote else "NO_CHANGE" if snapshots or restored else "NO_INPUTS")
@@ -137,8 +162,10 @@ def process(config, control, attempt):
         "delta_version": version,
         "status": status,
         "complete": complete,
+        "confirmed_input_ids": confirmed_inputs,
         "published_records": len(merged),
         "accepted_reference_pending": reference_pending,
+        "reference_pending_origins": sorted({r["origen_fenix"] for r in invalid_references}),
         "published_with_group": sum(r["ID_Agrupación"] is not None for r in merged.values()),
         "published_without_group": sum(r["ID_Agrupación"] is None for r in merged.values()),
         "recovered_operations": recovered,

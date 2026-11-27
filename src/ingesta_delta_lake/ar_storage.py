@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from collections import defaultdict
 from contextlib import closing
 from dataclasses import replace
 from datetime import datetime
@@ -13,7 +14,7 @@ from deltalake.transaction import CommitProperties
 from . import __version__
 from . import lista_ar as ar
 from .commit_protocol import application_transaction, delta_configuration, merge_counts_match
-from .common import IntegrityError, canonical, digest
+from .common import IntegrityError, canonical, digest, parse_int64
 from .delta import DeltaStore
 
 CODE_FIELDS = {
@@ -21,6 +22,48 @@ CODE_FIELDS = {
     "SIP_DEFECTO_STATUS": "codigo_status",
     "SIP_DEFECTO_AR": "codigo_tipo_ar",
 }
+
+
+def ar_silver_pin(manifest):
+    """Only changes to the AR table or its control invalidate the intake projection."""
+    table = manifest["tables"].get("LISTA_AR", {})
+    controls = manifest.get("controls", {})
+    return digest(
+        [
+            table.get("table_id"),
+            table.get("version"),
+            [controls.get(name, {}).get("hash") for name in ("LISTA_AR", *CODE_FIELDS)],
+        ]
+    )
+
+
+def reference_reviews(cases, code_field, accepted_by_id):
+    """Index conflicts whose complete set of affected codes is established."""
+    scoped, global_reviews = defaultdict(list), []
+    for case in cases:
+        payload = case["payload"]
+        try:
+            if case["reason"] == "ASSOCIATION_CONFLICT":
+                codes = {
+                    payload[code_field],
+                    *(row[code_field] for row in payload["accepted"]),
+                    *(value[0] for value in payload["values_for_id"]),
+                }
+            elif case["reason"] == "INVALID_VALUE":
+                raw = payload["evidence"]["raw"]
+                identifier, code = parse_int64(raw[0]), parse_int64(raw[1])
+                codes = {code, accepted_by_id.get(identifier, code)}
+            else:
+                global_reviews.append(case["issue_id"])
+                continue
+            if any(type(code) is not int for code in codes):
+                raise ValueError("Invalid conflict code")
+        except (KeyError, IndexError, TypeError, ValueError):
+            global_reviews.append(case["issue_id"])
+            continue
+        for code in codes:
+            scoped[code].append(case["issue_id"])
+    return dict(scoped), global_reviews
 
 
 def load_references(config):
@@ -65,7 +108,17 @@ def load_references(config):
         decoded = [
             dict(zip(source.contract.schema.names, (k, *v), strict=True)) for k, v in rows.items()
         ]
-        references[family] = {"codes": {r[code_field]: r for r in decoded}, "reviews": cases}
+        codes = {r[code_field]: r for r in decoded}
+        if len(codes) != len(decoded):
+            raise IntegrityError(f"El catálogo confirmado {family} contiene códigos duplicados")
+        scoped, global_reviews = reference_reviews(
+            cases, code_field, {identifier: values[0] for identifier, values in rows.items()}
+        )
+        references[family] = {
+            "codes": codes,
+            "scoped_reviews": scoped,
+            "global_reviews": global_reviews,
+        }
         manifest[family] = {
             "contract": source.contract.name,
             "version": version,

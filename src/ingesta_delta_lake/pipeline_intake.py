@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .common import CaptureError, IntegrityError, canonical, digest, now
+from .pipeline_lots import accepted_input
 from .pipeline_policy import LANES
 from .sources import Snapshot, capture, capture_identity, export_kind, parse_name, recover_capture
 
@@ -310,14 +311,15 @@ class Intake:
         return list(latest.values())
 
     def acknowledge(self, ids, result, *, published_at):
-        if not self.accepted_result(result):
-            return
         summary = {
             k: result[k]
             for k in ("status", "delta_version", "batch_id", "operation_id")
             if k in result
         }
-        receipt = digest([list(ids), summary])
+        eligible = [identity for identity in ids if accepted_input(result, identity)]
+        if not eligible:
+            return
+        receipt = digest([eligible, summary])
         with self.db:
             self.db.execute(
                 "INSERT OR IGNORE INTO receipts VALUES(?,?,?)",
@@ -326,7 +328,7 @@ class Intake:
             self.db.executemany(
                 "UPDATE inputs SET state='HANDLED', published_at=?, result=? "
                 "WHERE input_id=? AND state='CAPTURED'",
-                [(published_at, receipt, identity) for identity in ids],
+                [(published_at, receipt, identity) for identity in eligible],
             )
 
     def defer(self, ids, result):
@@ -349,6 +351,36 @@ class Intake:
             self.db.execute(
                 "UPDATE inputs SET state='CAPTURED' WHERE family=? AND state=?", (family, state)
             )
+
+    def release_ar_lots(self, reference_token, limit):
+        """Give each waiting capture one bounded retry per confirmed dictionary state."""
+        setting = "live_ar_dictionary_retry"
+        prior = json.loads(self.setting(setting) or "{}")
+        if prior.get("token") == reference_token and prior.get("done"):
+            return 0
+        cursor = prior.get("cursor", 0) if prior.get("token") == reference_token else 0
+        rows = self.db.execute(
+            "SELECT rowid FROM inputs WHERE state='LOT_WAIT' AND family='LISTA_AR' "
+            "AND rowid>? ORDER BY rowid LIMIT ?",
+            (cursor, limit),
+        ).fetchall()
+        with self.db:
+            self.db.executemany("UPDATE inputs SET state='CAPTURED' WHERE rowid=?", rows)
+            self.db.execute(
+                "INSERT INTO settings VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (
+                    setting,
+                    canonical(
+                        {
+                            "token": reference_token,
+                            "cursor": rows[-1][0] if rows else cursor,
+                            "done": len(rows) < limit,
+                        }
+                    ),
+                ),
+            )
+        return len(rows)
 
     def capture_turn(
         self, config, policy, candidates, *, clock=time.monotonic, cursor_key="cursor"
@@ -387,9 +419,11 @@ class Intake:
             if previous is None or snapshot.sha256 != previous.sha256:
                 self.remember(item.family, snapshot)
             counts["captured" if self.db.total_changes > before else "unchanged"] += 1
+            return True
         except (OSError, CaptureError, IntegrityError) as exc:
             self.failure(item.path, str(exc))
             counts["failed"] += 1
+            return False
 
     def capture_live(self, config, policy, candidates, *, window, clock=time.monotonic):
         if self.lane != "live":
@@ -427,6 +461,13 @@ class Intake:
             "audited": 0,
         }
         cursors = json.loads(self.setting("live_capture_cursors") or "{}")
+        ar_pending = {
+            str(item.path): item.origin
+            for tier in ("current", "unseen")
+            for item in tiers[tier]
+            if item.family == "LISTA_AR"
+        }
+        ar_failed = json.loads(self.setting("live_ar_failed_captures") or "{}")
         last, attempts = None, 0
         for tier, items in tiers.items():
             cursor = cursors.setdefault(tier, {})
@@ -438,13 +479,20 @@ class Intake:
                 ):
                     break
                 prior = known[str(item.path)]
-                self._capture_item(
+                accepted = self._capture_item(
                     config,
                     policy,
                     item,
                     counts,
                     previous=Snapshot(**json.loads(prior)) if prior else None,
                 )
+                if item.family == "LISTA_AR":
+                    path = str(item.path)
+                    if accepted:
+                        ar_pending.pop(path, None)
+                        ar_failed.pop(path, None)
+                    else:
+                        ar_failed[path] = item.origin
                 if audit:
                     counts["audited"] += 1
                 attempts += 1
@@ -454,6 +502,9 @@ class Intake:
         if last is not None:
             self.set("live_capture_cursors", canonical(cursors))
             self.set("cursor", canonical(last))
+        if ar_failed or self.setting("live_ar_failed_captures"):
+            self.set("live_ar_failed_captures", canonical(ar_failed))
+        counts["ar_capture_pending"] = sorted(set(ar_pending.values()) | set(ar_failed.values()))
         return counts
 
 
