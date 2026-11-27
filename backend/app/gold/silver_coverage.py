@@ -8,7 +8,13 @@ from .evidence import OPERATIONS
 from .fragment_delta import EPOCH
 
 SLOT_FAMILIES = OPERATIONS - {"LISTA_AR"}
-COVERAGE_RULE = "confirmed-slots-v2"
+COVERAGE_RULE = "ar-events-v1"
+
+
+def slot_receipts(snapshot, family):
+    manifest = snapshot.manifest
+    ref = manifest["tables"].get(family) or manifest.get("controls", {}).get(family, {})
+    return ref.get("slot_receipts", ())
 
 
 def slot_number(stamp, seconds):
@@ -42,9 +48,7 @@ def confirmed_blanks(storage, snapshot, policy, *, receipts=None, after=None, th
         return {}, {}
     latest, accepted, captures = {}, {}, {}
     for family in SLOT_FAMILIES:
-        for seq, identity, origin, stamp, confirmed in (
-            snapshot.manifest["tables"].get(family, {}).get("slot_receipts", ())
-        ):
+        for seq, identity, origin, stamp, confirmed in slot_receipts(snapshot, family):
             key = family, origin, slot_number(datetime.fromisoformat(stamp), policy.window_seconds)
             latest[key] = seq, identity
             if confirmed:

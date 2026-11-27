@@ -84,6 +84,18 @@ def _coverage_ready(snapshot, p, window, pending, required=None):
         return False
     for family in required:
         matching = [r for r in scopes if r["source"] == family and r["estado"] == "READY"]
+        if family == "LISTA_AR" and any(r.get("ar_event_source") for r in matching):
+            if not any(
+                r.get("ar_event_source")
+                and not any(
+                    (left is None or context.stamp(left) < coverage_window.cutoff)
+                    and (right is None or context.stamp(right) > coverage_window.start)
+                    for left, right in r.get("ar_review_intervals", ())
+                )
+                for r in matching
+            ):
+                return False
+            continue
         if not any(
             covers(r, coverage_window)
             if "confirmed_slots" in r
@@ -808,6 +820,7 @@ class SpilledTables(dict):
         self.hours: tuple[tuple[str, datetime], ...] | None = None
         self.fact_bounds: tuple[tuple[str, datetime, datetime], ...] | None = None
         self.result_ids: tuple[str, ...] | None = None
+        self.withdrawn_scores: tuple[str, ...] = ()
 
     def mark(self, name: str) -> None:
         self.spilled.add(name)
@@ -1488,6 +1501,26 @@ def build(
         config_id = digest([config, bundle])
         catalog_version = digest(catalog_bundle)
         scope_rows: list[dict] = []
+        if lane == "live" and isinstance(snapshot, Evidence):
+            from .live_hours import AR_COVERAGE_PENDING
+
+            invalidations = snapshot.document.get("ar_invalidations", ())
+            published.withdrawn_scores = tuple(row[0] for row in invalidations)
+            scope_rows.extend(
+                _scope_row(
+                    key,
+                    identity,
+                    "quality_scores",
+                    origin,
+                    datetime.fromisoformat(left),
+                    datetime.fromisoformat(right),
+                    "WAITING_DEPENDENCY",
+                    AR_COVERAGE_PENDING,
+                    snapshot.publication_id,
+                    last_discovery,
+                )
+                for key, identity, origin, left, right in invalidations
+            )
         score_windows = defaultdict(list)
         for chunk in hour_plan or ():
             if not chunk.facts_only:

@@ -11,6 +11,7 @@ from app.domain.errors import ApplicationError
 
 from .common import live_epoch
 from .lanes import canonical_hour
+from .live_hours import AR_COVERAGE_PENDING
 from .metrics import Window
 from .query import Query
 from .scoring import SCORE_COMPONENTS, has_official_total
@@ -110,7 +111,16 @@ def live_scores(settings, cache, *, moment=None):
     return view.model_copy(update={"stale": (now - view.published_at).total_seconds() > 1200})
 
 
-def _project(q, open_hour, now, *, include_contributions=True, archive_start=None, timezone=None):
+def _project(
+    q,
+    open_hour,
+    now,
+    *,
+    include_contributions=True,
+    archive_start=None,
+    timezone=None,
+    withdrawals=None,
+):
     start = archive_start if archive_start is not None else open_hour - timedelta(hours=7)
     field = ds.field
     published_at = datetime.fromisoformat(q.snapshot.manifest["created_at"])
@@ -205,6 +215,10 @@ def _project(q, open_hour, now, *, include_contributions=True, archive_start=Non
         )
     lookup = {r["id_resultado"]: r for r in scores}
     states = {r["scope_id"]: r for r in scopes}
+    if withdrawals:
+        states.update((r["scope_id"], r) for r in withdrawals)
+        for row in withdrawals:
+            lookup.pop(row["scope_id"], None)
     floor = live_epoch()
     hours = []
     for i in range((open_hour - start) // timedelta(hours=1)):
@@ -310,6 +324,7 @@ def detail(settings, publication, result):
     if len(publication) != 64 or any(c not in "0123456789abcdef" for c in publication):
         raise ApplicationError("GOLD_UNAVAILABLE", "Publicación Gold inválida.", status_code=404)
     q = query_live(settings, publication)
+    ensure_hour_not_withdrawn(settings, q, result)
     live = _project(
         q,
         datetime.now(ZoneInfo(settings.gold_live_timezone)).replace(
@@ -323,6 +338,22 @@ def detail(settings, publication, result):
             "RESULT_NOT_FOUND", "Resultado horario no disponible.", status_code=404
         )
     return result_details(q, result)
+
+
+def ensure_hour_not_withdrawn(settings, pinned, result):
+    latest = query_live(settings)
+    if latest.snapshot.publication_id == pinned.snapshot.publication_id:
+        return
+    scopes = _rows(
+        latest,
+        "publication_scope_status",
+        ds.field("scope_id").cast("string") == result,
+        [("scope_id", "=", result)],
+    )
+    if any(row["reason_code"] == AR_COVERAGE_PENDING for row in scopes):
+        raise ApplicationError(
+            "RESULT_NOT_FOUND", "Cierre horario pendiente de cobertura AR.", status_code=404
+        )
 
 
 def result_details(q, result):

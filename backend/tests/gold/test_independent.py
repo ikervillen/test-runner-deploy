@@ -1335,6 +1335,12 @@ def test_ar_category_revision_recovers_pinned_hour_in_real_delta(tmp_path, nativ
         tmp_path / "inputs", "live", recent=True, native=native, horizon=later, window_seconds=600
     )
     metadata = {k: v for k, v in source.document.items() if k not in {"tables", "schema_id"}}
+    metadata["coverage"] = [
+        dict(source="LISTA_AR", origin=row["origin"], estado="READY", ar_event_source=True)
+        if row["source"] == "LISTA_AR"
+        else row
+        for row in metadata["coverage"]
+    ]
     tables = {
         r["name"]: source.table(r["name"], max_rows=100000) for r in source.document["tables"]
     }
@@ -1394,6 +1400,11 @@ def test_ar_category_revision_recovers_pinned_hour_in_real_delta(tmp_path, nativ
     current = Snapshot.open(published)
     assert any(r["corte"] == closing for r in current.rows("quality_scores"))
     score = next(r for r in current.rows("quality_scores") if r["corte"] == closing)
+    assert {
+        r["componente"]
+        for r in current.rows("quality_score_components")
+        if r["id_resultado"] == score["id_resultado"]
+    } >= {"Grave", "DAR"}
     assert any(
         r["reference_id"] == score["reference_id"] for r in current.rows("mia_reference_sets")
     )
