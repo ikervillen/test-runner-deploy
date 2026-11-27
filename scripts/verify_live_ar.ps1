@@ -1,11 +1,13 @@
+param([switch]$Once, [string]$Contexto, [string]$Proyecto='fenix-aiala-independent', [string]$Casos)
 $ErrorActionPreference = 'Stop'
 $context = $env:FENIX_DOCKER_CONTEXT
 if ($env:FENIX_SITE -and (Test-Path -LiteralPath $env:FENIX_SITE -PathType Leaf)) {
     $context = (Get-Content -LiteralPath $env:FENIX_SITE -Raw | ConvertFrom-Json).docker_context
 }
-$profile = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../deployment/independent.example.json') -Raw | ConvertFrom-Json
+if ($Contexto) { $context = $Contexto }
+if (!$context) { $context = 'desktop-linux' }
 function Worker($service) {
-    $ids = @(docker --context $context ps -q --filter "label=com.docker.compose.project=$($profile.project)" --filter "label=com.docker.compose.service=$service")
+    $ids = @(docker --context $context ps -q --filter "label=com.docker.compose.project=$Proyecto" --filter "label=com.docker.compose.service=$service")
     if ($LASTEXITCODE -ne 0 -or $ids.Count -ne 1) { throw "Worker Live no identificado: $service" }
     $ids[0]
 }
@@ -13,62 +15,65 @@ function Worker($service) {
 $ingest = Worker 'ingesta-live'
 $gold = Worker 'gold-live'
 $api = Worker 'backend'
-$backend = ((docker --context $context inspect $api) -join [Environment]::NewLine | ConvertFrom-Json)[0]
-$cmd = [string[]]$backend.Config.Cmd
-$p = [Array]::IndexOf($cmd, '--port')
-if ($p -lt 0 -or $cmd[$p + 1] -notmatch '^\d+$') { throw 'Puerto interno del API no identificado.' }
 
 $silverCheck = @'
 import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
+from ingesta_delta_lake.ar_storage import ar_silver_pin
+from ingesta_delta_lake.pipeline_publications import SilverSnapshot
 
 root = Path('/pipelines/live')
 status = json.loads((root / 'exchange/ar-intake.json').read_text())
-silver = root / 'exchange/silver'
-pin = json.loads((silver / 'current.json').read_text())['publication_id']
-ar = json.loads((silver / 'publications' / f"{pin}.json").read_text())['tables'].get('LISTA_AR', {})
+ss = SilverSnapshot.open(SimpleNamespace(exchange=root / 'exchange'))
+ar = ss.manifest['tables'].get('LISTA_AR', {})
 with sqlite3.connect((root / 'checkpoint/intake.sqlite').as_uri() + '?mode=ro', uri=True) as db:
-    pending = db.execute("SELECT count(*) FROM inputs WHERE state='LOT_WAIT' AND family='LISTA_AR'").fetchone()[0]
-print(json.dumps(dict(delta_ar=ar.get('version'), lot_wait=pending, **status)))
+    pending = dict(db.execute("""
+        SELECT state, count(*) FROM inputs AS i WHERE family='LISTA_AR'
+        AND state IN ('CAPTURED','LOT_WAIT','WAITING_REVIEW','WAITING_RETRY','TRANSFERRED')
+        AND NOT EXISTS (SELECT 1 FROM inputs AS n WHERE n.family=i.family
+                        AND n.source_path=i.source_path AND n.rowid>i.rowid)
+        GROUP BY state
+    """))
+names = ('LISTA_AR', 'SIP_DEFECTO', 'SIP_DEFECTO_STATUS', 'SIP_DEFECTO_AR')
+controls = {name: ss.manifest['controls'].get(name, {}).get('hash') for name in names}
+print(json.dumps(dict(table=ar.get('table_id'), version=ar.get('version'), controls=controls, pending=pending,
+                      pending_count=sum(pending.values()), blocked=status['blocked_origins'],
+                      pin_ok=status['identity']==ss.manifest['identity']
+                      and status['pin']==ar_silver_pin(ss.manifest))))
 '@
-$goldCheck = @'
-import json
-import sys
-from urllib.request import urlopen
-
-with urlopen(f'http://127.0.0.1:{sys.argv[1]}/api/live/scores', timeout=8) as response:
-    view = json.load(response)
-hours = []
-for hour in view['hours']:
-    if hour['state'] != 'closed':
-        continue
-    present = [r for r in hour['results'] if 'DAR' in r['contributions']
-               and all(k in r['contributions'] for k in ('Critico', 'Grave', 'Mayor', 'Menor', 'Leve'))]
-    hours.append(dict(end=hour['end'], ar=len(present), results=len(hour['results']),
-                      reasons=sorted({r['reason'] for r in hour['results'] if r['reason']})))
-print(json.dumps(dict(publication=view['publication_id'], stale=view['stale'], hours=hours)))
-'@
+$goldCheck = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'verify_live_ar_events.py') -Raw
+$caseArgs = @()
+if ($Casos) {
+    $bytes = [Text.Encoding]::UTF8.GetBytes((Get-Content -LiteralPath $Casos -Raw))
+    $caseArgs = @([Convert]::ToBase64String($bytes))
+}
 
 $limit = [DateTimeOffset]::UtcNow.AddMinutes(8)
-$recovered = $false
+$stage = 'RECOVERY_PENDING'
 do {
     $silver = $silverCheck | docker --context $context exec -i $ingest python -B -
     $silverOk = $LASTEXITCODE -eq 0
-    $scores = $goldCheck | docker --context $context exec -i $api python -B - $cmd[$p + 1]
+    $scores = $goldCheck | docker --context $context exec -i $gold python -B - @caseArgs
     $scoresOk = $LASTEXITCODE -eq 0
     if ($silverOk -and $scoresOk) {
         $s = $silver | ConvertFrom-Json
         $g = $scores | ConvertFrom-Json
-        if ($s.delta_ar -gt 230 -and $s.lot_wait -eq 0 -and !$g.stale -and @($g.hours | Where-Object ar -gt 0).Count) {
-            $recovered = $true
-            break
+        if ($s.pin_ok -and $s.pending_count -eq 0 -and @($s.blocked).Count -eq 0 -and
+            $s.table -eq $g.table -and $s.version -eq $g.version -and
+            $g.gold_controls_verified -and
+            @($s.controls.PSObject.Properties | Where-Object {
+                !$_.Value -or $_.Value -cne $g.controls.($_.Name)
+            }).Count -eq 0) {
+            if ($g.reference_checks_ok) { $stage = 'REFERENCE_CASES_VERIFIED'; break }
+            if (!$Casos) { break }
         }
     }
-    if ([DateTimeOffset]::UtcNow -lt $limit) { Start-Sleep -Seconds 15 }
-} while ([DateTimeOffset]::UtcNow -lt $limit)
+    if (!$Once -and [DateTimeOffset]::UtcNow -lt $limit) { Start-Sleep -Seconds 20 }
+} while (!$Once -and [DateTimeOffset]::UtcNow -lt $limit)
+Write-Output "AR verification: $stage"
 Write-Output "Silver: $silver"
 Write-Output "Gold: $scores"
-docker --context $context inspect $ingest $gold $api --format '{{.Name}} {{.State.Status}} {{.RestartCount}}'
+docker --context $context inspect $ingest $gold $api --format '{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}} {{.RestartCount}}'
 if (!$silverOk -or !$scoresOk) { throw 'No se pudo completar la verificacion operativa AR.' }
-if (!$recovered) { Write-Warning 'Servicios observados. Queda pendiente acreditar la recuperacion completa de AR.' }

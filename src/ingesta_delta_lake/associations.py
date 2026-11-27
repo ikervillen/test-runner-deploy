@@ -14,6 +14,7 @@ from .common import IntegrityError, digest, parse_int64
 
 CONTRACT = "asignacion_produccion_ramal_v2"
 RULE = "temporal_assignment_v2"
+AR_ATTRIBUTION_RULE = "ar-reference-scope-v1"
 ACCEPTED_STATUSES = frozenset(
     {
         "ASSIGNED",
@@ -110,6 +111,7 @@ def review_index(bundle):
                 refs = refs if isinstance(refs, list) else [refs]
                 origins.update(ref.get("origin") for ref in refs)
         result[family] = keys, origins
+    result["_ar_references"] = ar_reference_index(bundle)
     return result
 
 
@@ -131,10 +133,30 @@ def blocked(bundle, family, row, index=None):
     return False
 
 
+def ar_reference_index(bundle):
+    references = {}
+    sources = bundle.get("sources", {})
+    for family, field in lista_ar.CODE_FIELDS.items():
+        rows = sources.get(family, ())
+        codes = {r[field]: r for r in rows}
+        scoped, global_cases = lista_ar.reference_reviews(
+            bundle["cases"].get(family, ()),
+            field,
+            {SOURCE_KEYS[family](row): row[field] for row in rows},
+        )
+        if len(codes) != len(rows):
+            global_cases.append("DUPLICATE_CONFIRMED_CODE")
+        references[family] = {
+            "codes": codes,
+            "scoped_reviews": scoped,
+            "global_reviews": global_cases,
+        }
+    return references
+
+
 def ar_blocked(bundle, row, index=None):
-    return blocked(bundle, "LISTA_AR", row, index) or any(
-        bundle["cases"].get(f) for f in ("SIP_DEFECTO", "SIP_DEFECTO_STATUS", "SIP_DEFECTO_AR")
-    )
+    refs = index["_ar_references"] if index is not None else ar_reference_index(bundle)
+    return blocked(bundle, "LISTA_AR", row, index) or bool(lista_ar.reference_gaps(row, refs))
 
 
 def decision_identity(raw):
@@ -272,7 +294,7 @@ def zc_outgoing_decision(items, start, end, prods):
     return None
 
 
-def normalize_decision(raw, bundle, plant, lines):
+def normalize_decision(raw, bundle, plant, lines, *, reviews=None):
     allowed = {
         "id",
         "kind",
@@ -348,12 +370,24 @@ def normalize_decision(raw, bundle, plant, lines):
         )
         if matched is None:
             raise ValueError("Evidencia no encontrada en snapshot")
+        ref = (
+            (reviews or review_index(bundle))["_ar_references"][family]
+            if family in lista_ar.CODE_FIELDS
+            else None
+        )
         reviewed = (
-            topology.affected(family, bundle["cases"].get(family, []), matched)
+            ar_blocked(bundle, matched, reviews)
+            if family == "LISTA_AR"
+            else bool(
+                ref["global_reviews"]
+                or matched[lista_ar.CODE_FIELDS[family]] in ref["scoped_reviews"]
+            )
+            if ref is not None
+            else topology.affected(family, bundle["cases"].get(family, []), matched)
             if family in topology.FAMILIES
             else bool(bundle["cases"].get(family))
         )
-        if reviewed or (family == "LISTA_AR" and ar_blocked(bundle, matched)):
+        if reviewed:
             raise ValueError("Evidencia de una fuente en revisión")
     return d
 
@@ -442,9 +476,10 @@ def propose_registry(raw_decisions, previous, bundle, plant, lines):
     issues = []
     bad_scopes = set()
     repeated = Counter(decision_identity(raw) for raw in raw_decisions)
+    reviews = review_index(bundle)
     for raw in raw_decisions:
         try:
-            d = normalize_decision(raw, bundle, plant, lines)
+            d = normalize_decision(raw, bundle, plant, lines, reviews=reviews)
             if repeated[d["id"]] > 1:
                 raise ValueError("ID de decisión repetido")
             old = previous.get(d["id"])
@@ -629,7 +664,7 @@ def candidates(bundle, ar_index):
 
 
 def assign(bundle, registry, ar_index, review_scopes=(), *, frozen=None):
-    reviews = getattr(ar_index, "reviews", None)
+    reviews = getattr(ar_index, "reviews", None) or review_index(bundle)
     zf = defaultdict(list)
     zc = defaultdict(list)
     for d in registry.values():
@@ -647,8 +682,10 @@ def assign(bundle, registry, ar_index, review_scopes=(), *, frozen=None):
             episode_ids = []
             reason = ""
             status = "PENDING_ASSOCIATION"
-            if blocked(bundle, family, row, reviews) or (
-                family == "LISTA_AR" and ar_blocked(bundle, row, reviews)
+            if (
+                ar_blocked(bundle, row, reviews)
+                if family == "LISTA_AR"
+                else blocked(bundle, family, row, reviews)
             ):
                 status = "SOURCE_REVIEW"
             elif family == "LISTA_AR":

@@ -3,7 +3,7 @@ from copy import deepcopy
 import pytest
 
 from ingesta_delta_lake.ar_attribution import resolve
-from ingesta_delta_lake.associations import source_id
+from ingesta_delta_lake.associations import ar_blocked, review_index, source_id
 
 
 def fixture():
@@ -52,6 +52,72 @@ def fixture():
         for row in (ar, second)
     ]
     return bundle, ledger
+
+
+def test_incident_review_does_not_block_unrelated_ar_code():
+    bundle, _ = fixture()
+    event = {**bundle["sources"]["LISTA_AR"][0], "COD_AR": 129}
+    bundle["sources"].update(
+        SIP_DEFECTO=[
+            {"id_defecto_fenix": identity, "codigo_aviso_rechazo": code}
+            for identity, code in [(50, 510), (172, 500), *((n, n) for n in (129, 13, 112, 220, 2))]
+        ],
+        SIP_DEFECTO_STATUS=[{"id_status_fenix": n, "codigo_status": n} for n in (1, 2)],
+        SIP_DEFECTO_AR=[{"id_tipo_ar_fenix": n, "codigo_tipo_ar": n} for n in (1, 3)],
+    )
+    cases = []
+    for identity, confirmed, candidate in ((50, 510, 9510), (172, 500, 510)):
+        cases.append(
+            {
+                "issue_id": str(identity),
+                "reason": "ASSOCIATION_CONFLICT",
+                "payload": {
+                    "codigo_aviso_rechazo": candidate,
+                    "accepted": [{"codigo_aviso_rechazo": confirmed}],
+                    "values_for_id": [[confirmed], [candidate]],
+                },
+            }
+        )
+    bundle["cases"] = {"SIP_DEFECTO": cases}
+    for index in (None, review_index(bundle)):
+        assert not ar_blocked(bundle, event, index)
+        assert all(
+            ar_blocked(bundle, dict(event, COD_AR=code), index) for code in (500, 510, 9510, 9999)
+        )
+
+
+@pytest.mark.parametrize(
+    ("family", "code_field", "field"),
+    [
+        ("SIP_DEFECTO_STATUS", "codigo_status", "STATUS"),
+        ("SIP_DEFECTO_AR", "codigo_tipo_ar", "TIPO"),
+    ],
+)
+def test_local_ar_status_and_type_conflicts_leave_other_codes_available(family, code_field, field):
+    bundle, _ = fixture()
+    event = bundle["sources"]["LISTA_AR"][0]
+    bundle["sources"].update(
+        SIP_DEFECTO=[{"id_defecto_fenix": 1, "codigo_aviso_rechazo": 115}],
+        SIP_DEFECTO_STATUS=[{"id_status_fenix": 1, "codigo_status": 1}],
+        SIP_DEFECTO_AR=[{"id_tipo_ar_fenix": 1, "codigo_tipo_ar": 1}],
+    )
+    bundle["cases"] = {
+        family: [
+            {
+                "issue_id": "local",
+                "reason": "ASSOCIATION_CONFLICT",
+                "payload": {
+                    code_field: 3,
+                    "accepted": [{code_field: 2}],
+                    "values_for_id": [[2], [3]],
+                },
+            }
+        ]
+    }
+    assert not ar_blocked(bundle, event, review_index(bundle))
+    assert ar_blocked(bundle, dict(event, **{field: 2}), review_index(bundle))
+    bundle["cases"][family] = [{"issue_id": "global", "reason": "STRUCTURE", "payload": {}}]
+    assert ar_blocked(bundle, event, review_index(bundle))
 
 
 def test_contiguous_ar_segments_share_physical_witness_without_merging_rows():
