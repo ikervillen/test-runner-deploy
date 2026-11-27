@@ -113,6 +113,24 @@ def test_event_source_scores_three_hours_from_one_open_close_without_periodic_fi
     assert not _coverage_ready(snapshot, production, score_window, [], {"LISTA_AR"})
 
 
+def test_ar_withdrawal_retains_mia_zc_values_and_original_mia_reference():
+    from app.gold.scoring import has_official_total, without_ar
+
+    old = dict(id_resultado="r", reference_id="pin-mia", total_penalty=46.1)
+    components = [
+        dict(componente="MIA", contribucion=2.1, peso=2.0),
+        dict(componente="Grave", contribucion=40.0, peso=1.0),
+        dict(componente="ZC", contribucion=4.0, peso=1.0),
+    ]
+    partial, retained = without_ar(old, components)
+    assert retained == [components[0], components[2]]
+    assert partial["reference_id"] == "pin-mia"
+    assert partial["id_resultado"] == "r"
+    assert partial["total_penalty"] == 6.1
+    assert not has_official_total(partial["formula_version"])
+    assert old["total_penalty"] == 46.1
+
+
 def test_an_unresolved_non_dar_event_only_blocks_its_aql_category():
     row = {**event(START, None), "cavidad": "99Z", "grupo_dar": None}
     result = ar_bases([row], capacity(), window(), independent=True)

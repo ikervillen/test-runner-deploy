@@ -166,6 +166,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
 
     storage, policy = getattr(pipelines, lane), pipelines.policy
     own = SilverSnapshot.open(storage)
+    ar_attribution_rule = getattr(native, "AR_ATTRIBUTION_RULE", None)
     from ingesta_delta_lake.common import IntegrityError as NativeIntegrityError
 
     from .common import atomic_json, immutable_json, live_epoch, read_json
@@ -237,7 +238,10 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
     previous = None
     if (storage.gold / "inputs" / "current.json").exists():
         previous = Evidence.open(storage.gold / "inputs")
-        if previous.document.get("source_vector") == vector and (
+        if (
+            previous.document.get("source_vector") == vector
+            and previous.document.get("ar_attribution_rule") == ar_attribution_rule
+        ) and (
             lane != "live"
             or (
                 previous.document.get("coverage_rule") == COVERAGE_RULE
@@ -546,6 +550,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
             **({"historical_mp9_closures": historical_closures} if historical_closures else {}),
         },
         "coverage": coverage,
+        "ar_attribution_rule": ar_attribution_rule,
     }
     window = None
     scopes = None
@@ -662,6 +667,7 @@ def export(pipelines, lane, config, *, ar_categories=None, score_config_id=None)
                         review.get("ar_pin") != doc["ar_pin"]
                         or review.get("ar_categories") != ar_categories
                         or review.get("ar_unit_rule") != AR_UNIT_RULE
+                        or review.get("ar_attribution_rule") != ar_attribution_rule
                         or review.get("coverage_rule") != COVERAGE_RULE
                         or review.get("more_hourly_revisions")
                         or review.get("older_retry_scan")

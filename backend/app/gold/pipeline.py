@@ -1503,9 +1503,50 @@ def build(
         scope_rows: list[dict] = []
         if lane == "live" and isinstance(snapshot, Evidence):
             from .live_hours import AR_COVERAGE_PENDING
+            from .scoring import without_ar
 
             invalidations = snapshot.document.get("ar_invalidations", ())
             published.withdrawn_scores = tuple(row[0] for row in invalidations)
+            if previous is not None and invalidations:
+                import pyarrow.dataset as ds
+
+                ids = list(published.withdrawn_scores)
+                prior = {
+                    name: previous.rows(
+                        name,
+                        expression=ds.field("id_resultado").cast("string").isin(ids),
+                        file_pruning_predicate=[("id_resultado", "in", ids)],
+                        max_rows=max_total_rows,
+                    )
+                    for name in (
+                        "quality_scores",
+                        "quality_score_components",
+                        "mia_score_details",
+                        "zc_score_details",
+                    )
+                }
+                for score in prior["quality_scores"]:
+                    identity = score["id_resultado"]
+                    partial, components = without_ar(
+                        score,
+                        [
+                            r
+                            for r in prior["quality_score_components"]
+                            if r["id_resultado"] == identity
+                        ],
+                    )
+                    if partial is None:
+                        continue
+                    owner = score["id_produccion"]
+                    _store_row(store, "quality_scores", owner, partial)
+                    for row in components:
+                        _store_row(store, "quality_score_components", owner, row)
+                    retained = {r["componente"] for r in components}
+                    for component in retained:
+                        name = f"{component.lower()}_score_details"
+                        for row in prior[name]:
+                            if row["id_resultado"] == identity:
+                                _store_row(store, name, owner, row)
             scope_rows.extend(
                 _scope_row(
                     key,
